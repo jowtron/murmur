@@ -1,0 +1,32 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicholascm/tauri/dev/crates/tauri-utils/schema.json",
+  "productName": "Whisper Transcriber",
+  "version": "0.1.0",
+  "identifier": "com.whisper-transcriber.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Whisper Transcriber",
+        "width": 1100,
+        "height": 750,
+        "minWidth": 900,
+        "minHeight": 600,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "icon": [
+      "icons/icon.png"
+    ]
+  }
+}

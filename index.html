@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Whisper Transcriber</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header>
+        <h1>Whisper Transcriber</h1>
+        <div class="header-actions">
+          <button id="btn-add-files">Add Files</button>
+          <button id="btn-add-folder">Add Folder</button>
+          <button id="btn-add-feed">Add Podcast Feed</button>
+          <button id="btn-detect-chapters">Detect Chapters</button>
+          <button id="btn-settings">Settings</button>
+          <button id="btn-models">Models</button>
+        </div>
+      </header>
+
+      <div class="gpu-bar" id="gpu-bar"></div>
+
+      <div class="settings-bar">
+        <label>
+          Model:
+          <select id="select-model">
+            <option value="large-v3-turbo" selected>Large V3 Turbo</option>
+            <option value="large-v3">Large V3</option>
+            <option value="medium">Medium</option>
+            <option value="small">Small</option>
+            <option value="base">Base</option>
+            <option value="tiny">Tiny</option>
+          </select>
+        </label>
+        <label>
+          Format:
+          <select id="select-format">
+            <option value="all">All Formats</option>
+            <option value="txt">Text (.txt)</option>
+            <option value="srt">SRT (.srt)</option>
+            <option value="vtt">VTT (.vtt)</option>
+            <option value="json">JSON (.json)</option>
+          </select>
+        </label>
+        <label>
+          Output Dir:
+          <select id="select-output">
+            <option value="same">Same as source</option>
+            <option value="custom">Custom folder...</option>
+          </select>
+        </label>
+        <label>
+          Threads:
+          <select id="select-threads">
+            <option value="2">2</option>
+            <option value="4">4</option>
+            <option value="6">6</option>
+            <option value="8" selected>8</option>
+            <option value="10">10</option>
+          </select>
+        </label>
+        <label>
+          Concurrent:
+          <select id="select-concurrent">
+            <option value="1">1 file</option>
+            <option value="2" selected>2 files</option>
+            <option value="3">3 files</option>
+            <option value="4">4 files</option>
+          </select>
+        </label>
+        <label class="auto-chapters-label">
+          <input type="checkbox" id="chk-auto-chapters" />
+          Auto-detect chapters
+        </label>
+        <button id="btn-transcribe-all" class="primary">Transcribe All</button>
+      </div>
+
+      <div class="queue-container">
+        <div class="queue-header">
+          <span>Queue (<span id="queue-count">0</span> files)</span>
+          <div class="queue-actions">
+            <button id="btn-retry-errors" class="small" style="display:none">Retry Failed</button>
+            <button id="btn-clear-done" class="small" style="display:none">Clear Done</button>
+            <button id="btn-clear-queue" class="small">Clear All</button>
+          </div>
+        </div>
+        <div id="queue-list" class="queue-list">
+          <div class="empty-state">
+            Drop audio files here or click "Add Files" / "Add Folder"
+          </div>
+        </div>
+      </div>
+
+      <!-- Model Manager Modal -->
+      <div id="model-modal" class="modal hidden">
+        <div class="modal-content">
+          <div class="modal-header">
+            <h2>Model Manager</h2>
+            <button class="modal-close">&times;</button>
+          </div>
+          <div id="model-list" class="model-list"></div>
+          <div class="modal-footer">
+            <small>Models stored in: <span id="models-dir"></span></small>
+          </div>
+        </div>
+      </div>
+
+      <!-- Settings Modal -->
+      <div id="settings-modal" class="modal hidden">
+        <div class="modal-content wide">
+          <div class="modal-header">
+            <h2>Chapter Detection Settings</h2>
+            <button class="modal-close">&times;</button>
+          </div>
+          <div class="settings-form">
+            <label class="form-label">
+              OpenRouter API Key:
+              <input type="password" id="input-api-key" placeholder="sk-or-..." class="form-input" />
+            </label>
+            <label class="form-label">
+              Model:
+              <input type="text" id="input-llm-model" value="google/gemini-2.0-flash-001" class="form-input" placeholder="e.g. google/gemini-2.0-flash-001" />
+            </label>
+            <label class="form-label">
+              API Base URL:
+              <input type="text" id="input-api-url" value="https://openrouter.ai/api/v1/chat/completions" class="form-input" />
+            </label>
+            <label class="form-label">
+              Chapter Detection Prompt:
+              <textarea id="input-chapter-prompt" class="form-textarea" rows="8">You are analyzing an audio transcription with timestamps. Identify where each distinct story or chapter begins. For each chapter/story found, provide the title and the start timestamp.
+
+Look for indicators like:
+- Narrator announcements ("and now...", "the story of...")
+- Title mentions
+- Clear topic/story transitions
+- Musical interludes or pauses between stories
+
+Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs (seconds from start).</textarea>
+            </label>
+            <label class="form-label">
+              Chapter Output Format:
+              <select id="select-chapter-format" class="form-input">
+                <option value="txt">Text (.chapters.txt)</option>
+                <option value="json">JSON (.chapters.json)</option>
+              </select>
+            </label>
+            <button id="btn-save-settings" class="primary">Save Settings</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Feed Modal -->
+      <div id="feed-modal" class="modal hidden">
+        <div class="modal-content wide">
+          <div class="modal-header">
+            <h2>Add Podcast Feed</h2>
+            <button class="modal-close">&times;</button>
+          </div>
+          <div class="feed-form">
+            <div class="feed-input-row">
+              <input type="text" id="input-feed-url" placeholder="Enter RSS feed URL..." class="form-input" />
+              <button id="btn-load-feed" class="primary">Load Feed</button>
+            </div>
+            <div id="feed-status" class="feed-status"></div>
+            <div id="feed-episodes" class="feed-episodes"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Chapter Detection Modal -->
+      <div id="chapters-modal" class="modal hidden">
+        <div class="modal-content wide">
+          <div class="modal-header">
+            <h2>Detect Chapters</h2>
+            <button class="modal-close">&times;</button>
+          </div>
+          <div class="chapters-form">
+            <p class="chapters-desc">Select one or more SRT/VTT/TXT transcript files to detect chapter boundaries via LLM. Results auto-save next to source files. Configure API key and prompt in Settings.</p>
+            <div class="chapters-input-row">
+              <input type="text" id="input-chapter-file" placeholder="No file selected..." class="form-input" readonly />
+              <button id="btn-choose-chapter-file" class="small">Browse...</button>
+              <button id="btn-run-detect" class="primary">Detect Chapters</button>
+            </div>
+            <div id="chapters-status" class="chapters-status"></div>
+            <div id="chapters-results" class="chapters-results"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
