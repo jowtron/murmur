@@ -27,6 +27,11 @@
   "bundle": {
     "icon": [
       "icons/icon.png"
+    ],
+    "resources": [
+      "binaries/metaflac",
+      "binaries/libFLAC.14.dylib",
+      "binaries/libogg.0.dylib"
     ]
   }
 }

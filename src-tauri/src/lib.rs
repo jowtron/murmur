@@ -1,5 +1,8 @@
 mod commands;
+mod flac_utils;
 mod transcriber;
+mod gap_detection;
+mod template;
 
 use commands::AppState;
 
@@ -25,6 +28,22 @@ pub fn run() {
             commands::get_audio_duration,
             commands::read_text_file,
             commands::write_text_file,
+            commands::file_exists,
+            commands::detect_energy_gaps,
+            commands::detect_chapters_with_gaps,
+            commands::check_seekability,
+            commands::fix_seektable,
+            commands::fix_seektables_batch,
+            commands::embed_chapters_in_flac,
+            commands::write_cue_file,
+            commands::check_transcription_exists,
+            commands::get_waveform_peaks,
+            commands::get_audio_region_pcm,
+            commands::save_audio_template,
+            commands::list_audio_templates,
+            commands::get_template_pcm,
+            commands::delete_audio_template,
+            commands::find_template_matches,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

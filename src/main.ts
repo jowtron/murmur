@@ -38,6 +38,22 @@ interface Chapter {
   start_secs: number;
 }
 
+interface SeekInfo {
+  seekable: boolean;
+  has_seektable: boolean;
+  fixable: boolean;
+  format: string;
+  message: string | null;
+}
+
+interface ChapterWithSnap {
+  title: string;
+  start_time: string;
+  start_secs: number;
+  original_secs: number;
+  snapped: boolean;
+}
+
 interface QueueItem {
   id: string;
   path: string;
@@ -51,6 +67,7 @@ interface QueueItem {
   elapsed?: number;
   autoDetectChapters: boolean;
   chapters?: Chapter[];
+  snappedChapters?: ChapterWithSnap[];
 }
 
 const queue: QueueItem[] = [];
@@ -59,21 +76,46 @@ let customOutputDir: string | null = null;
 // Settings
 function loadSettings() {
   return {
-    apiKey: localStorage.getItem("openrouter_api_key") || "",
-    llmModel: localStorage.getItem("llm_model") || "google/gemini-2.0-flash-001",
+    apiKey: localStorage.getItem("openrouter_api_key") || (document.getElementById("input-api-key") as HTMLInputElement)?.value || "",
+    llmModel: selectLlmModel.value || localStorage.getItem("llm_model") || "google/gemini-3.1-flash-lite-preview",
+    llmModels: localStorage.getItem("llm_models") || "google/gemini-3.1-flash-lite-preview\ngoogle/gemini-2.5-flash-preview\nanthropic/claude-sonnet-4\nopenai/gpt-4o-mini",
     apiUrl: localStorage.getItem("api_url") || "https://openrouter.ai/api/v1/chat/completions",
     chapterPrompt: localStorage.getItem("chapter_prompt") || (document.getElementById("input-chapter-prompt") as HTMLTextAreaElement)?.value || "",
-    chapterOutputFormat: localStorage.getItem("chapter_output_format") || "txt",
+    chapterOutputFormat: localStorage.getItem("chapter_output_format") || "json",
   };
+}
+
+function llmModelShort(fullModel: string): string {
+  // "google/gemini-3.1-flash-lite-preview" → "gemini-3.1-flash-lite-preview"
+  return fullModel.split("/").pop() || fullModel;
+}
+
+function refreshLlmDropdown() {
+  const models = (localStorage.getItem("llm_models") || "google/gemini-3.1-flash-lite-preview").split("\n").map(m => m.trim()).filter(Boolean);
+  const current = selectLlmModel.value || localStorage.getItem("llm_model") || models[0];
+  selectLlmModel.innerHTML = models.map(m =>
+    `<option value="${escapeHtml(m)}" ${m === current ? "selected" : ""}>${escapeHtml(llmModelShort(m))}</option>`
+  ).join("");
 }
 
 function saveSettings() {
   localStorage.setItem("openrouter_api_key", (document.getElementById("input-api-key") as HTMLInputElement).value);
-  localStorage.setItem("llm_model", (document.getElementById("input-llm-model") as HTMLInputElement).value);
+  const modelsText = (document.getElementById("input-llm-models") as HTMLTextAreaElement).value;
+  localStorage.setItem("llm_models", modelsText);
+  const modelsList = modelsText.split("\n").map(m => m.trim()).filter(Boolean);
+  if (modelsList.length > 0 && !modelsList.includes(selectLlmModel.value)) {
+    localStorage.setItem("llm_model", modelsList[0]);
+  }
+  refreshLlmDropdown();
   localStorage.setItem("api_url", (document.getElementById("input-api-url") as HTMLInputElement).value);
   localStorage.setItem("chapter_prompt", (document.getElementById("input-chapter-prompt") as HTMLTextAreaElement).value);
   localStorage.setItem("chapter_output_format", (document.getElementById("select-chapter-format") as HTMLSelectElement).value);
+  localStorage.setItem("align_before", (document.getElementById("input-align-before") as HTMLInputElement).value);
+  localStorage.setItem("align_after", (document.getElementById("input-align-after") as HTMLInputElement).value);
 }
+
+function getAlignBefore(): number { return parseFloat(localStorage.getItem("align_before") || "2"); }
+function getAlignAfter(): number { return parseFloat(localStorage.getItem("align_after") || "2"); }
 
 // DOM
 const queueList = document.getElementById("queue-list")!;
@@ -98,6 +140,12 @@ const selectOutput = document.getElementById("select-output")! as HTMLSelectElem
 const selectThreads = document.getElementById("select-threads")! as HTMLSelectElement;
 const selectConcurrent = document.getElementById("select-concurrent")! as HTMLSelectElement;
 const chkAutoChapters = document.getElementById("chk-auto-chapters")! as HTMLInputElement;
+const chkSnapGaps = document.getElementById("chk-snap-gaps")! as HTMLInputElement;
+const chkRawLlm = document.getElementById("chk-raw-llm")! as HTMLInputElement;
+const chkPerWord = document.getElementById("chk-per-word")! as HTMLInputElement;
+const selectLlmModel = document.getElementById("select-llm-model")! as HTMLSelectElement;
+const chkEmbedFlac = document.getElementById("chk-embed-flac")! as HTMLInputElement;
+const chkWriteCue = document.getElementById("chk-write-cue")! as HTMLInputElement;
 const gpuBar = document.getElementById("gpu-bar")!;
 
 function generateId(): string {
@@ -149,7 +197,7 @@ function renderQueue() {
         <div class="file-name">${escapeHtml(item.name)}</div>
         <div class="file-path">${escapeHtml(item.path)}</div>
         ${item.error ? `<div class="error-msg">${escapeHtml(item.error)}</div>` : ""}
-        ${item.chapters ? `<div class="chapters-badge">${item.chapters.length} chapters detected</div>` : ""}
+        ${item.chapters ? `<div class="chapters-badge clickable" data-id="${item.id}" style="cursor:pointer; text-decoration:underline;">${item.chapters.length} chapters detected</div> <span class="chapters-badge" style="cursor:pointer;text-decoration:underline;margin-left:6px;" data-align-id="${item.id}">Align</span>` : ""}
         ${
           item.status === "transcribing" || item.status === "detecting"
             ? `<div class="progress-bar"><div class="fill" style="width: ${Math.round(item.progress * 100)}%"></div></div>`
@@ -221,6 +269,51 @@ function renderQueue() {
       }
     });
   });
+
+  // Clickable chapters badge
+  queueList.querySelectorAll(".chapters-badge.clickable").forEach((badge) => {
+    badge.addEventListener("click", () => {
+      const id = (badge as HTMLElement).dataset.id!;
+      const item = queue.find((q) => q.id === id);
+      if (item?.chapters) showChapterDetail(item);
+    });
+  });
+
+  // Align button
+  queueList.querySelectorAll("[data-align-id]").forEach((el) => {
+    el.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const id = (el as HTMLElement).dataset.alignId!;
+      const item = queue.find((q) => q.id === id);
+      if (item?.chapters) openAlignModal(item.path, item.chapters, item.duration || 0);
+    });
+  });
+}
+
+function showChapterDetail(item: QueueItem) {
+  const modal = document.getElementById("chapter-detail-modal")!;
+  const title = document.getElementById("chapter-detail-title")!;
+  const list = document.getElementById("chapter-detail-list")!;
+
+  title.textContent = `Chapters — ${item.name}`;
+
+  list.innerHTML = (item.chapters || []).map((ch, idx) => {
+    const snap = item.snappedChapters?.[idx];
+    const snapped = snap?.snapped;
+    const snapDelta = snapped ? (snap!.start_secs - snap!.original_secs) : 0;
+    const snapInfo = snapped
+      ? ` <span class="snapped-badge">snapped ${snapDelta >= 0 ? "+" : ""}${snapDelta.toFixed(1)}s</span>`
+      : "";
+    return `
+      <div class="chapter-item${snapped ? " snapped" : ""}">
+        <span class="ch-time">${escapeHtml(ch.start_time)}</span>
+        <span class="ch-title">${escapeHtml(ch.title)}${snapInfo}</span>
+      </div>`;
+  }).join("");
+
+  modal.classList.remove("hidden");
+  modal.querySelector(".modal-close")!.addEventListener("click", () => modal.classList.add("hidden"), { once: true });
+  modal.addEventListener("click", (e) => { if (e.target === modal) modal.classList.add("hidden"); }, { once: true });
 }
 
 // Elapsed time updater
@@ -237,6 +330,36 @@ setInterval(() => {
 
 async function addFiles(paths: string[]) {
   const autoChapters = chkAutoChapters.checked;
+
+  // Check for FLAC files missing seek tables
+  const fixablePaths: string[] = [];
+  for (const path of paths) {
+    try {
+      const info = await invoke<SeekInfo>("check_seekability", { path });
+      if (info.fixable && !info.has_seektable) {
+        fixablePaths.push(path);
+      }
+    } catch { /* ignore non-FLAC or errors */ }
+  }
+
+  if (fixablePaths.length > 0) {
+    const doFix = confirm(
+      `${fixablePaths.length} FLAC file(s) are missing seek tables.\n` +
+      `This causes inaccurate seeking in media players.\n\n` +
+      `Fix them now? (adds seek points every 1 second, requires metaflac)`
+    );
+    if (doFix) {
+      try {
+        const fixed = await invoke<string[]>("fix_seektables_batch", { paths: fixablePaths });
+        if (fixed.length > 0) {
+          console.log(`Fixed seek tables in ${fixed.length} files`);
+        }
+      } catch (err) {
+        console.error("Failed to fix seek tables:", err);
+      }
+    }
+  }
+
   for (const path of paths) {
     const name = path.split("/").pop() || path;
     const item: QueueItem = {
@@ -304,30 +427,54 @@ async function runChapterDetection(item: QueueItem): Promise<void> {
   }
 
   item.status = "detecting";
-  item.progress = 0.5;
   renderQueue();
 
-  // Read the SRT output for this file
   const outputDir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
   const stem = item.name.replace(/\.[^.]+$/, "");
-  const srtPath = `${outputDir}/${stem}.srt`;
+  const model = item.modelUsed || selectModel.value;
+  const srtPath = `${outputDir}/${stem}_transcription_${model}.srt`;
 
   try {
     const transcript = await invoke<string>("read_text_file", { path: srtPath });
+    const useSnap = chkSnapGaps.checked;
+    let chapters: Chapter[];
 
-    const chapters = await invoke<Chapter[]>("detect_chapters", {
-      req: {
-        transcript,
-        api_key: settings.apiKey,
-        model: settings.llmModel,
-        base_url: settings.apiUrl,
-        prompt: settings.chapterPrompt,
-      },
-    });
+    if (useSnap) {
+      const snappedChapters = await invoke<ChapterWithSnap[]>("detect_chapters_with_gaps", {
+        req: {
+          transcript,
+          api_key: settings.apiKey,
+          model: settings.llmModel,
+          base_url: settings.apiUrl,
+          prompt: settings.chapterPrompt,
+          transcript_path: srtPath, raw_mode: chkRawLlm.checked,
+        },
+        audioPath: item.path,
+        minGapSecs: 1.5,
+        silenceThreshold: 0.02,
+        maxLookbackSecs: 60.0,
+      });
+      item.snappedChapters = snappedChapters;
+      chapters = snappedChapters.map((ch) => ({
+        title: ch.title,
+        start_time: ch.start_time,
+        start_secs: ch.start_secs,
+      }));
+    } else {
+      chapters = await invoke<Chapter[]>("detect_chapters", {
+        req: {
+          transcript,
+          api_key: settings.apiKey,
+          model: settings.llmModel,
+          base_url: settings.apiUrl,
+          prompt: settings.chapterPrompt,
+          transcript_path: srtPath, raw_mode: chkRawLlm.checked,
+        },
+      });
+    }
 
     item.chapters = chapters;
 
-    // Save chapter file
     if (chapters.length > 0) {
       const chapterFormat = settings.chapterOutputFormat || "txt";
       let content: string;
@@ -335,14 +482,27 @@ async function runChapterDetection(item: QueueItem): Promise<void> {
 
       if (chapterFormat === "json") {
         content = JSON.stringify(chapters, null, 2);
-        ext = "chapters.json";
+        ext = "json";
       } else {
         content = chapters.map((ch) => `${ch.start_time} - ${ch.title}`).join("\n");
-        ext = "chapters.txt";
+        ext = "txt";
       }
 
-      const chapterPath = `${outputDir}/${stem}.${ext}`;
+      const llmShort = llmModelShort(settings.llmModel);
+      const chapterPath = `${outputDir}/${stem}_chapters_${llmShort}.${ext}`;
       await invoke("write_text_file", { path: chapterPath, content });
+
+      // Embed chapters in FLAC and write .cue
+      if (chkEmbedFlac.checked) {
+        try {
+          await invoke("embed_chapters_in_flac", { req: { audio_path: item.path, chapters } });
+        } catch (embedErr) { console.warn("Embed chapters failed:", embedErr); }
+      }
+      if (chkWriteCue.checked) {
+        try {
+          await invoke("write_cue_file", { audioPath: item.path, chapters });
+        } catch (cueErr) { console.warn("Write cue failed:", cueErr); }
+      }
     }
   } catch (err: any) {
     const errMsg = typeof err === "string" ? err : err?.message || "Chapter detection failed";
@@ -355,43 +515,65 @@ async function transcribeItem(item: QueueItem) {
   const format = selectFormat.value;
   const threads = parseInt(selectThreads.value);
 
-  item.status = "transcribing";
-  item.progress = 0;
-  item.error = undefined;
   item.modelUsed = model;
-  item.startedAt = Date.now();
-  item.elapsed = undefined;
+  item.error = undefined;
   renderQueue();
 
   try {
-    // Make sure format includes srt if auto-chapters is on
-    let outputFormat = format;
-    if (item.autoDetectChapters && format !== "all" && format !== "srt") {
-      outputFormat = "all"; // Need SRT for chapter detection
-    }
-
-    await invoke("transcribe_file", {
-      job: {
-        id: item.id,
-        path: item.path,
-        model,
-        output_format: outputFormat,
-        output_dir: customOutputDir,
-        threads,
-      },
+    // Check if transcription already exists for this model
+    const alreadyExists = await invoke<boolean>("check_transcription_exists", {
+      path: item.path,
+      model,
+      outputDir: customOutputDir || null,
     });
 
-    item.elapsed = Date.now() - (item.startedAt || Date.now());
+    if (alreadyExists) {
+      // Skip transcription, but still run chapter detection if needed
+      if (item.autoDetectChapters) {
+        item.status = "detecting";
+        item.progress = 1.0;
+        renderQueue();
+        await runChapterDetection(item);
+      }
+      item.status = "complete";
+      item.progress = 1.0;
+    } else {
+      item.status = "queued";
+      item.progress = 0;
+      item.startedAt = undefined;
+      item.elapsed = undefined;
+      renderQueue();
 
-    // Auto-detect chapters if enabled
-    if (item.autoDetectChapters) {
-      await runChapterDetection(item);
+      // If chapters needed, ensure SRT is produced alongside selected format
+      let outputFormat = format;
+      if (item.autoDetectChapters && format !== "all" && format !== "srt") {
+        outputFormat = `${format},srt`;
+      }
+
+      await invoke("transcribe_file", {
+        job: {
+          id: item.id,
+          path: item.path,
+          model,
+          output_format: outputFormat,
+          output_dir: customOutputDir,
+          threads,
+          per_word: chkPerWord.checked,
+        },
+      });
+
+      item.elapsed = Date.now() - (item.startedAt || Date.now());
+
+      // Auto-detect chapters if enabled
+      if (item.autoDetectChapters) {
+        await runChapterDetection(item);
+      }
+
+      item.status = "complete";
+      item.progress = 1.0;
     }
-
-    item.status = "complete";
-    item.progress = 1.0;
   } catch (err: any) {
-    item.elapsed = Date.now() - (item.startedAt || Date.now());
+    item.elapsed = item.startedAt ? Date.now() - item.startedAt : undefined;
     const errMsg = typeof err === "string" ? err : err?.message || "Unknown error";
     if (errMsg === "Cancelled") {
       item.status = "cancelled";
@@ -623,16 +805,73 @@ document.getElementById("btn-save-settings")!.addEventListener("click", () => {
 function loadSettingsIntoForm() {
   const s = loadSettings();
   (document.getElementById("input-api-key") as HTMLInputElement).value = s.apiKey;
-  (document.getElementById("input-llm-model") as HTMLInputElement).value = s.llmModel;
+  (document.getElementById("input-llm-models") as HTMLTextAreaElement).value = s.llmModels;
   (document.getElementById("input-api-url") as HTMLInputElement).value = s.apiUrl;
   if (s.chapterPrompt) (document.getElementById("input-chapter-prompt") as HTMLTextAreaElement).value = s.chapterPrompt;
   (document.getElementById("select-chapter-format") as HTMLSelectElement).value = s.chapterOutputFormat;
+  (document.getElementById("input-align-before") as HTMLInputElement).value = localStorage.getItem("align_before") || "2";
+  (document.getElementById("input-align-after") as HTMLInputElement).value = localStorage.getItem("align_after") || "2";
+  refreshLlmDropdown();
 }
 
 // Feed
 document.getElementById("btn-load-feed")!.addEventListener("click", () => {
   const url = (document.getElementById("input-feed-url") as HTMLInputElement).value.trim();
   if (url) loadFeed(url);
+});
+
+// Convert to CUE
+document.getElementById("btn-convert-cue")!.addEventListener("click", async () => {
+  const selected = await open({
+    multiple: true,
+    filters: [{ name: "Chapters", extensions: ["json", "srt", "txt"] }],
+  });
+  if (!selected) return;
+  const paths = Array.isArray(selected) ? selected : [selected];
+  let count = 0;
+  for (const path of paths) {
+    try {
+      const text = await invoke<string>("read_text_file", { path });
+      let chapters: Chapter[] = [];
+      if (path.endsWith(".json")) {
+        const data = JSON.parse(text);
+        chapters = Array.isArray(data) ? data : (data.chapters || []);
+      } else if (path.endsWith(".srt")) {
+        // Parse SRT → chapter-like entries (each subtitle as a chapter)
+        // More useful: look for chapter markers in the text
+        const lines = text.split("\n");
+        for (const line of lines) {
+          const m = line.match(/^(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)\s*[-–]\s*(.+)/);
+          if (m) chapters.push({ title: m[4], start_time: `${m[1]||"00"}:${m[2].padStart(2,"0")}:${String(Math.floor(+m[3])).padStart(2,"0")}`, start_secs: (+m[1]||0)*3600 + +m[2]*60 + +m[3] });
+        }
+        if (chapters.length === 0) {
+          // fallback: parse as JSON chapters text format
+          for (const line of lines) {
+            const m2 = line.match(/(\d+:\d+:\d+)\s*[-–]\s*(.+)/);
+            if (m2) {
+              const parts = m2[1].split(":").map(Number);
+              chapters.push({ title: m2[2], start_time: m2[1], start_secs: parts[0]*3600+parts[1]*60+parts[2] });
+            }
+          }
+        }
+      }
+      if (chapters.length === 0) continue;
+      // Find matching audio file (same stem, audio extension)
+      const dir = path.substring(0, path.lastIndexOf("/"));
+      const stem = path.split("/").pop()!.replace(/[._](chapters|llm_chapters|llm_raw|gemini[^.]*|gpt[^.]*|claude[^.]*)\..+$/, "").replace(/\.[^.]+$/, "");
+      const exts = ["flac", "mp3", "wav", "m4a", "ogg", "aac"];
+      let audioPath = "";
+      for (const ext of exts) {
+        const candidate = `${dir}/${stem}.${ext}`;
+        const exists = await invoke<boolean>("file_exists", { path: candidate });
+        if (exists) { audioPath = candidate; break; }
+      }
+      if (!audioPath) { console.warn(`No audio file found for ${stem}`); continue; }
+      await invoke("write_cue_file", { audioPath, chapters });
+      count++;
+    } catch (e) { console.warn("CUE convert failed for", path, e); }
+  }
+  if (count > 0) alert(`Wrote ${count} .cue file(s)`);
 });
 
 // Chapter detection standalone
@@ -647,6 +886,12 @@ const chaptersResults = document.getElementById("chapters-results")!;
 let chapterFilePaths: string[] = [];
 
 setupModal(btnDetectChapters, chaptersModal);
+// Sync modal checkboxes with settings bar
+btnDetectChapters.addEventListener("click", () => {
+  (document.getElementById("chk-modal-snap") as HTMLInputElement).checked = chkSnapGaps.checked;
+  (document.getElementById("chk-modal-embed") as HTMLInputElement).checked = chkEmbedFlac.checked;
+  (document.getElementById("chk-modal-cue") as HTMLInputElement).checked = chkWriteCue.checked;
+});
 
 btnChooseChapterFile.addEventListener("click", async () => {
   const selected = await open({
@@ -675,6 +920,9 @@ btnRunDetect.addEventListener("click", async () => {
     return;
   }
 
+  const chkModalSnap = document.getElementById("chk-modal-snap") as HTMLInputElement;
+  const useSnap = chkModalSnap.checked;
+
   btnRunDetect.disabled = true;
   chaptersResults.innerHTML = "";
 
@@ -690,15 +938,52 @@ btnRunDetect.addEventListener("click", async () => {
     try {
       const transcript = await invoke<string>("read_text_file", { path: filePath });
 
-      const chapters = await invoke<Chapter[]>("detect_chapters", {
-        req: {
-          transcript,
-          api_key: settings.apiKey,
-          model: settings.llmModel,
-          base_url: settings.apiUrl,
-          prompt: settings.chapterPrompt,
-        },
-      });
+      let chapters: Chapter[];
+      let snappedChaptersResult: ChapterWithSnap[] | null = null;
+
+      if (useSnap) {
+        // Try to find the source audio file alongside the transcript
+        const dir = filePath.substring(0, filePath.lastIndexOf("/"));
+        // Strip _transcription_<model> suffix to get the audio stem
+        const rawStem = fileName.replace(/\.[^.]+$/, "");
+        const stem = rawStem.replace(/_transcription_[^_]+$/, "") || rawStem;
+        const audioExts = ["flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus"];
+        let audioPath = "";
+        for (const ext of audioExts) {
+          const candidate = `${dir}/${stem}.${ext}`;
+          const exists = await invoke<boolean>("file_exists", { path: candidate });
+          if (exists) { audioPath = candidate; break; }
+        }
+
+        if (!audioPath) {
+          // Fall back to LLM-only if no audio file found
+          chaptersResults.innerHTML += `<div class="chapter-file-header">${escapeHtml(fileName)} - No matching audio file found, using LLM only</div>`;
+          chapters = await invoke<Chapter[]>("detect_chapters", {
+            req: { transcript, api_key: settings.apiKey, model: settings.llmModel, base_url: settings.apiUrl, prompt: settings.chapterPrompt, transcript_path: filePath, raw_mode: chkRawLlm.checked },
+          });
+        } else {
+          chaptersStatus.textContent = chapterFilePaths.length > 1
+            ? `Processing ${i + 1}/${chapterFilePaths.length}: ${fileName} (LLM + gap snap)...`
+            : `Analyzing ${fileName} with LLM + gap snap...`;
+
+          snappedChaptersResult = await invoke<ChapterWithSnap[]>("detect_chapters_with_gaps", {
+            req: { transcript, api_key: settings.apiKey, model: settings.llmModel, base_url: settings.apiUrl, prompt: settings.chapterPrompt, transcript_path: filePath, raw_mode: chkRawLlm.checked },
+            audioPath,
+            minGapSecs: 1.5,
+            silenceThreshold: 0.02,
+            maxLookbackSecs: 60.0,
+          });
+          chapters = snappedChaptersResult.map((ch) => ({
+            title: ch.title,
+            start_time: ch.start_time,
+            start_secs: ch.start_secs,
+          }));
+        }
+      } else {
+        chapters = await invoke<Chapter[]>("detect_chapters", {
+          req: { transcript, api_key: settings.apiKey, model: settings.llmModel, base_url: settings.apiUrl, prompt: settings.chapterPrompt, transcript_path: filePath, raw_mode: chkRawLlm.checked },
+        });
+      }
 
       if (chapters.length === 0) {
         chaptersResults.innerHTML += `<div class="chapter-file-header">${escapeHtml(fileName)} - No chapters detected</div>`;
@@ -707,29 +992,53 @@ btnRunDetect.addEventListener("click", async () => {
 
       // Auto-save
       const dir = filePath.substring(0, filePath.lastIndexOf("/"));
-      const stem = fileName.replace(/\.[^.]+$/, "");
+      const rawStemSave = fileName.replace(/\.[^.]+$/, "");
+      const stem = rawStemSave.replace(/_transcription_[^_]+$/, "") || rawStemSave;
       const chapterFormat = settings.chapterOutputFormat || "txt";
 
       let content: string;
       let ext: string;
       if (chapterFormat === "json") {
         content = JSON.stringify(chapters, null, 2);
-        ext = "chapters.json";
+        ext = "json";
       } else {
         content = chapters.map((ch) => `${ch.start_time} - ${ch.title}`).join("\n");
-        ext = "chapters.txt";
+        ext = "txt";
       }
 
       const outPath = `${customOutputDir || dir}/${stem}.${ext}`;
       await invoke("write_text_file", { path: outPath, content });
 
-      // Display
+      // Embed chapters in FLAC and write .cue if audio file found
+      const chkModalEmbed = document.getElementById("chk-modal-embed") as HTMLInputElement;
+      const chkModalCue = document.getElementById("chk-modal-cue") as HTMLInputElement;
+      if (chkModalEmbed.checked || chkModalCue.checked) {
+        const audioExtsEmbed = ["flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus"];
+        for (const aext of audioExtsEmbed) {
+          const candidate = `${dir}/${stem}.${aext}`;
+          const exists = await invoke<boolean>("file_exists", { path: candidate });
+          if (exists) {
+            if (chkModalEmbed.checked) {
+              try { await invoke("embed_chapters_in_flac", { req: { audio_path: candidate, chapters } }); } catch (e) { console.warn("Embed failed:", e); }
+            }
+            if (chkModalCue.checked) {
+              try { await invoke("write_cue_file", { audioPath: candidate, chapters }); } catch (e) { console.warn("Cue failed:", e); }
+            }
+            break;
+          }
+        }
+      }
+
+      // Display — highlight snapped chapters
       let html = `<div class="chapter-file-header">${escapeHtml(fileName)} (${chapters.length} chapters) <span class="saved-badge">Saved: ${stem}.${ext}</span></div>`;
-      html += chapters.map((ch) => `
-        <div class="chapter-item">
+      html += chapters.map((ch, idx) => {
+        const wasSnapped = snappedChaptersResult && snappedChaptersResult[idx]?.snapped;
+        return `
+        <div class="chapter-item${wasSnapped ? " snapped" : ""}">
           <span class="ch-time">${escapeHtml(ch.start_time)}</span>
-          <span class="ch-title">${escapeHtml(ch.title)}</span>
-        </div>`).join("");
+          <span class="ch-title">${escapeHtml(ch.title)}${wasSnapped ? ' <span class="snapped-badge">snapped</span>' : ""}</span>
+        </div>`;
+      }).join("");
       chaptersResults.innerHTML += html;
     } catch (err: any) {
       const errMsg = typeof err === "string" ? err : err?.message || "Failed";
@@ -747,7 +1056,12 @@ listen<TranscriptionProgress>("transcription-progress", (event) => {
   const item = queue.find((q) => q.id === data.job_id);
   if (item) {
     item.progress = data.progress;
-    if (data.status === "transcribing") item.status = "transcribing";
+    if (data.status === "transcribing") {
+      if (item.status !== "transcribing") {
+        item.status = "transcribing";
+        item.startedAt = Date.now();
+      }
+    }
     renderQueue();
   }
 });
@@ -760,7 +1074,1120 @@ listen<ModelDownloadProgress>("model-download-progress", (event) => {
   if (text && data.downloaded_mb !== undefined) text.textContent = `${data.downloaded_mb.toFixed(0)} / ${data.total_mb?.toFixed(0)} MB`;
 });
 
+listen<{status: string; progress: number}>("gap-progress", (event) => {
+  const data = event.payload;
+  // Update the chapters status if modal is open
+  const chaptersStatus = document.getElementById("chapters-status");
+  if (chaptersStatus && !chaptersModal.classList.contains("hidden")) {
+    chaptersStatus.textContent = data.status;
+    chaptersStatus.className = "chapters-status";
+  }
+});
+
+// Persist UI preferences
+function savePreferences() {
+  localStorage.setItem("pref_model", selectModel.value);
+  localStorage.setItem("pref_format", selectFormat.value);
+  localStorage.setItem("pref_threads", selectThreads.value);
+  localStorage.setItem("pref_concurrent", selectConcurrent.value);
+  localStorage.setItem("pref_auto_chapters", chkAutoChapters.checked ? "1" : "0");
+  localStorage.setItem("pref_snap_gaps", chkSnapGaps.checked ? "1" : "0");
+  localStorage.setItem("pref_embed_flac", chkEmbedFlac.checked ? "1" : "0");
+  localStorage.setItem("pref_write_cue", chkWriteCue.checked ? "1" : "0");
+  localStorage.setItem("pref_raw_llm", chkRawLlm.checked ? "1" : "0");
+  localStorage.setItem("pref_per_word", chkPerWord.checked ? "1" : "0");
+}
+
+function loadPreferences() {
+  const model = localStorage.getItem("pref_model");
+  if (model) selectModel.value = model;
+  const format = localStorage.getItem("pref_format");
+  if (format) selectFormat.value = format;
+  const threads = localStorage.getItem("pref_threads");
+  if (threads) selectThreads.value = threads;
+  const concurrent = localStorage.getItem("pref_concurrent");
+  if (concurrent) selectConcurrent.value = concurrent;
+  const autoChapters = localStorage.getItem("pref_auto_chapters");
+  if (autoChapters !== null) chkAutoChapters.checked = autoChapters === "1";
+  const useVad = localStorage.getItem("pref_snap_gaps");
+  if (useVad !== null) chkSnapGaps.checked = useVad === "1";
+  const embedFlac = localStorage.getItem("pref_embed_flac");
+  if (embedFlac !== null) chkEmbedFlac.checked = embedFlac === "1";
+  const writeCue = localStorage.getItem("pref_write_cue");
+  if (writeCue !== null) chkWriteCue.checked = writeCue === "1";
+  const rawLlm = localStorage.getItem("pref_raw_llm");
+  if (rawLlm !== null) chkRawLlm.checked = rawLlm === "1";
+  const perWord = localStorage.getItem("pref_per_word");
+  if (perWord !== null) chkPerWord.checked = perWord === "1";
+}
+
+selectModel.addEventListener("change", savePreferences);
+selectFormat.addEventListener("change", savePreferences);
+selectThreads.addEventListener("change", savePreferences);
+selectConcurrent.addEventListener("change", savePreferences);
+chkAutoChapters.addEventListener("change", savePreferences);
+chkSnapGaps.addEventListener("change", savePreferences);
+chkEmbedFlac.addEventListener("change", savePreferences);
+chkWriteCue.addEventListener("change", savePreferences);
+chkRawLlm.addEventListener("change", savePreferences);
+chkPerWord.addEventListener("change", savePreferences);
+selectLlmModel.addEventListener("change", () => {
+  localStorage.setItem("llm_model", selectLlmModel.value);
+});
+
+// === Template Editor ===
+interface WaveformData {
+  peaks_min: number[];
+  peaks_max: number[];
+  start_secs: number;
+  end_secs: number;
+  duration_secs: number;
+}
+
+interface TemplateInfo {
+  name: string;
+  duration_secs: number;
+  source_file: string;
+}
+
+interface TemplateMatchResult {
+  time_secs: number;
+  confidence: number;
+}
+
+const templateModal = document.getElementById("template-modal")!;
+const btnTemplateEditor = document.getElementById("btn-template-editor")!;
+const templateAudioPath = document.getElementById("template-audio-path") as HTMLInputElement;
+const btnTemplateBrowse = document.getElementById("btn-template-browse")!;
+const btnTemplateLoadChapters = document.getElementById("btn-template-load-chapters")!;
+const templateJumpTime = document.getElementById("template-jump-time") as HTMLInputElement;
+const btnTemplateJump = document.getElementById("btn-template-jump")!;
+const templateCanvas = document.getElementById("template-waveform") as HTMLCanvasElement;
+const templateTimeInfo = document.getElementById("template-time-info")!;
+const btnTemplateZoomIn = document.getElementById("btn-template-zoom-in")!;
+const btnTemplateZoomOut = document.getElementById("btn-template-zoom-out")!;
+const btnTemplateZoomFit = document.getElementById("btn-template-zoom-fit")!;
+const btnTemplateZoomSel = document.getElementById("btn-template-zoom-sel")!;
+const btnTemplatePlay = document.getElementById("btn-template-play")!;
+const btnTemplateSave = document.getElementById("btn-template-save")!;
+const templateNameInput = document.getElementById("template-name-input") as HTMLInputElement;
+const templateListItems = document.getElementById("template-list-items")!;
+const templateThreshold = document.getElementById("template-threshold") as HTMLInputElement;
+const templateThresholdVal = document.getElementById("template-threshold-val")!;
+templateThreshold.addEventListener("input", () => { templateThresholdVal.textContent = templateThreshold.value; });
+
+setupModal(btnTemplateEditor, templateModal);
+
+let tmplAudioFile = "";
+let tmplDuration = 0;
+let tmplViewStart = 0;
+let tmplViewEnd = 30; // show 30s initially
+let tmplSelStart = 0;
+let tmplSelEnd = 0;
+let tmplDragging: "start" | "end" | "pan" | null = null;
+let tmplDragStartX = 0;
+let tmplPanOrigin = { viewStart: 0, viewEnd: 0 };
+let tmplWaveform: WaveformData | null = null;
+let tmplAudioCtx: AudioContext | null = null;
+let tmplPlayingSource: AudioBufferSourceNode | null = null;
+let tmplCssW = 800;
+let tmplCssH = 180;
+let tmplChapterMarkers: { time: number; title: string }[] = [];
+let tmplPlayStartCtx = 0;
+let tmplPlayStartSec = 0;
+let tmplPlayheadRAF = 0;
+
+function tmplSetupCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = templateCanvas.getBoundingClientRect();
+  tmplCssW = rect.width || 800;
+  tmplCssH = rect.height || 180;
+  templateCanvas.width = Math.round(tmplCssW * dpr);
+  templateCanvas.height = Math.round(tmplCssH * dpr);
+  const ctx = templateCanvas.getContext("2d")!;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function tmplSecsToX(secs: number): number {
+  return ((secs - tmplViewStart) / (tmplViewEnd - tmplViewStart)) * tmplCssW;
+}
+
+function tmplXToSecs(x: number): number {
+  return tmplViewStart + (x / tmplCssW) * (tmplViewEnd - tmplViewStart);
+}
+
+function tmplFormatTime(secs: number): string {
+  const m = Math.floor(secs / 60);
+  const s = (secs % 60).toFixed(2);
+  return `${m}:${s.padStart(5, "0")}`;
+}
+
+async function tmplLoadWaveform() {
+  if (!tmplAudioFile) return;
+  templateTimeInfo.textContent = "Loading waveform...";
+  try {
+    tmplWaveform = await invoke<WaveformData>("get_waveform_peaks", {
+      path: tmplAudioFile,
+      startSecs: tmplViewStart,
+      endSecs: tmplViewEnd,
+      numPoints: Math.round(tmplCssW),
+    });
+    tmplDrawWaveform();
+    tmplUpdateInfo();
+  } catch (e) {
+    templateTimeInfo.textContent = `Error: ${e}`;
+  }
+}
+
+let tmplLoadTimer = 0;
+function tmplScheduleLoad() {
+  clearTimeout(tmplLoadTimer);
+  tmplLoadTimer = window.setTimeout(() => tmplLoadWaveform(), 80);
+}
+
+function tmplAnimatePlayhead() {
+  if (!tmplPlayingSource) { tmplPlayheadRAF = 0; return; }
+  tmplDrawWaveform();
+  tmplPlayheadRAF = requestAnimationFrame(tmplAnimatePlayhead);
+}
+
+function tmplDrawWaveform() {
+  const ctx = templateCanvas.getContext("2d")!;
+  const w = tmplCssW;
+  const h = tmplCssH;
+  ctx.clearRect(0, 0, w, h);
+
+  // Background
+  ctx.fillStyle = "#0a0a1a";
+  ctx.fillRect(0, 0, w, h);
+
+  if (!tmplWaveform) return;
+
+  // Selection highlight
+  const selX1 = tmplSecsToX(tmplSelStart);
+  const selX2 = tmplSecsToX(tmplSelEnd);
+  if (tmplSelEnd > tmplSelStart) {
+    ctx.fillStyle = "rgba(0, 176, 240, 0.15)";
+    ctx.fillRect(selX1, 0, selX2 - selX1, h);
+  }
+
+  // Waveform
+  const mid = h / 2;
+  const scale = mid * 0.9;
+  ctx.strokeStyle = "#00b0f0";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  const stepX = w / tmplWaveform.peaks_max.length;
+  for (let i = 0; i < tmplWaveform.peaks_max.length; i++) {
+    const x = i * stepX;
+    const yMax = mid - tmplWaveform.peaks_max[i] * scale;
+    const yMin = mid - tmplWaveform.peaks_min[i] * scale;
+    ctx.moveTo(x, yMax);
+    ctx.lineTo(x, yMin);
+  }
+  ctx.stroke();
+
+  // Center line
+  ctx.strokeStyle = "rgba(255,255,255,0.1)";
+  ctx.beginPath();
+  ctx.moveTo(0, mid);
+  ctx.lineTo(w, mid);
+  ctx.stroke();
+
+  // Selection handles
+  if (tmplSelEnd > tmplSelStart) {
+    for (const x of [selX1, selX2]) {
+      ctx.strokeStyle = "#ff9800";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+
+      // Handle grip
+      ctx.fillStyle = "#ff9800";
+      ctx.fillRect(x - 4, 0, 8, 12);
+      ctx.fillRect(x - 4, h - 12, 8, 12);
+    }
+  }
+
+  // Time labels
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  ctx.font = "11px monospace";
+  const viewDur = tmplViewEnd - tmplViewStart;
+  const labelStep = viewDur < 5 ? 0.5 : viewDur < 30 ? 2 : viewDur < 120 ? 10 : 30;
+  let t = Math.ceil(tmplViewStart / labelStep) * labelStep;
+  while (t < tmplViewEnd) {
+    const x = tmplSecsToX(t);
+    ctx.fillText(tmplFormatTime(t), x + 2, h - 2);
+    ctx.strokeStyle = "rgba(255,255,255,0.08)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    t += labelStep;
+  }
+
+  // Chapter markers overlay
+  for (const m of tmplChapterMarkers) {
+    if (m.time < tmplViewStart || m.time > tmplViewEnd) continue;
+    const x = tmplSecsToX(m.time);
+    ctx.strokeStyle = "rgba(76, 175, 80, 0.8)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(76, 175, 80, 0.9)";
+    ctx.font = "10px sans-serif";
+    ctx.fillText(m.title.slice(0, 30), x + 3, 11);
+  }
+
+  // Playhead
+  if (tmplPlayingSource && tmplAudioCtx) {
+    const playPos = tmplPlayStartSec + (tmplAudioCtx.currentTime - tmplPlayStartCtx);
+    if (playPos >= tmplViewStart && playPos <= tmplViewEnd) {
+      const x = tmplSecsToX(playPos);
+      ctx.strokeStyle = "#e94560";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, h);
+      ctx.stroke();
+    }
+  }
+}
+
+function tmplUpdateInfo() {
+  if (tmplSelEnd > tmplSelStart) {
+    templateTimeInfo.textContent =
+      `Selection: ${tmplFormatTime(tmplSelStart)} — ${tmplFormatTime(tmplSelEnd)} (${(tmplSelEnd - tmplSelStart).toFixed(2)}s)  |  View: ${tmplFormatTime(tmplViewStart)} — ${tmplFormatTime(tmplViewEnd)}`;
+  } else {
+    templateTimeInfo.textContent = `View: ${tmplFormatTime(tmplViewStart)} — ${tmplFormatTime(tmplViewEnd)}  |  Click and drag to select region`;
+  }
+}
+
+// Canvas mouse interaction
+templateCanvas.addEventListener("mousedown", (e) => {
+  const rect = templateCanvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const secs = tmplXToSecs(x);
+
+  // Check if clicking near a handle
+  if (tmplSelEnd > tmplSelStart) {
+    const startX = tmplSecsToX(tmplSelStart);
+    const endX = tmplSecsToX(tmplSelEnd);
+    if (Math.abs(x - startX) < 8) { tmplDragging = "start"; return; }
+    if (Math.abs(x - endX) < 8) { tmplDragging = "end"; return; }
+  }
+
+  // Middle click or right-click to pan
+  if (e.button === 1 || e.button === 2) {
+    tmplDragging = "pan";
+    tmplDragStartX = x;
+    tmplPanOrigin = { viewStart: tmplViewStart, viewEnd: tmplViewEnd };
+    return;
+  }
+
+  // Start new selection
+  tmplSelStart = secs;
+  tmplSelEnd = secs;
+  tmplDragging = "end";
+});
+
+templateCanvas.addEventListener("mousemove", (e) => {
+  if (!tmplDragging) return;
+  const rect = templateCanvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const secs = tmplXToSecs(x);
+
+  if (tmplDragging === "start") {
+    tmplSelStart = Math.max(tmplViewStart, Math.min(secs, tmplSelEnd - 0.05));
+  } else if (tmplDragging === "end") {
+    tmplSelEnd = Math.min(tmplViewEnd, Math.max(secs, tmplSelStart + 0.05));
+  } else if (tmplDragging === "pan") {
+    const dx = (x - tmplDragStartX) / tmplCssW * (tmplPanOrigin.viewEnd - tmplPanOrigin.viewStart);
+    const dur = tmplPanOrigin.viewEnd - tmplPanOrigin.viewStart;
+    tmplViewStart = Math.max(0, Math.min(tmplDuration - dur, tmplPanOrigin.viewStart - dx));
+    tmplViewEnd = tmplViewStart + dur;
+    tmplScheduleLoad();
+    tmplDrawWaveform();
+    return;
+  }
+  tmplDrawWaveform();
+  tmplUpdateInfo();
+});
+
+window.addEventListener("mouseup", () => {
+  tmplDragging = null;
+});
+
+templateCanvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+// Scroll to zoom
+templateCanvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  const rect = templateCanvas.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const center = tmplXToSecs(x);
+  const viewDur = tmplViewEnd - tmplViewStart;
+  const factor = e.deltaY > 0 ? 1.3 : 0.7;
+  const newDur = Math.max(0.5, Math.min(tmplDuration, viewDur * factor));
+  const ratio = (center - tmplViewStart) / viewDur;
+  tmplViewStart = Math.max(0, center - newDur * ratio);
+  tmplViewEnd = Math.min(tmplDuration, tmplViewStart + newDur);
+  tmplLoadWaveform();
+});
+
+// Browse for audio file
+btnTemplateBrowse.addEventListener("click", async () => {
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "Audio", extensions: ["flac", "mp3", "wav", "ogg", "m4a", "aac"] }],
+  });
+  if (selected) {
+    const path = Array.isArray(selected) ? selected[0] : selected;
+    tmplAudioFile = path;
+    templateAudioPath.value = path.split("/").pop() || path;
+    try {
+      tmplDuration = await invoke<number>("get_audio_duration", { path });
+      tmplViewStart = 0;
+      tmplViewEnd = tmplDuration;
+      tmplSelStart = 0;
+      tmplSelEnd = 0;
+      await tmplLoadWaveform();
+    } catch (e) {
+      templateTimeInfo.textContent = `Error loading audio: ${e}`;
+    }
+  }
+});
+
+// Jump to time
+btnTemplateJump.addEventListener("click", () => {
+  const val = templateJumpTime.value.trim();
+  const parts = val.split(":").map(Number);
+  let secs = 0;
+  if (parts.length === 2) secs = parts[0] * 60 + parts[1];
+  else if (parts.length === 1) secs = parts[0];
+  else return;
+  if (isNaN(secs)) return;
+  const viewDur = tmplViewEnd - tmplViewStart;
+  tmplViewStart = Math.max(0, secs - viewDur / 2);
+  tmplViewEnd = Math.min(tmplDuration, tmplViewStart + viewDur);
+  tmplLoadWaveform();
+});
+
+// Zoom buttons
+btnTemplateZoomIn.addEventListener("click", () => {
+  const mid = (tmplViewStart + tmplViewEnd) / 2;
+  const dur = (tmplViewEnd - tmplViewStart) * 0.5;
+  tmplViewStart = Math.max(0, mid - dur / 2);
+  tmplViewEnd = Math.min(tmplDuration, mid + dur / 2);
+  tmplLoadWaveform();
+  tmplDrawWaveform();
+});
+
+btnTemplateZoomOut.addEventListener("click", () => {
+  const mid = (tmplViewStart + tmplViewEnd) / 2;
+  const dur = Math.min(tmplDuration, (tmplViewEnd - tmplViewStart) * 2);
+  tmplViewStart = Math.max(0, mid - dur / 2);
+  tmplViewEnd = Math.min(tmplDuration, mid + dur / 2);
+  tmplLoadWaveform();
+  tmplDrawWaveform();
+});
+
+btnTemplateZoomFit.addEventListener("click", () => {
+  tmplViewStart = 0;
+  tmplViewEnd = tmplDuration;
+  tmplLoadWaveform();
+});
+
+btnTemplateZoomSel.addEventListener("click", () => {
+  if (tmplSelEnd <= tmplSelStart) return;
+  const pad = (tmplSelEnd - tmplSelStart) * 0.3;
+  tmplViewStart = Math.max(0, tmplSelStart - pad);
+  tmplViewEnd = Math.min(tmplDuration, tmplSelEnd + pad);
+  tmplLoadWaveform();
+});
+
+function tmplStopPlayback() {
+  if (tmplPlayingSource) {
+    try { tmplPlayingSource.stop(); } catch {}
+    tmplPlayingSource = null;
+  }
+  btnTemplatePlay.textContent = "Play Selection";
+  tmplDrawWaveform();
+}
+
+function tmplPlaySamples(samples: number[] | Float32Array, startSec: number) {
+  if (!tmplAudioCtx) tmplAudioCtx = new AudioContext();
+  const buffer = tmplAudioCtx.createBuffer(1, samples.length, 16000);
+  const channelData = buffer.getChannelData(0);
+  for (let i = 0; i < samples.length; i++) channelData[i] = samples[i];
+  const source = tmplAudioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(tmplAudioCtx.destination);
+  source.start();
+  tmplPlayingSource = source;
+  tmplPlayStartCtx = tmplAudioCtx.currentTime;
+  tmplPlayStartSec = startSec;
+  btnTemplatePlay.textContent = "Stop";
+  source.onended = () => {
+    if (tmplPlayingSource === source) tmplStopPlayback();
+  };
+  if (!tmplPlayheadRAF) tmplAnimatePlayhead();
+}
+
+async function tmplTogglePlaySelection() {
+  if (tmplPlayingSource) { tmplStopPlayback(); return; }
+  if (tmplSelEnd <= tmplSelStart || !tmplAudioFile) return;
+  try {
+    const samples = await invoke<number[]>("get_audio_region_pcm", {
+      path: tmplAudioFile,
+      startSecs: tmplSelStart,
+      endSecs: tmplSelEnd,
+    });
+    tmplPlaySamples(samples, tmplSelStart);
+  } catch (e) {
+    templateTimeInfo.textContent = `Playback error: ${e}`;
+  }
+}
+
+btnTemplatePlay.addEventListener("click", tmplTogglePlaySelection);
+
+// Space bar to play/stop when template modal open
+window.addEventListener("keydown", (e) => {
+  if (templateModal.classList.contains("hidden")) return;
+  const target = e.target as HTMLElement;
+  if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA")) return;
+  if (e.code === "Space") {
+    e.preventDefault();
+    tmplTogglePlaySelection();
+  }
+});
+
+// Save template
+btnTemplateSave.addEventListener("click", async () => {
+  const name = templateNameInput.value.trim();
+  if (!name) { templateTimeInfo.textContent = "Enter a template name"; return; }
+  if (tmplSelEnd <= tmplSelStart) { templateTimeInfo.textContent = "Select a region first"; return; }
+  if (!tmplAudioFile) return;
+
+  try {
+    const result = await invoke<string>("save_audio_template", {
+      name,
+      path: tmplAudioFile,
+      startSecs: tmplSelStart,
+      endSecs: tmplSelEnd,
+    });
+    templateTimeInfo.textContent = result;
+    templateNameInput.value = "";
+    tmplRefreshList();
+  } catch (e) {
+    templateTimeInfo.textContent = `Save error: ${e}`;
+  }
+});
+
+let tmplMatches: TemplateMatchResult[] = [];
+let tmplMatchSelected: boolean[] = [];
+
+function tmplRenderMatches(matches: TemplateMatchResult[]) {
+  tmplMatches = matches;
+  tmplMatchSelected = matches.map(() => true);
+  const wrap = document.getElementById("template-matches-wrap")!;
+  const list = document.getElementById("template-matches-list")!;
+  const count = document.getElementById("template-matches-count")!;
+  count.textContent = String(matches.length);
+  if (matches.length === 0) { wrap.style.display = "none"; return; }
+  wrap.style.display = "block";
+  list.innerHTML = matches.map((m, i) => `
+    <div class="template-item" data-idx="${i}">
+      <div class="template-item-info">
+        <input type="checkbox" class="tmpl-match-chk" data-idx="${i}" checked />
+        <span class="template-item-name">${tmplFormatTime(m.time_secs)}</span>
+        <span class="template-item-dur">${(m.confidence * 100).toFixed(0)}%</span>
+        <input type="text" class="form-input tmpl-match-title" data-idx="${i}" placeholder="Chapter title..." style="padding:2px 6px;font-size:0.75rem;width:180px;" />
+      </div>
+      <div>
+        <button class="small tmpl-match-play" data-idx="${i}">Play</button>
+        <button class="small tmpl-match-jump" data-idx="${i}">Show</button>
+      </div>
+    </div>
+  `).join("");
+
+  list.querySelectorAll(".tmpl-match-chk").forEach(el => {
+    el.addEventListener("change", (e) => {
+      const idx = +(e.target as HTMLElement).dataset.idx!;
+      tmplMatchSelected[idx] = (e.target as HTMLInputElement).checked;
+    });
+  });
+  list.querySelectorAll(".tmpl-match-play").forEach(el => {
+    el.addEventListener("click", async () => {
+      const idx = +(el as HTMLElement).dataset.idx!;
+      const t = tmplMatches[idx].time_secs;
+      if (tmplPlayingSource) { tmplStopPlayback(); return; }
+      const samples = await invoke<number[]>("get_audio_region_pcm", {
+        path: tmplAudioFile,
+        startSecs: Math.max(0, t - 0.5),
+        endSecs: Math.min(tmplDuration, t + 2.5),
+      });
+      tmplPlaySamples(samples, Math.max(0, t - 0.5));
+    });
+  });
+  list.querySelectorAll(".tmpl-match-jump").forEach(el => {
+    el.addEventListener("click", () => {
+      const idx = +(el as HTMLElement).dataset.idx!;
+      const t = tmplMatches[idx].time_secs;
+      const viewDur = Math.max(4, tmplViewEnd - tmplViewStart);
+      tmplViewStart = Math.max(0, t - viewDur / 2);
+      tmplViewEnd = Math.min(tmplDuration, tmplViewStart + viewDur);
+      tmplLoadWaveform();
+    });
+  });
+}
+
+document.getElementById("btn-tmpl-matches-all")?.addEventListener("click", () => {
+  tmplMatchSelected = tmplMatches.map(() => true);
+  document.querySelectorAll<HTMLInputElement>(".tmpl-match-chk").forEach(c => c.checked = true);
+});
+document.getElementById("btn-tmpl-matches-none")?.addEventListener("click", () => {
+  tmplMatchSelected = tmplMatches.map(() => false);
+  document.querySelectorAll<HTMLInputElement>(".tmpl-match-chk").forEach(c => c.checked = false);
+});
+document.getElementById("btn-tmpl-matches-save")?.addEventListener("click", async () => {
+  if (!tmplAudioFile) { templateTimeInfo.textContent = "No audio file"; return; }
+  const titles: string[] = [];
+  document.querySelectorAll<HTMLInputElement>(".tmpl-match-title").forEach(el => {
+    titles[+el.dataset.idx!] = el.value.trim();
+  });
+  const selected = tmplMatches
+    .map((m, i) => ({ ...m, title: titles[i] || `Chapter ${i + 1}`, keep: tmplMatchSelected[i] }))
+    .filter(m => m.keep)
+    .sort((a, b) => a.time_secs - b.time_secs);
+  if (selected.length === 0) { templateTimeInfo.textContent = "No matches selected"; return; }
+  // Force first chapter to 0:00
+  const chapters = selected.map((m, i) => ({
+    title: i === 0 ? (m.title || "Chapter 1") : m.title,
+    start_secs: i === 0 ? 0 : m.time_secs,
+    start_time: tmplFormatHHMMSS(i === 0 ? 0 : m.time_secs),
+  }));
+  // Write JSON next to audio
+  const base = tmplAudioFile.replace(/\.[^.]+$/, "");
+  const outPath = `${base}.chapters.json`;
+  try {
+    await invoke("write_text_file", { path: outPath, content: JSON.stringify(chapters, null, 2) });
+    templateTimeInfo.textContent = `Saved ${chapters.length} chapters → ${outPath.split("/").pop()}`;
+  } catch (e) {
+    templateTimeInfo.textContent = `Save failed: ${e}`;
+  }
+});
+
+function tmplFormatHHMMSS(secs: number): string {
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = Math.floor(secs % 60);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+async function tmplRefreshList() {
+  const templates = await invoke<TemplateInfo[]>("list_audio_templates");
+  if (templates.length === 0) {
+    templateListItems.innerHTML = '<div style="font-size:0.8rem;color:var(--text-muted);padding:8px 0;">No templates saved yet</div>';
+    return;
+  }
+  templateListItems.innerHTML = templates.map(t => `
+    <div class="template-item">
+      <div class="template-item-info">
+        <span class="template-item-name">${escapeHtml(t.name)}</span>
+        <span class="template-item-dur">${t.duration_secs.toFixed(2)}s</span>
+        <span class="template-item-dur">${escapeHtml(t.source_file.split("/").pop() || "")}</span>
+      </div>
+      <div>
+        <button class="small btn-tmpl-play" data-name="${escapeHtml(t.name)}">Play</button>
+        <button class="small btn-tmpl-test" data-name="${escapeHtml(t.name)}">Test</button>
+        <button class="small danger btn-tmpl-delete" data-name="${escapeHtml(t.name)}">&times;</button>
+      </div>
+    </div>
+  `).join("");
+
+  templateListItems.querySelectorAll(".btn-tmpl-delete").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const name = (btn as HTMLElement).dataset.name!;
+      await invoke("delete_audio_template", { name });
+      tmplRefreshList();
+    });
+  });
+
+  templateListItems.querySelectorAll(".btn-tmpl-play").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const name = (btn as HTMLElement).dataset.name!;
+      if (tmplPlayingSource) { tmplStopPlayback(); return; }
+      try {
+        const samples = await invoke<number[]>("get_template_pcm", { name });
+        tmplPlaySamples(samples, 0);
+      } catch (e) {
+        templateTimeInfo.textContent = `Template play error: ${e}`;
+      }
+    });
+  });
+
+  templateListItems.querySelectorAll(".btn-tmpl-test").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      if (!tmplAudioFile) { templateTimeInfo.textContent = "Load an audio file first"; return; }
+      const name = (btn as HTMLElement).dataset.name!;
+      templateTimeInfo.textContent = `Scanning for "${name}" matches...`;
+      try {
+        const matches = await invoke<TemplateMatchResult[]>("find_template_matches", {
+          audioPath: tmplAudioFile,
+          templateName: name,
+          threshold: parseFloat(templateThreshold.value),
+        });
+        tmplRenderMatches(matches);
+        if (matches.length === 0) {
+          templateTimeInfo.textContent = `No matches found for "${name}". Try lowering threshold.`;
+        } else {
+          templateTimeInfo.textContent = `Found ${matches.length} matches`;
+        }
+      } catch (e) {
+        templateTimeInfo.textContent = `Match error: ${e}`;
+      }
+    });
+  });
+}
+
+btnTemplateEditor.addEventListener("click", () => {
+  tmplRefreshList();
+  requestAnimationFrame(() => {
+    tmplSetupCanvas();
+    tmplDrawWaveform();
+    if (tmplAudioFile) tmplLoadWaveform();
+  });
+});
+
+window.addEventListener("resize", () => {
+  if (!templateModal.classList.contains("hidden")) {
+    tmplSetupCanvas();
+    tmplDrawWaveform();
+  }
+});
+
+btnTemplateLoadChapters.addEventListener("click", async () => {
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "Chapters", extensions: ["json", "srt", "vtt", "cue", "txt"] }],
+  });
+  if (!selected) return;
+  const path = Array.isArray(selected) ? selected[0] : selected;
+  try {
+    const text = await invoke<string>("read_text_file", { path });
+    tmplChapterMarkers = parseChapterMarkers(text, path);
+    templateTimeInfo.textContent = `Loaded ${tmplChapterMarkers.length} chapter markers`;
+    tmplDrawWaveform();
+  } catch (e) {
+    templateTimeInfo.textContent = `Failed to load chapters: ${e}`;
+  }
+});
+
+function parseChapterMarkers(text: string, path: string): { time: number; title: string }[] {
+  const ext = path.split(".").pop()?.toLowerCase() || "";
+  const result: { time: number; title: string }[] = [];
+  const toSecs = (h: number, m: number, s: number) => h * 3600 + m * 60 + s;
+  if (ext === "json") {
+    try {
+      const data = JSON.parse(text);
+      const arr = Array.isArray(data) ? data : (data.chapters || []);
+      for (const c of arr) {
+        const t = c.start_secs ?? c.start ?? (c.start_time ? parseTimeStr(c.start_time) : 0);
+        result.push({ time: Number(t) || 0, title: c.title || c.name || "" });
+      }
+    } catch {}
+  } else if (ext === "cue") {
+    const lines = text.split("\n");
+    let title = "";
+    for (const line of lines) {
+      const tm = line.match(/TITLE\s+"(.+)"/);
+      if (tm) { title = tm[1]; continue; }
+      const im = line.match(/INDEX\s+01\s+(\d+):(\d+):(\d+)/);
+      if (im) {
+        result.push({ time: toSecs(0, +im[1], +im[2] + +im[3] / 75), title });
+        title = "";
+      }
+    }
+  } else if (ext === "srt" || ext === "vtt") {
+    const re = /(\d+):(\d+):(\d+)[.,](\d+)\s*-->/g;
+    let m;
+    while ((m = re.exec(text))) {
+      result.push({ time: toSecs(+m[1], +m[2], +m[3] + +m[4] / 1000), title: "" });
+    }
+  } else {
+    // txt: "MM:SS Title" or "HH:MM:SS Title" per line
+    for (const line of text.split("\n")) {
+      const m = line.match(/^(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)\s+(.*)$/);
+      if (m) result.push({ time: toSecs(+(m[1] || 0), +m[2], +m[3]), title: m[4] });
+    }
+  }
+  return result;
+}
+
+function parseTimeStr(s: string): number {
+  const parts = s.split(":").map(Number);
+  if (parts.length === 3) return parts[0] * 3600 + parts[1] * 60 + parts[2];
+  if (parts.length === 2) return parts[0] * 60 + parts[1];
+  return parts[0] || 0;
+}
+
+listen<{status: string; progress: number}>("template-match-progress", (event) => {
+  templateTimeInfo.textContent = event.payload.status;
+});
+
+// === Align Chapters Modal ===
+const alignModal = document.getElementById("align-modal")!;
+const alignTitle = document.getElementById("align-title")!;
+const alignStrips = document.getElementById("align-strips")!;
+const btnAlignApply = document.getElementById("btn-align-apply")!;
+
+interface AlignStrip {
+  idx: number;
+  chapter: Chapter;
+  markerSecs: number;
+  viewStart: number;
+  viewEnd: number;
+  canvas: HTMLCanvasElement;
+  waveform: WaveformData | null;
+}
+
+let alignAudioPath = "";
+let alignDuration = 0;
+let alignStripsData: AlignStrip[] = [];
+let alignPlayingSource: AudioBufferSourceNode | null = null;
+let alignAudioCtx: AudioContext | null = null;
+let alignDragging: { idx: number } | null = null;
+let alignPlayheadRAF = 0;
+let alignPlayStartCtx = 0;
+let alignPlayStartSec = 0;
+let alignPlayingIdx = -1;
+
+alignModal.querySelector(".modal-close")!.addEventListener("click", () => {
+  alignModal.classList.add("hidden");
+  alignStopPlayback();
+});
+alignModal.addEventListener("click", (e) => {
+  if (e.target === alignModal) { alignModal.classList.add("hidden"); alignStopPlayback(); }
+});
+
+function alignStopPlayback() {
+  if (alignPlayingSource) { try { alignPlayingSource.stop(); } catch {} alignPlayingSource = null; }
+  alignPlayingIdx = -1;
+  if (alignPlayheadRAF) { cancelAnimationFrame(alignPlayheadRAF); alignPlayheadRAF = 0; }
+  alignStripsData.forEach(s => alignDrawStrip(s));
+}
+
+function alignFormatTime(secs: number): string {
+  const m = Math.floor(secs / 60);
+  const s = (secs % 60).toFixed(2);
+  return `${m}:${s.padStart(5, "0")}`;
+}
+
+function alignFormatHMS(secs: number): string {
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = Math.floor(secs % 60);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+async function openAlignModal(audioPath: string, chapters: Chapter[], duration: number) {
+  alignAudioPath = audioPath;
+  alignDuration = duration || await invoke<number>("get_audio_duration", { path: audioPath });
+  alignTitle.textContent = `Align Chapters — ${audioPath.split("/").pop()}`;
+  alignModal.classList.remove("hidden");
+  alignStripsData = [];
+  alignStrips.innerHTML = "";
+
+  // Try to load previously aligned chapters
+  const base = audioPath.replace(/\.[^.]+$/, "");
+  const alignedPath = `${base}_aligned_chapters.json`;
+  try {
+    const exists = await invoke<boolean>("file_exists", { path: alignedPath });
+    if (exists) {
+      const text = await invoke<string>("read_text_file", { path: alignedPath });
+      const aligned: Chapter[] = JSON.parse(text);
+      if (aligned.length > 0) chapters = aligned;
+    }
+  } catch {}
+
+  const WINDOW = 15; // ±15s around each boundary
+
+  for (let i = 0; i < chapters.length; i++) {
+    const ch = chapters[i];
+    const nextCh = chapters[i + 1];
+    const markerSecs = ch.start_secs;
+    const viewStart = Math.max(0, markerSecs - WINDOW);
+    const viewEnd = Math.min(alignDuration, markerSecs + WINDOW);
+
+    const stripEl = document.createElement("div");
+    stripEl.className = "align-strip";
+    stripEl.innerHTML = `
+      <div class="align-strip-header">
+        <span class="align-strip-title">${i === 0 ? "(Start)" : ""} ${escapeHtml(ch.title)}${nextCh ? ` → ${escapeHtml(nextCh.title)}` : ""}</span>
+        <span class="align-strip-time" id="align-time-${i}">${alignFormatHMS(markerSecs)}</span>
+      </div>
+      <div class="align-strip-info" id="align-info-${i}">Drag the marker to adjust boundary. Click to set.</div>
+      <div class="align-canvas-wrap">
+        <canvas id="align-canvas-${i}" width="850" height="80"></canvas>
+      </div>
+      <div class="align-btns">
+        <button class="small align-play" data-idx="${i}">Play</button>
+        <button class="small align-zoom-in" data-idx="${i}">Zoom In</button>
+        <button class="small align-zoom-out" data-idx="${i}">Zoom Out</button>
+      </div>
+    `;
+    alignStrips.appendChild(stripEl);
+
+    const canvas = document.getElementById(`align-canvas-${i}`) as HTMLCanvasElement;
+    const strip: AlignStrip = { idx: i, chapter: ch, markerSecs, viewStart, viewEnd, canvas, waveform: null };
+    alignStripsData.push(strip);
+
+    // HiDPI
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    const cssW = rect.width || 850;
+    const cssH = rect.height || 80;
+    canvas.width = Math.round(cssW * dpr);
+    canvas.height = Math.round(cssH * dpr);
+    canvas.getContext("2d")!.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    // Mouse handlers
+    canvas.addEventListener("mousedown", (e) => {
+      const r = canvas.getBoundingClientRect();
+      const x = e.clientX - r.left;
+      const secs = strip.viewStart + (x / r.width) * (strip.viewEnd - strip.viewStart);
+      strip.markerSecs = Math.max(strip.viewStart, Math.min(strip.viewEnd, secs));
+      alignDragging = { idx: i };
+      alignUpdateStripTime(strip);
+      alignDrawStrip(strip);
+    });
+
+    canvas.addEventListener("mousemove", (e) => {
+      if (!alignDragging || alignDragging.idx !== i) return;
+      const r = canvas.getBoundingClientRect();
+      const x = e.clientX - r.left;
+      const secs = strip.viewStart + (x / r.width) * (strip.viewEnd - strip.viewStart);
+      strip.markerSecs = Math.max(strip.viewStart, Math.min(strip.viewEnd, secs));
+      alignUpdateStripTime(strip);
+      alignDrawStrip(strip);
+    });
+
+    // Load waveform
+    alignLoadStrip(strip);
+  }
+
+  // Global mouseup
+  window.addEventListener("mouseup", () => { alignDragging = null; });
+
+  // Button handlers
+  alignStrips.querySelectorAll(".align-play").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = +(btn as HTMLElement).dataset.idx!;
+      alignPlayAt(idx);
+    });
+  });
+
+  alignStrips.querySelectorAll(".align-zoom-in").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = +(btn as HTMLElement).dataset.idx!;
+      const s = alignStripsData[idx];
+      const center = s.markerSecs;
+      const dur = (s.viewEnd - s.viewStart) * 0.5;
+      s.viewStart = Math.max(0, center - dur / 2);
+      s.viewEnd = Math.min(alignDuration, center + dur / 2);
+      alignLoadStrip(s);
+    });
+  });
+
+  alignStrips.querySelectorAll(".align-zoom-out").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = +(btn as HTMLElement).dataset.idx!;
+      const s = alignStripsData[idx];
+      const center = s.markerSecs;
+      const dur = Math.min(alignDuration, (s.viewEnd - s.viewStart) * 2);
+      s.viewStart = Math.max(0, center - dur / 2);
+      s.viewEnd = Math.min(alignDuration, center + dur / 2);
+      alignLoadStrip(s);
+    });
+  });
+}
+
+function alignUpdateStripTime(strip: AlignStrip) {
+  const el = document.getElementById(`align-time-${strip.idx}`);
+  if (el) el.textContent = alignFormatHMS(strip.markerSecs);
+  const info = document.getElementById(`align-info-${strip.idx}`);
+  if (info) info.textContent = `${alignFormatTime(strip.markerSecs)} (${strip.markerSecs > strip.chapter.start_secs ? "+" : ""}${(strip.markerSecs - strip.chapter.start_secs).toFixed(2)}s from original)`;
+}
+
+async function alignLoadStrip(strip: AlignStrip) {
+  const cssW = strip.canvas.getBoundingClientRect().width || 850;
+  try {
+    strip.waveform = await invoke<WaveformData>("get_waveform_peaks", {
+      path: alignAudioPath,
+      startSecs: strip.viewStart,
+      endSecs: strip.viewEnd,
+      numPoints: Math.round(cssW),
+    });
+    alignDrawStrip(strip);
+  } catch (e) {
+    console.warn("Failed to load waveform for strip", strip.idx, e);
+  }
+}
+
+function alignDrawStrip(strip: AlignStrip) {
+  const ctx = strip.canvas.getContext("2d")!;
+  const rect = strip.canvas.getBoundingClientRect();
+  const w = rect.width || 850;
+  const h = rect.height || 80;
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#0a0a1a";
+  ctx.fillRect(0, 0, w, h);
+
+  if (!strip.waveform) return;
+
+  // Waveform
+  const mid = h / 2;
+  const scale = mid * 0.9;
+  const stepX = w / strip.waveform.peaks_max.length;
+  ctx.strokeStyle = "#00b0f0";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let i = 0; i < strip.waveform.peaks_max.length; i++) {
+    const x = i * stepX;
+    const yMax = mid - strip.waveform.peaks_max[i] * scale;
+    const yMin = mid - strip.waveform.peaks_min[i] * scale;
+    ctx.moveTo(x, yMax);
+    ctx.lineTo(x, yMin);
+  }
+  ctx.stroke();
+
+  // Center line
+  ctx.strokeStyle = "rgba(255,255,255,0.08)";
+  ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(w, mid); ctx.stroke();
+
+  // Original position (ghost line)
+  const origX = ((strip.chapter.start_secs - strip.viewStart) / (strip.viewEnd - strip.viewStart)) * w;
+  if (origX >= 0 && origX <= w && Math.abs(strip.markerSecs - strip.chapter.start_secs) > 0.1) {
+    ctx.strokeStyle = "rgba(255, 152, 0, 0.3)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 4]);
+    ctx.beginPath(); ctx.moveTo(origX, 0); ctx.lineTo(origX, h); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Marker line
+  const markerX = ((strip.markerSecs - strip.viewStart) / (strip.viewEnd - strip.viewStart)) * w;
+  if (markerX >= 0 && markerX <= w) {
+    ctx.strokeStyle = "#ff9800";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(markerX, 0); ctx.lineTo(markerX, h); ctx.stroke();
+    // Handle grips
+    ctx.fillStyle = "#ff9800";
+    ctx.fillRect(markerX - 4, 0, 8, 10);
+    ctx.fillRect(markerX - 4, h - 10, 8, 10);
+  }
+
+  // Playhead
+  if (alignPlayingSource && alignAudioCtx && alignPlayingIdx === strip.idx) {
+    const pos = alignPlayStartSec + (alignAudioCtx.currentTime - alignPlayStartCtx);
+    const px = ((pos - strip.viewStart) / (strip.viewEnd - strip.viewStart)) * w;
+    if (px >= 0 && px <= w) {
+      ctx.strokeStyle = "#e94560";
+      ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(px, 0); ctx.lineTo(px, h); ctx.stroke();
+    }
+  }
+
+  // Time labels
+  ctx.fillStyle = "rgba(255,255,255,0.4)";
+  ctx.font = "10px monospace";
+  const viewDur = strip.viewEnd - strip.viewStart;
+  const labelStep = viewDur < 5 ? 0.5 : viewDur < 15 ? 1 : viewDur < 60 ? 5 : 10;
+  let t = Math.ceil(strip.viewStart / labelStep) * labelStep;
+  while (t < strip.viewEnd) {
+    const x = ((t - strip.viewStart) / (strip.viewEnd - strip.viewStart)) * w;
+    ctx.fillText(alignFormatTime(t), x + 2, h - 2);
+    t += labelStep;
+  }
+}
+
+async function alignPlayAt(idx: number) {
+  alignStopPlayback();
+  const strip = alignStripsData[idx];
+  const start = Math.max(0, strip.markerSecs - getAlignBefore());
+  const end = Math.min(alignDuration, strip.markerSecs + getAlignAfter());
+  try {
+    const samples = await invoke<number[]>("get_audio_region_pcm", {
+      path: alignAudioPath,
+      startSecs: start,
+      endSecs: end,
+    });
+    if (!alignAudioCtx) alignAudioCtx = new AudioContext();
+    const buffer = alignAudioCtx.createBuffer(1, samples.length, 16000);
+    const cd = buffer.getChannelData(0);
+    for (let i = 0; i < samples.length; i++) cd[i] = samples[i];
+    const source = alignAudioCtx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(alignAudioCtx.destination);
+    source.start();
+    alignPlayingSource = source;
+    alignPlayStartCtx = alignAudioCtx.currentTime;
+    alignPlayStartSec = start;
+    alignPlayingIdx = idx;
+    source.onended = () => { alignStopPlayback(); };
+
+    function animAlign() {
+      if (!alignPlayingSource || alignPlayingIdx !== idx) return;
+      alignDrawStrip(strip);
+      alignPlayheadRAF = requestAnimationFrame(animAlign);
+    }
+    animAlign();
+  } catch (e) { console.warn("Align playback error:", e); }
+}
+
+// Apply aligned chapters
+btnAlignApply.addEventListener("click", async () => {
+  const chapters: Chapter[] = alignStripsData.map(s => ({
+    title: s.chapter.title,
+    start_time: alignFormatHMS(s.markerSecs),
+    start_secs: s.markerSecs,
+  }));
+
+  // Write CUE
+  try {
+    await invoke("write_cue_file", { audioPath: alignAudioPath, chapters });
+  } catch (e) { console.warn("CUE write failed:", e); }
+
+  // Embed in FLAC
+  if (chkEmbedFlac.checked) {
+    try {
+      await invoke("embed_chapters_in_flac", { req: { audio_path: alignAudioPath, chapters } });
+    } catch (e) { console.warn("Embed failed:", e); }
+  }
+
+  // Save JSON
+  const base = alignAudioPath.replace(/\.[^.]+$/, "");
+  const jsonPath = `${base}_aligned_chapters.json`;
+  try {
+    await invoke("write_text_file", { path: jsonPath, content: JSON.stringify(chapters, null, 2) });
+  } catch (e) { console.warn("JSON write failed:", e); }
+
+  alert(`Saved ${chapters.length} aligned chapters (CUE${chkEmbedFlac.checked ? " + FLAC embedded" : ""} + JSON)`);
+  alignModal.classList.add("hidden");
+  alignStopPlayback();
+});
+
 // Init
 loadGpuInfo();
 loadSettingsIntoForm();
+loadPreferences();
 renderQueue();

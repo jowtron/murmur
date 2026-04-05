@@ -1,6 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::DecoderOptions;
+use symphonia::core::formats::FormatOptions;
+use symphonia::core::io::MediaSourceStream;
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -82,61 +88,138 @@ pub fn is_model_downloaded(model: &WhisperModel) -> bool {
     model_path(model).exists()
 }
 
-/// Convert audio file to 16kHz mono f32 PCM using ffmpeg
+/// Decode audio file using symphonia, resample to 16kHz mono f32 PCM
 pub fn audio_to_pcm(path: &Path) -> Result<Vec<f32>, String> {
-    let output = std::process::Command::new("ffmpeg")
-        .args([
-            "-i",
-            path.to_str().ok_or("Invalid path")?,
-            "-ar",
-            "16000",
-            "-ac",
-            "1",
-            "-f",
-            "f32le",
-            "-acodec",
-            "pcm_f32le",
-            "pipe:1",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .output()
-        .map_err(|e| format!("Failed to run ffmpeg: {}", e))?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open audio file: {}", e))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ffmpeg error: {}", stderr));
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
     }
 
-    let samples: Vec<f32> = output
-        .stdout
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-        .collect();
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| format!("Failed to probe audio format: {}", e))?;
 
-    Ok(samples)
+    let mut format = probed.format;
+
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or("No audio track found")?;
+
+    let codec_params = track.codec_params.clone();
+    let track_id = track.id;
+    let source_rate = codec_params.sample_rate.unwrap_or(44100) as f64;
+
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&codec_params, &DecoderOptions::default())
+        .map_err(|e| format!("Failed to create decoder: {}", e))?;
+
+    let mut all_samples: Vec<f32> = Vec::new();
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(p) => p,
+            Err(symphonia::core::errors::Error::IoError(ref e))
+                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(e) => return Err(format!("Error reading packet: {}", e)),
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        let decoded = match decoder.decode(&packet) {
+            Ok(d) => d,
+            Err(symphonia::core::errors::Error::DecodeError(_)) => continue,
+            Err(e) => return Err(format!("Decode error: {}", e)),
+        };
+
+        let spec = *decoded.spec();
+        let num_frames = decoded.frames();
+        let mut sample_buf = SampleBuffer::<f32>::new(num_frames as u64, spec);
+        sample_buf.copy_interleaved_ref(decoded);
+        let samples = sample_buf.samples();
+
+        // Mix down to mono
+        let num_channels = spec.channels.count();
+        for frame in 0..num_frames {
+            let mut sum = 0.0f32;
+            for ch in 0..num_channels {
+                sum += samples[frame * num_channels + ch];
+            }
+            all_samples.push(sum / num_channels as f32);
+        }
+    }
+
+    // Resample to 16kHz using linear interpolation
+    let target_rate = 16000.0;
+    if (source_rate - target_rate).abs() < 1.0 {
+        return Ok(all_samples);
+    }
+
+    let ratio = source_rate / target_rate;
+    let output_len = (all_samples.len() as f64 / ratio) as usize;
+    let mut resampled = Vec::with_capacity(output_len);
+
+    for i in 0..output_len {
+        let src_pos = i as f64 * ratio;
+        let idx = src_pos as usize;
+        let frac = (src_pos - idx as f64) as f32;
+
+        if idx + 1 < all_samples.len() {
+            resampled.push(all_samples[idx] * (1.0 - frac) + all_samples[idx + 1] * frac);
+        } else if idx < all_samples.len() {
+            resampled.push(all_samples[idx]);
+        }
+    }
+
+    Ok(resampled)
 }
 
-/// Get audio duration in seconds using ffprobe
+/// Get audio duration in seconds using symphonia
 pub fn get_duration(path: &Path) -> Result<f64, String> {
-    let output = std::process::Command::new("ffprobe")
-        .args([
-            "-v",
-            "quiet",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            path.to_str().ok_or("Invalid path")?,
-        ])
-        .output()
-        .map_err(|e| format!("ffprobe error: {}", e))?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("Failed to open audio file: {}", e))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse::<f64>()
-        .map_err(|e| format!("Failed to parse duration: {}", e))
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let probed = symphonia::default::get_probe()
+        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .map_err(|e| format!("Failed to probe audio: {}", e))?;
+
+    let format = probed.format;
+
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL)
+        .ok_or("No audio track found")?;
+
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(44100) as f64;
+    let n_frames = track.codec_params.n_frames.unwrap_or(0) as f64;
+
+    if n_frames > 0.0 {
+        Ok(n_frames / sample_rate)
+    } else {
+        // Fallback: use time_base and duration from the track
+        if let (Some(tb), Some(dur)) = (track.codec_params.time_base, track.codec_params.n_frames) {
+            Ok(tb.calc_time(dur).seconds as f64 + tb.calc_time(dur).frac)
+        } else {
+            Err("Could not determine duration".to_string())
+        }
+    }
 }
 
 pub struct Transcriber {
@@ -167,6 +250,23 @@ impl Transcriber {
         audio_path: &Path,
         progress_cb: Option<Arc<Mutex<dyn FnMut(f32) + Send>>>,
     ) -> Result<TranscriptionResult, String> {
+        self.transcribe_inner(audio_path, progress_cb, false)
+    }
+
+    pub fn transcribe_per_word(
+        &self,
+        audio_path: &Path,
+        progress_cb: Option<Arc<Mutex<dyn FnMut(f32) + Send>>>,
+    ) -> Result<TranscriptionResult, String> {
+        self.transcribe_inner(audio_path, progress_cb, true)
+    }
+
+    fn transcribe_inner(
+        &self,
+        audio_path: &Path,
+        progress_cb: Option<Arc<Mutex<dyn FnMut(f32) + Send>>>,
+        per_word: bool,
+    ) -> Result<TranscriptionResult, String> {
         let samples = audio_to_pcm(audio_path)?;
         let duration_secs = samples.len() as f64 / 16000.0;
 
@@ -177,6 +277,8 @@ impl Transcriber {
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_token_timestamps(true);
+        params.set_split_on_word(true);      // split at word boundaries, not mid-word
+        params.set_max_len(if per_word { 1 } else { 20 });
 
         if let Some(cb) = progress_cb {
             params.set_progress_callback_safe(move |progress| {
