@@ -4,6 +4,7 @@ use crate::transcriber::{
 };
 use crate::gap_detection;
 use crate::template;
+use crate::yamnet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -578,35 +579,97 @@ pub async fn detect_chapters(req: ChapterRequest) -> Result<Vec<Chapter>, String
     let parsed: serde_json::Value =
         serde_json::from_str(clean_content).map_err(|e| format!("Failed to parse chapters: {}", e))?;
 
-    let chapters: Vec<Chapter> = serde_json::from_value(parsed["chapters"].clone())
+    let mut chapters: Vec<Chapter> = serde_json::from_value(parsed["chapters"].clone())
         .map_err(|e| format!("Failed to parse chapter list: {}", e))?;
 
-    // Always save raw LLM output alongside (even in corrected mode)
-    if !req.raw_mode {
-        if let Some(ref cp) = cache_path {
-            let raw_path = cp.with_file_name(
-                cp.file_name().unwrap().to_string_lossy().replace("_llm_chapters.", "_llm_raw."),
+    // LLMs often get start_secs wrong (e.g. "00:11:36" → 1136 instead of 696).
+    // Always recompute start_secs from start_time which is usually correct.
+    for ch in &mut chapters {
+        let computed = parse_srt_time(&ch.start_time);
+        if (computed - ch.start_secs).abs() > 1.0 {
+            ch.start_secs = computed;
+        }
+    }
+
+    let corrected_chapters = correct_chapter_timestamps(&chapters, &req.transcript);
+
+    let final_chapters = if req.raw_mode {
+        chapters.clone()
+    } else {
+        corrected_chapters.clone()
+    };
+
+    // Always save both raw and corrected caches
+    if let Some(ref cp) = cache_path {
+        // Save the main cache (whichever mode is active)
+        if let Ok(json) = serde_json::to_string_pretty(&final_chapters) {
+            std::fs::write(cp, json).ok();
+        }
+
+        // Always save raw LLM output with _llm_raw suffix
+        let raw_path = if req.raw_mode {
+            cp.clone()
+        } else {
+            cp.with_file_name(
+                cp.file_name().unwrap().to_string_lossy()
+                    .replace("_llm_chapters.", "_llm_raw."),
+            )
+        };
+        if let Ok(json) = serde_json::to_string_pretty(&chapters) {
+            std::fs::write(&raw_path, json).ok();
+        }
+
+        // Always save corrected with _llm_chapters suffix
+        if req.raw_mode {
+            let corrected_path = cp.with_file_name(
+                cp.file_name().unwrap().to_string_lossy()
+                    .replace("_llm_raw.", "_llm_chapters."),
             );
-            if let Ok(json) = serde_json::to_string_pretty(&chapters) {
-                std::fs::write(&raw_path, json).ok();
+            if let Ok(json) = serde_json::to_string_pretty(&corrected_chapters) {
+                std::fs::write(&corrected_path, json).ok();
             }
         }
     }
 
-    let final_chapters = if req.raw_mode {
-        chapters
+    Ok(final_chapters)
+}
+
+/// Internal: detect chapters and return (raw_llm, srt_corrected) pair
+async fn detect_chapters_both(req: ChapterRequest) -> Result<(Vec<Chapter>, Vec<Chapter>), String> {
+    // We always want both, so run with raw_mode=false to get correction
+    let mut req_for_raw = req.clone();
+    req_for_raw.raw_mode = true;
+    let mut req_for_corrected = req;
+    req_for_corrected.raw_mode = false;
+
+    // Call detect_chapters for corrected (which also saves raw as side effect)
+    let corrected = detect_chapters(req_for_corrected).await?;
+
+    // Load raw from cache file
+    let raw = if let Some(ref tp) = req_for_raw.transcript_path {
+        let path = PathBuf::from(tp);
+        let raw_stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let stem = if let Some(idx) = raw_stem.find("_transcription") {
+            raw_stem[..idx].to_string()
+        } else {
+            raw_stem
+        };
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        let llm_short = req_for_raw.model.split('/').last().unwrap_or(&req_for_raw.model);
+        let raw_path = dir.join(format!("{}_{}_llm_raw.json", stem, llm_short));
+        if raw_path.exists() {
+            std::fs::read_to_string(&raw_path)
+                .ok()
+                .and_then(|d| serde_json::from_str::<Vec<Chapter>>(&d).ok())
+                .unwrap_or_else(|| corrected.clone())
+        } else {
+            corrected.clone()
+        }
     } else {
-        correct_chapter_timestamps(&chapters, &req.transcript)
+        corrected.clone()
     };
 
-    // Save (possibly corrected) cache
-    if let Some(ref cp) = cache_path {
-        if let Ok(json) = serde_json::to_string_pretty(&final_chapters) {
-            std::fs::write(cp, json).ok();
-        }
-    }
-
-    Ok(final_chapters)
+    Ok((raw, corrected))
 }
 
 /// Search the original SRT transcript for each chapter title and use
@@ -770,6 +833,15 @@ pub fn write_text_file(path: String, content: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+pub fn delete_file(path: String) -> Result<(), String> {
+    if std::path::Path::new(&path).exists() {
+        std::fs::remove_file(&path).map_err(|e| format!("Failed to delete file: {}", e))
+    } else {
+        Ok(())
+    }
+}
+
+#[tauri::command]
 pub async fn detect_energy_gaps(
     path: String,
     min_gap_secs: f64,
@@ -812,8 +884,37 @@ pub struct ChapterWithSnap {
     pub title: String,
     pub start_time: String,
     pub start_secs: f64,
-    pub original_secs: f64,
+    pub raw_llm_secs: f64,
+    pub srt_corrected_secs: Option<f64>,
+    pub yamnet_secs: Option<f64>,
     pub snapped: bool,
+}
+
+/// Find the bundled YAMNet TFLite model in the app's Resources directory
+fn find_yamnet_model() -> Result<std::path::PathBuf, String> {
+    // Check bundled in app Resources (macOS: AppName.app/Contents/Resources/)
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(macos_dir) = exe.parent() {
+            let resources = macos_dir.parent().unwrap_or(macos_dir).join("Resources");
+            let bundled = resources.join("resources").join("yamnet.tflite");
+            if bundled.exists() {
+                return Ok(bundled);
+            }
+            // Also check directly in Resources (dev mode)
+            let direct = resources.join("yamnet.tflite");
+            if direct.exists() {
+                return Ok(direct);
+            }
+        }
+    }
+    // Fallback: check relative to the source directory (dev mode)
+    let dev_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("resources")
+        .join("yamnet.tflite");
+    if dev_path.exists() {
+        return Ok(dev_path);
+    }
+    Err("YAMNet model not found. Expected at resources/yamnet.tflite".to_string())
 }
 
 #[tauri::command]
@@ -821,72 +922,83 @@ pub async fn detect_chapters_with_gaps(
     req: ChapterRequest,
     audio_path: String,
     min_gap_secs: f64,
-    silence_threshold: f32,
+    _silence_threshold: f32,
     max_lookback_secs: f64,
     window: Window,
 ) -> Result<Vec<ChapterWithSnap>, String> {
-    // Step 1: LLM chapters first
+    // Step 1: LLM chapters — get both raw and SRT-corrected
     window.emit("gap-progress", serde_json::json!({"status": "Sending transcript to LLM...", "progress": 0.0})).ok();
-    let chapters = detect_chapters(req).await?;
+    let use_srt_correction = !req.raw_mode;
+    let (raw_chapters, corrected_chapters) = detect_chapters_both(req).await?;
+
+    // Use whichever the user selected as the base for snapping
+    let chapters = if use_srt_correction { &corrected_chapters } else { &raw_chapters };
 
     if chapters.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Step 2: Decode audio and scan only 30s windows before each chapter
+    // Step 2: Decode audio, run YAMNet, find speech onsets near each chapter
     let win = window.clone();
     let ap = audio_path.clone();
     let chapter_times: Vec<f64> = chapters.iter().map(|c| c.start_secs).collect();
-    let lookback = max_lookback_secs;
-    let thresh = silence_threshold;
-    let min_gap = min_gap_secs;
+    let snap_window = max_lookback_secs; // ±window around each chapter time
 
     let snapped = tokio::task::spawn_blocking(move || {
-        win.emit("gap-progress", serde_json::json!({"status": "Decoding audio...", "progress": 0.1})).ok();
+        win.emit("gap-progress", serde_json::json!({"status": "Decoding audio...", "progress": 0.05})).ok();
         let samples = transcriber::audio_to_pcm(std::path::Path::new(&ap))?;
-        let sample_rate = 16000u32;
 
-        let mut results: Vec<Option<f64>> = Vec::new();
+        // Find YAMNet model path (bundled in Resources)
+        let model_path = find_yamnet_model()?;
 
-        for (i, &chapter_time) in chapter_times.iter().enumerate() {
-            let pct = 0.2 + 0.8 * (i as f32 / chapter_times.len() as f32);
-            win.emit("gap-progress", serde_json::json!({
-                "status": format!("Scanning gap for chapter {}/{}", i + 1, chapter_times.len()),
-                "progress": pct,
-            })).ok();
+        let progress_cb: std::sync::Arc<std::sync::Mutex<dyn FnMut(f32, &str) + Send>> = {
+            let win2 = win.clone();
+            std::sync::Arc::new(std::sync::Mutex::new(move |pct: f32, status: &str| {
+                // Scale yamnet progress to 0.1-0.8 range
+                let scaled = 0.1 + pct * 0.7;
+                win2.emit("gap-progress", serde_json::json!({"status": status, "progress": scaled})).ok();
+            }))
+        };
 
-            // Extract window: lookback seconds before chapter_time
-            let end_sample = (chapter_time * sample_rate as f64) as usize;
-            let start_sample = ((chapter_time - lookback).max(0.0) * sample_rate as f64) as usize;
+        // Check for cached YAMNet results
+        let audio_path_obj = std::path::Path::new(&ap);
+        let stem = audio_path_obj.file_stem().unwrap_or_default().to_string_lossy();
+        let audio_dir = audio_path_obj.parent().unwrap_or(std::path::Path::new("."));
+        let yamnet_cache_path = audio_dir.join(format!("{}_yamnet.json", stem));
 
-            if start_sample >= samples.len() || end_sample > samples.len() {
-                results.push(None);
-                continue;
+        let frame_scores = if yamnet_cache_path.exists() {
+            win.emit("gap-progress", serde_json::json!({"status": "Loading cached YAMNet results...", "progress": 0.1})).ok();
+            let cached = std::fs::read_to_string(&yamnet_cache_path)
+                .map_err(|e| format!("Failed to read YAMNet cache: {}", e))?;
+            serde_json::from_str::<Vec<yamnet::FrameScores>>(&cached)
+                .map_err(|e| format!("Failed to parse YAMNet cache: {}", e))?
+        } else {
+            win.emit("gap-progress", serde_json::json!({"status": "Running YAMNet classification...", "progress": 0.1})).ok();
+            let scores = yamnet::classify_audio(&samples, &model_path, Some(progress_cb))?;
+            // Cache results
+            if let Ok(json) = serde_json::to_string_pretty(&scores) {
+                std::fs::write(&yamnet_cache_path, json).ok();
             }
+            scores
+        };
 
-            let window_samples = &samples[start_sample..end_sample.min(samples.len())];
+        let onsets = yamnet::find_speech_onsets(&frame_scores, min_gap_secs);
 
-            // Find gaps in this window
-            let gaps = gap_detection::detect_energy_gaps(
-                window_samples, sample_rate, 0.5, thresh, min_gap, None,
-            );
-
-            // Adjust gap times back to absolute time
-            let window_offset = start_sample as f64 / sample_rate as f64;
-
-            // Find the gap closest to (but before) chapter_time
-            let best = gaps.iter()
-                .map(|g| gap_detection::SpeechGap {
-                    start_secs: g.start_secs + window_offset,
-                    end_secs: g.end_secs + window_offset,
-                    duration_secs: g.duration_secs,
-                })
-                .filter(|g| g.start_secs <= chapter_time)
-                .max_by(|a, b| a.start_secs.partial_cmp(&b.start_secs).unwrap())
-                .map(|g| g.start_secs);
-
-            results.push(best);
+        // Also save onsets for inspection
+        let onsets_cache_path = audio_dir.join(format!("{}_yamnet_onsets.json", stem));
+        if let Ok(json) = serde_json::to_string_pretty(&onsets) {
+            std::fs::write(&onsets_cache_path, json).ok();
         }
+
+        win.emit("gap-progress", serde_json::json!({
+            "status": format!("Found {} speech onsets, snapping chapters...", onsets.len()),
+            "progress": 0.85
+        })).ok();
+
+        // For each chapter, find nearest speech onset within ±window
+        let results: Vec<Option<f64>> = chapter_times.iter()
+            .map(|&t| yamnet::nearest_speech_onset(&onsets, t, snap_window))
+            .collect();
 
         win.emit("gap-progress", serde_json::json!({"status": "Done", "progress": 1.0})).ok();
         Ok::<Vec<Option<f64>>, String>(results)
@@ -896,8 +1008,13 @@ pub async fn detect_chapters_with_gaps(
 
     let result = chapters
         .iter()
+        .enumerate()
         .zip(snapped.iter())
-        .map(|(ch, snapped_time)| {
+        .map(|((i, ch), snapped_time)| {
+            let raw_secs = raw_chapters.get(i).map(|r| r.start_secs).unwrap_or(ch.start_secs);
+            let corrected_secs = corrected_chapters.get(i).map(|c| c.start_secs);
+            let yamnet_secs = *snapped_time;
+
             let (final_secs, was_snapped) = match snapped_time {
                 Some(t) => (*t, true),
                 None => (ch.start_secs, false),
@@ -909,7 +1026,9 @@ pub async fn detect_chapters_with_gaps(
                 title: ch.title.clone(),
                 start_time: format!("{:02}:{:02}:{:02}", h, m, s),
                 start_secs: final_secs,
-                original_secs: ch.start_secs,
+                raw_llm_secs: raw_secs,
+                srt_corrected_secs: corrected_secs,
+                yamnet_secs,
                 snapped: was_snapped,
             }
         })

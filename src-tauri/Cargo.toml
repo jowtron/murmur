@@ -23,6 +23,8 @@ symphonia = { version = "0.5", features = ["all"] }
 uuid = { version = "1", features = ["v4"] }
 dirs = "6"
 tokio-util = "0.7"
+rubato = "0.16"
+libloading = "0.8"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

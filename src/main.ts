@@ -50,7 +50,9 @@ interface ChapterWithSnap {
   title: string;
   start_time: string;
   start_secs: number;
-  original_secs: number;
+  raw_llm_secs: number;
+  srt_corrected_secs: number | null;
+  yamnet_secs: number | null;
   snapped: boolean;
 }
 
@@ -68,6 +70,7 @@ interface QueueItem {
   autoDetectChapters: boolean;
   chapters?: Chapter[];
   snappedChapters?: ChapterWithSnap[];
+  detectStatus?: string;
 }
 
 const queue: QueueItem[] = [];
@@ -141,7 +144,8 @@ const selectThreads = document.getElementById("select-threads")! as HTMLSelectEl
 const selectConcurrent = document.getElementById("select-concurrent")! as HTMLSelectElement;
 const chkAutoChapters = document.getElementById("chk-auto-chapters")! as HTMLInputElement;
 const chkSnapGaps = document.getElementById("chk-snap-gaps")! as HTMLInputElement;
-const chkRawLlm = document.getElementById("chk-raw-llm")! as HTMLInputElement;
+const chkSrtCorrect = document.getElementById("chk-srt-correct")! as HTMLInputElement;
+const chkFirstZero = document.getElementById("chk-first-zero")! as HTMLInputElement;
 const chkPerWord = document.getElementById("chk-per-word")! as HTMLInputElement;
 const selectLlmModel = document.getElementById("select-llm-model")! as HTMLSelectElement;
 const chkEmbedFlac = document.getElementById("chk-embed-flac")! as HTMLInputElement;
@@ -217,15 +221,16 @@ function renderQueue() {
           ${item.status === "pending" ? "Pending" : ""}
           ${item.status === "queued" ? "Queued" : ""}
           ${item.status === "transcribing" ? `${Math.round(item.progress * 100)}%` : ""}
-          ${item.status === "detecting" ? "Detecting..." : ""}
+          ${item.status === "detecting" ? `<span id="detect-status-${item.id}">Detecting...</span>` : ""}
           ${item.status === "complete" ? "Done" : ""}
           ${item.status === "error" ? "Error" : ""}
           ${item.status === "cancelled" ? "Cancelled" : ""}
         </span>
       </div>
       <div class="actions">
-        ${item.status === "transcribing" || item.status === "queued" ? `<button class="small danger btn-cancel" data-id="${item.id}">Cancel</button>` : ""}
+        ${item.status === "transcribing" || item.status === "queued" || item.status === "detecting" ? `<button class="small danger btn-cancel" data-id="${item.id}">Cancel</button>` : ""}
         ${item.status === "error" || item.status === "cancelled" ? `<button class="small btn-retry" data-id="${item.id}">Retry</button>` : ""}
+        ${item.status === "complete" ? `<button class="small btn-reprocess" data-id="${item.id}">Reprocess</button>` : ""}
         ${item.status !== "transcribing" && item.status !== "detecting" ? `<button class="small danger btn-remove" data-id="${item.id}">&times;</button>` : ""}
       </div>
     </div>
@@ -235,10 +240,16 @@ function renderQueue() {
 
   // Attach handlers
   queueList.querySelectorAll(".btn-remove").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const id = (btn as HTMLElement).dataset.id!;
       const idx = queue.findIndex((q) => q.id === id);
-      if (idx !== -1) { queue.splice(idx, 1); renderQueue(); }
+      if (idx !== -1) {
+        // Cancel any backend work before removing
+        await invoke("cancel_job", { jobId: id }).catch(() => {});
+        queue[idx].status = "cancelled";
+        queue.splice(idx, 1);
+        renderQueue();
+      }
     });
   });
 
@@ -279,15 +290,60 @@ function renderQueue() {
     });
   });
 
+  // Reprocess button — re-run chapter detection with current settings
+  queueList.querySelectorAll(".btn-reprocess").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = (btn as HTMLElement).dataset.id!;
+      const item = queue.find((q) => q.id === id);
+      if (!item) return;
+
+      // Delete cached chapter files so they regenerate
+      const outputDir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
+      const stem = item.name.replace(/\.[^.]+$/, "");
+      const settings = loadSettings();
+      const llmShort = llmModelShort(settings.llmModel);
+      const cachePaths = [
+        `${outputDir}/${stem}_${llmShort}_llm_chapters.json`,
+        `${outputDir}/${stem}_${llmShort}_llm_raw.json`,
+        `${outputDir}/${stem}_chapters_${llmShort}.json`,
+        `${outputDir}/${stem}_chapters_${llmShort}.txt`,
+        `${outputDir}/${stem}_yamnet.json`,
+        `${outputDir}/${stem}_yamnet_onsets.json`,
+      ];
+      for (const p of cachePaths) {
+        try { await invoke("delete_file", { path: p }); } catch { /* ignore */ }
+      }
+
+      item.chapters = undefined;
+      item.snappedChapters = undefined;
+      item.status = "detecting";
+      item.error = undefined;
+      item.autoDetectChapters = true;
+      renderQueue();
+      await runChapterDetection(item, true);
+      if ((item.status as string) !== "cancelled") {
+        item.status = "complete";
+      }
+      renderQueue();
+    });
+  });
+
   // Align button
   queueList.querySelectorAll("[data-align-id]").forEach((el) => {
     el.addEventListener("click", (e) => {
       e.stopPropagation();
       const id = (el as HTMLElement).dataset.alignId!;
       const item = queue.find((q) => q.id === id);
-      if (item?.chapters) openAlignModal(item.path, item.chapters, item.duration || 0);
+      if (item?.chapters) openAlignModal(item.path, item.chapters, item.duration || 0, item.snappedChapters);
     });
   });
+}
+
+function formatHMS(secs: number): string {
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = Math.floor(secs % 60);
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
 function showChapterDetail(item: QueueItem) {
@@ -297,19 +353,48 @@ function showChapterDetail(item: QueueItem) {
 
   title.textContent = `Chapters — ${item.name}`;
 
-  list.innerHTML = (item.chapters || []).map((ch, idx) => {
-    const snap = item.snappedChapters?.[idx];
-    const snapped = snap?.snapped;
-    const snapDelta = snapped ? (snap!.start_secs - snap!.original_secs) : 0;
-    const snapInfo = snapped
-      ? ` <span class="snapped-badge">snapped ${snapDelta >= 0 ? "+" : ""}${snapDelta.toFixed(1)}s</span>`
-      : "";
-    return `
-      <div class="chapter-item${snapped ? " snapped" : ""}">
+  const hasSnap = item.snappedChapters && item.snappedChapters.length > 0;
+
+  let html = "";
+  if (hasSnap) {
+    // Show comparison table with all pipeline stages
+    html += `<table class="chapter-compare-table">
+      <thead><tr>
+        <th>#</th><th>Title</th><th>Raw LLM</th><th>SRT Corrected</th><th>YAMNet Snap</th><th>Final</th>
+      </tr></thead><tbody>`;
+    (item.snappedChapters || []).forEach((snap, idx) => {
+      let rawSecs = snap.raw_llm_secs;
+      if (chkFirstZero.checked && idx === 0) rawSecs = 0;
+      const rawTime = formatHMS(rawSecs);
+      const srtTime = snap.srt_corrected_secs != null ? formatHMS(snap.srt_corrected_secs) : "—";
+      const yamTime = snap.yamnet_secs != null ? formatHMS(snap.yamnet_secs) : "—";
+      const finalTime = snap.start_time;
+
+      // Highlight cells that differ from the final time
+      const rawClass = rawTime !== finalTime ? "ch-diff" : "ch-match";
+      const srtClass = srtTime !== "—" && srtTime !== finalTime ? "ch-diff" : srtTime === finalTime ? "ch-match" : "";
+      const yamClass = yamTime !== "—" && yamTime !== finalTime ? "ch-diff" : yamTime === finalTime ? "ch-match" : "";
+
+      html += `<tr>
+        <td>${idx + 1}</td>
+        <td class="ch-title-cell">${escapeHtml(snap.title)}</td>
+        <td class="${rawClass}">${rawTime}</td>
+        <td class="${srtClass}">${srtTime}</td>
+        <td class="${yamClass}">${yamTime}</td>
+        <td class="ch-final">${finalTime}</td>
+      </tr>`;
+    });
+    html += `</tbody></table>`;
+  } else {
+    // Simple list when no snap data
+    html = (item.chapters || []).map((ch) => `
+      <div class="chapter-item">
         <span class="ch-time">${escapeHtml(ch.start_time)}</span>
-        <span class="ch-title">${escapeHtml(ch.title)}${snapInfo}</span>
-      </div>`;
-  }).join("");
+        <span class="ch-title">${escapeHtml(ch.title)}</span>
+      </div>`).join("");
+  }
+
+  list.innerHTML = html;
 
   modal.classList.remove("hidden");
   modal.querySelector(".modal-close")!.addEventListener("click", () => modal.classList.add("hidden"), { once: true });
@@ -419,7 +504,7 @@ async function checkModelAndPromptDownload(modelName: string): Promise<boolean> 
   });
 }
 
-async function runChapterDetection(item: QueueItem): Promise<void> {
+async function runChapterDetection(item: QueueItem, skipCueEmbed = false): Promise<void> {
   const settings = loadSettings();
   if (!settings.apiKey) {
     item.error = (item.error || "") + " (No API key for chapter detection)";
@@ -447,7 +532,7 @@ async function runChapterDetection(item: QueueItem): Promise<void> {
           model: settings.llmModel,
           base_url: settings.apiUrl,
           prompt: settings.chapterPrompt,
-          transcript_path: srtPath, raw_mode: chkRawLlm.checked,
+          transcript_path: srtPath, raw_mode: !chkSrtCorrect.checked,
         },
         audioPath: item.path,
         minGapSecs: 1.5,
@@ -468,9 +553,15 @@ async function runChapterDetection(item: QueueItem): Promise<void> {
           model: settings.llmModel,
           base_url: settings.apiUrl,
           prompt: settings.chapterPrompt,
-          transcript_path: srtPath, raw_mode: chkRawLlm.checked,
+          transcript_path: srtPath, raw_mode: !chkSrtCorrect.checked,
         },
       });
+    }
+
+    // Force first chapter to 0:00 if checkbox is checked
+    if (chkFirstZero.checked && chapters.length > 0 && chapters[0].start_secs > 0) {
+      chapters[0].start_secs = 0;
+      chapters[0].start_time = "00:00:00";
     }
 
     item.chapters = chapters;
@@ -492,16 +583,18 @@ async function runChapterDetection(item: QueueItem): Promise<void> {
       const chapterPath = `${outputDir}/${stem}_chapters_${llmShort}.${ext}`;
       await invoke("write_text_file", { path: chapterPath, content });
 
-      // Embed chapters in FLAC and write .cue
-      if (chkEmbedFlac.checked) {
-        try {
-          await invoke("embed_chapters_in_flac", { req: { audio_path: item.path, chapters } });
-        } catch (embedErr) { console.warn("Embed chapters failed:", embedErr); }
-      }
-      if (chkWriteCue.checked) {
-        try {
-          await invoke("write_cue_file", { audioPath: item.path, chapters });
-        } catch (cueErr) { console.warn("Write cue failed:", cueErr); }
+      // Embed chapters in FLAC and write .cue (skip during reprocess to preserve manual alignment)
+      if (!skipCueEmbed) {
+        if (chkEmbedFlac.checked) {
+          try {
+            await invoke("embed_chapters_in_flac", { req: { audio_path: item.path, chapters } });
+          } catch (embedErr) { console.warn("Embed chapters failed:", embedErr); }
+        }
+        if (chkWriteCue.checked) {
+          try {
+            await invoke("write_cue_file", { audioPath: item.path, chapters });
+          } catch (cueErr) { console.warn("Write cue failed:", cueErr); }
+        }
       }
     }
   } catch (err: any) {
@@ -520,6 +613,9 @@ async function transcribeItem(item: QueueItem) {
   renderQueue();
 
   try {
+    // Check if already cancelled or removed before starting
+    if (item.status === "cancelled" || !queue.includes(item)) return;
+
     // Check if transcription already exists for this model
     const alreadyExists = await invoke<boolean>("check_transcription_exists", {
       path: item.path,
@@ -529,14 +625,16 @@ async function transcribeItem(item: QueueItem) {
 
     if (alreadyExists) {
       // Skip transcription, but still run chapter detection if needed
-      if (item.autoDetectChapters) {
+      if (item.autoDetectChapters && (item.status as string) !== "cancelled" && queue.includes(item)) {
         item.status = "detecting";
         item.progress = 1.0;
         renderQueue();
         await runChapterDetection(item);
       }
-      item.status = "complete";
-      item.progress = 1.0;
+      if ((item.status as string) !== "cancelled" && queue.includes(item)) {
+        item.status = "complete";
+        item.progress = 1.0;
+      }
     } else {
       item.status = "queued";
       item.progress = 0;
@@ -564,13 +662,15 @@ async function transcribeItem(item: QueueItem) {
 
       item.elapsed = Date.now() - (item.startedAt || Date.now());
 
-      // Auto-detect chapters if enabled
-      if (item.autoDetectChapters) {
+      // Auto-detect chapters if enabled (check cancel/removed before starting)
+      if (item.autoDetectChapters && (item.status as string) !== "cancelled" && queue.includes(item)) {
         await runChapterDetection(item);
       }
 
-      item.status = "complete";
-      item.progress = 1.0;
+      if ((item.status as string) !== "cancelled") {
+        item.status = "complete";
+        item.progress = 1.0;
+      }
     }
   } catch (err: any) {
     item.elapsed = item.startedAt ? Date.now() - item.startedAt : undefined;
@@ -874,6 +974,185 @@ document.getElementById("btn-convert-cue")!.addEventListener("click", async () =
   if (count > 0) alert(`Wrote ${count} .cue file(s)`);
 });
 
+// Parse a CUE file text into chapters
+function parseCueText(text: string): Chapter[] {
+  const chapters: Chapter[] = [];
+  let currentTitle = "";
+  for (const line of text.split("\n")) {
+    const titleMatch = line.match(/^\s*TITLE\s+"(.+)"/);
+    if (titleMatch) currentTitle = titleMatch[1];
+    const indexMatch = line.match(/^\s*INDEX\s+01\s+(\d+):(\d+):(\d+)/);
+    if (indexMatch) {
+      const totalSecs = parseInt(indexMatch[1]) * 60 + parseInt(indexMatch[2]) + parseInt(indexMatch[3]) / 75;
+      const h = Math.floor(totalSecs / 3600);
+      const m = Math.floor((totalSecs % 3600) / 60);
+      const s = Math.floor(totalSecs % 60);
+      chapters.push({
+        title: currentTitle || `Chapter ${chapters.length + 1}`,
+        start_time: `${String(h).padStart(2,"0")}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`,
+        start_secs: totalSecs,
+      });
+      currentTitle = "";
+    }
+  }
+  return chapters;
+}
+
+// Find audio file for a CUE file
+async function findAudioForCue(cuePath: string, cueText: string): Promise<string | null> {
+  const dir = cuePath.substring(0, cuePath.lastIndexOf("/"));
+  const fileMatch = cueText.match(/^\s*FILE\s+"(.+?)"/m);
+  if (fileMatch) {
+    const candidate = `${dir}/${fileMatch[1]}`;
+    if (await invoke<boolean>("file_exists", { path: candidate })) return candidate;
+  }
+  const stem = cuePath.split("/").pop()!.replace(/\.cue$/, "");
+  for (const ext of ["flac", "mp3", "wav", "m4a", "ogg", "aac"]) {
+    const candidate = `${dir}/${stem}.${ext}`;
+    if (await invoke<boolean>("file_exists", { path: candidate })) return candidate;
+  }
+  return null;
+}
+
+// Try to load pipeline markers (raw LLM, SRT corrected) for an audio file
+async function loadPipelineMarkers(audioPath: string, chapters: Chapter[]): Promise<ChapterWithSnap[] | undefined> {
+  const dir = audioPath.substring(0, audioPath.lastIndexOf("/"));
+  const stem = audioPath.split("/").pop()!.replace(/\.[^.]+$/, "");
+  const settings = loadSettings();
+  const llmShort = llmModelShort(settings.llmModel);
+
+  let rawChapters: Chapter[] | null = null;
+  let correctedChapters: Chapter[] | null = null;
+
+  // Try to load raw LLM chapters
+  const rawPath = `${dir}/${stem}_${llmShort}_llm_raw.json`;
+  try {
+    const data = await invoke<string>("read_text_file", { path: rawPath });
+    rawChapters = JSON.parse(data);
+  } catch {}
+
+  // Try to load SRT-corrected chapters
+  const corrPath = `${dir}/${stem}_${llmShort}_llm_chapters.json`;
+  try {
+    const data = await invoke<string>("read_text_file", { path: corrPath });
+    correctedChapters = JSON.parse(data);
+  } catch {}
+
+  // Try to load YAMNet onsets
+  let yamnetOnsets: number[] | null = null;
+  const onsetsPath = `${dir}/${stem}_yamnet_onsets.json`;
+  try {
+    const data = await invoke<string>("read_text_file", { path: onsetsPath });
+    yamnetOnsets = JSON.parse(data);
+  } catch {}
+
+  if (!rawChapters && !correctedChapters && !yamnetOnsets) return undefined;
+
+  return chapters.map((ch, i) => {
+    const rawSecs = rawChapters?.[i]?.start_secs ?? ch.start_secs;
+    const corrSecs = correctedChapters?.[i]?.start_secs ?? null;
+    // Find nearest YAMNet onset within ±60s
+    let yamSecs: number | null = null;
+    if (yamnetOnsets) {
+      let best: number | null = null;
+      let bestDist = 60;
+      for (const o of yamnetOnsets) {
+        const d = Math.abs(o - ch.start_secs);
+        if (d < bestDist) { bestDist = d; best = o; }
+      }
+      yamSecs = best;
+    }
+    return {
+      title: ch.title,
+      start_time: ch.start_time,
+      start_secs: ch.start_secs,
+      raw_llm_secs: chkFirstZero.checked && i === 0 ? 0 : rawSecs,
+      srt_corrected_secs: corrSecs,
+      yamnet_secs: yamSecs,
+      snapped: false,
+    };
+  });
+}
+
+// Align CUE — load CUE file(s), show list with align buttons
+document.getElementById("btn-align-cue")!.addEventListener("click", async () => {
+  const selected = await open({
+    multiple: true,
+    filters: [{ name: "CUE files", extensions: ["cue"] }],
+  });
+  if (!selected) return;
+  const cuePaths = Array.isArray(selected) ? selected : [selected];
+
+  if (cuePaths.length === 1) {
+    // Single file — open align modal directly
+    try {
+      const text = await invoke<string>("read_text_file", { path: cuePaths[0] });
+      const chapters = parseCueText(text);
+      if (chapters.length === 0) { alert("No chapters found in CUE file"); return; }
+      const audioPath = await findAudioForCue(cuePaths[0], text);
+      if (!audioPath) { alert("No matching audio file found for this CUE file"); return; }
+      const snap = await loadPipelineMarkers(audioPath, chapters);
+      openAlignModal(audioPath, chapters, 0, snap);
+    } catch (e) { alert(`Failed to load CUE: ${e}`); }
+    return;
+  }
+
+  // Multiple files — show list in chapter-detail-modal
+  const modal = document.getElementById("chapter-detail-modal")!;
+  const title = document.getElementById("chapter-detail-title")!;
+  const list = document.getElementById("chapter-detail-list")!;
+  title.textContent = `Align CUE Files (${cuePaths.length})`;
+
+  interface CueEntry { cuePath: string; audioPath: string; chapters: Chapter[]; snap?: ChapterWithSnap[]; name: string; }
+  const entries: CueEntry[] = [];
+
+  list.innerHTML = `<div style="color:var(--text-muted);padding:8px;">Loading ${cuePaths.length} CUE files...</div>`;
+  modal.classList.remove("hidden");
+  modal.querySelector(".modal-close")!.addEventListener("click", () => modal.classList.add("hidden"), { once: true });
+  modal.addEventListener("click", (e) => { if (e.target === modal) modal.classList.add("hidden"); }, { once: true });
+
+  for (const cp of cuePaths) {
+    const name = cp.split("/").pop() || cp;
+    try {
+      const text = await invoke<string>("read_text_file", { path: cp });
+      const chapters = parseCueText(text);
+      const audioPath = await findAudioForCue(cp, text);
+      if (audioPath && chapters.length > 0) {
+        const snap = await loadPipelineMarkers(audioPath, chapters);
+        entries.push({ cuePath: cp, audioPath, chapters, snap, name });
+      } else {
+        entries.push({ cuePath: cp, audioPath: "", chapters, name });
+      }
+    } catch {
+      entries.push({ cuePath: cp, audioPath: "", chapters: [], name });
+    }
+  }
+
+  let html = `<table class="chapter-compare-table"><thead><tr><th>#</th><th>File</th><th>Chapters</th><th></th></tr></thead><tbody>`;
+  entries.forEach((entry, idx) => {
+    const hasAudio = !!entry.audioPath;
+    html += `<tr>
+      <td>${idx + 1}</td>
+      <td class="ch-title-cell">${escapeHtml(entry.name)}</td>
+      <td>${entry.chapters.length}</td>
+      <td>${hasAudio
+        ? `<button class="small cue-align-btn" data-cue-idx="${idx}">Align</button>`
+        : `<span style="color:var(--text-muted)">No audio</span>`}</td>
+    </tr>`;
+  });
+  html += `</tbody></table>`;
+  list.innerHTML = html;
+
+  list.querySelectorAll(".cue-align-btn").forEach(btn => {
+    btn.addEventListener("click", () => {
+      const idx = +(btn as HTMLElement).dataset.cueIdx!;
+      const entry = entries[idx];
+      modal.classList.add("hidden");
+      openAlignModal(entry.audioPath, entry.chapters, 0, entry.snap);
+    });
+  });
+});
+
 // Chapter detection standalone
 const chaptersModal = document.getElementById("chapters-modal")!;
 const btnDetectChapters = document.getElementById("btn-detect-chapters")!;
@@ -959,15 +1238,15 @@ btnRunDetect.addEventListener("click", async () => {
           // Fall back to LLM-only if no audio file found
           chaptersResults.innerHTML += `<div class="chapter-file-header">${escapeHtml(fileName)} - No matching audio file found, using LLM only</div>`;
           chapters = await invoke<Chapter[]>("detect_chapters", {
-            req: { transcript, api_key: settings.apiKey, model: settings.llmModel, base_url: settings.apiUrl, prompt: settings.chapterPrompt, transcript_path: filePath, raw_mode: chkRawLlm.checked },
+            req: { transcript, api_key: settings.apiKey, model: settings.llmModel, base_url: settings.apiUrl, prompt: settings.chapterPrompt, transcript_path: filePath, raw_mode: !chkSrtCorrect.checked },
           });
         } else {
           chaptersStatus.textContent = chapterFilePaths.length > 1
-            ? `Processing ${i + 1}/${chapterFilePaths.length}: ${fileName} (LLM + gap snap)...`
-            : `Analyzing ${fileName} with LLM + gap snap...`;
+            ? `Processing ${i + 1}/${chapterFilePaths.length}: ${fileName} (LLM + YAMNet snap)...`
+            : `Analyzing ${fileName} with LLM + YAMNet snap...`;
 
           snappedChaptersResult = await invoke<ChapterWithSnap[]>("detect_chapters_with_gaps", {
-            req: { transcript, api_key: settings.apiKey, model: settings.llmModel, base_url: settings.apiUrl, prompt: settings.chapterPrompt, transcript_path: filePath, raw_mode: chkRawLlm.checked },
+            req: { transcript, api_key: settings.apiKey, model: settings.llmModel, base_url: settings.apiUrl, prompt: settings.chapterPrompt, transcript_path: filePath, raw_mode: !chkSrtCorrect.checked },
             audioPath,
             minGapSecs: 1.5,
             silenceThreshold: 0.02,
@@ -981,8 +1260,14 @@ btnRunDetect.addEventListener("click", async () => {
         }
       } else {
         chapters = await invoke<Chapter[]>("detect_chapters", {
-          req: { transcript, api_key: settings.apiKey, model: settings.llmModel, base_url: settings.apiUrl, prompt: settings.chapterPrompt, transcript_path: filePath, raw_mode: chkRawLlm.checked },
+          req: { transcript, api_key: settings.apiKey, model: settings.llmModel, base_url: settings.apiUrl, prompt: settings.chapterPrompt, transcript_path: filePath, raw_mode: !chkSrtCorrect.checked },
         });
+      }
+
+      // Force first chapter to 0:00 if checkbox is checked
+      if (chkFirstZero.checked && chapters.length > 0 && chapters[0].start_secs > 0) {
+        chapters[0].start_secs = 0;
+        chapters[0].start_time = "00:00:00";
       }
 
       if (chapters.length === 0) {
@@ -1082,6 +1367,15 @@ listen<{status: string; progress: number}>("gap-progress", (event) => {
     chaptersStatus.textContent = data.status;
     chaptersStatus.className = "chapters-status";
   }
+  // Also update any "detecting" queue items
+  const detectingItem = queue.find(q => q.status === "detecting");
+  if (detectingItem) {
+    const statusEl = document.querySelector(`[data-id="${detectingItem.id}"] .status, #queue-list .status`);
+    // Just re-render queue item to show progress would be heavy; store for display
+    detectingItem.detectStatus = data.status;
+    const el = document.getElementById(`detect-status-${detectingItem.id}`);
+    if (el) el.textContent = data.status;
+  }
 });
 
 // Persist UI preferences
@@ -1094,8 +1388,9 @@ function savePreferences() {
   localStorage.setItem("pref_snap_gaps", chkSnapGaps.checked ? "1" : "0");
   localStorage.setItem("pref_embed_flac", chkEmbedFlac.checked ? "1" : "0");
   localStorage.setItem("pref_write_cue", chkWriteCue.checked ? "1" : "0");
-  localStorage.setItem("pref_raw_llm", chkRawLlm.checked ? "1" : "0");
+  localStorage.setItem("pref_srt_correct", chkSrtCorrect.checked ? "1" : "0");
   localStorage.setItem("pref_per_word", chkPerWord.checked ? "1" : "0");
+  localStorage.setItem("pref_first_zero", chkFirstZero.checked ? "1" : "0");
 }
 
 function loadPreferences() {
@@ -1115,10 +1410,12 @@ function loadPreferences() {
   if (embedFlac !== null) chkEmbedFlac.checked = embedFlac === "1";
   const writeCue = localStorage.getItem("pref_write_cue");
   if (writeCue !== null) chkWriteCue.checked = writeCue === "1";
-  const rawLlm = localStorage.getItem("pref_raw_llm");
-  if (rawLlm !== null) chkRawLlm.checked = rawLlm === "1";
+  const srtCorrect = localStorage.getItem("pref_srt_correct");
+  if (srtCorrect !== null) chkSrtCorrect.checked = srtCorrect === "1";
   const perWord = localStorage.getItem("pref_per_word");
   if (perWord !== null) chkPerWord.checked = perWord === "1";
+  const firstZero = localStorage.getItem("pref_first_zero");
+  if (firstZero !== null) chkFirstZero.checked = firstZero === "1";
 }
 
 selectModel.addEventListener("change", savePreferences);
@@ -1129,8 +1426,9 @@ chkAutoChapters.addEventListener("change", savePreferences);
 chkSnapGaps.addEventListener("change", savePreferences);
 chkEmbedFlac.addEventListener("change", savePreferences);
 chkWriteCue.addEventListener("change", savePreferences);
-chkRawLlm.addEventListener("change", savePreferences);
+chkSrtCorrect.addEventListener("change", savePreferences);
 chkPerWord.addEventListener("change", savePreferences);
+chkFirstZero.addEventListener("change", savePreferences);
 selectLlmModel.addEventListener("change", () => {
   localStorage.setItem("llm_model", selectLlmModel.value);
 });
@@ -1857,6 +2155,7 @@ interface AlignStrip {
   viewEnd: number;
   canvas: HTMLCanvasElement;
   waveform: WaveformData | null;
+  pipelineMarkers?: { rawLlm?: number; srtCorrected?: number; yamnet?: number };
 }
 
 let alignAudioPath = "";
@@ -1898,13 +2197,21 @@ function alignFormatHMS(secs: number): string {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
-async function openAlignModal(audioPath: string, chapters: Chapter[], duration: number) {
+async function openAlignModal(audioPath: string, chapters: Chapter[], duration: number, snappedChapters?: ChapterWithSnap[]) {
   alignAudioPath = audioPath;
   alignDuration = duration || await invoke<number>("get_audio_duration", { path: audioPath });
   alignTitle.textContent = `Align Chapters — ${audioPath.split("/").pop()}`;
   alignModal.classList.remove("hidden");
   alignStripsData = [];
   alignStrips.innerHTML = "";
+
+  // Legend for pipeline markers
+  if (snappedChapters && snappedChapters.length > 0) {
+    const legend = document.createElement("div");
+    legend.className = "align-legend";
+    legend.innerHTML = `<span style="color:#f44336;">━━</span> Raw LLM &nbsp; <span style="color:#4caf50;">━━</span> SRT Corrected &nbsp; <span style="color:#2196f3;">━━</span> YAMNet Snap &nbsp; <span style="color:#ff9800;">━━</span> Current`;
+    alignStrips.appendChild(legend);
+  }
 
   // Try to load previously aligned chapters
   const base = audioPath.replace(/\.[^.]+$/, "");
@@ -1947,7 +2254,12 @@ async function openAlignModal(audioPath: string, chapters: Chapter[], duration: 
     alignStrips.appendChild(stripEl);
 
     const canvas = document.getElementById(`align-canvas-${i}`) as HTMLCanvasElement;
-    const strip: AlignStrip = { idx: i, chapter: ch, markerSecs, viewStart, viewEnd, canvas, waveform: null };
+    const pipelineMarkers = snappedChapters && snappedChapters[i] ? {
+      rawLlm: chkFirstZero.checked && i === 0 ? 0 : snappedChapters[i].raw_llm_secs,
+      srtCorrected: snappedChapters[i].srt_corrected_secs ?? undefined,
+      yamnet: snappedChapters[i].yamnet_secs ?? undefined,
+    } : undefined;
+    const strip: AlignStrip = { idx: i, chapter: ch, markerSecs, viewStart, viewEnd, canvas, waveform: null, pipelineMarkers };
     alignStripsData.push(strip);
 
     // HiDPI
@@ -2082,6 +2394,29 @@ function alignDrawStrip(strip: AlignStrip) {
     ctx.setLineDash([4, 4]);
     ctx.beginPath(); ctx.moveTo(origX, 0); ctx.lineTo(origX, h); ctx.stroke();
     ctx.setLineDash([]);
+  }
+
+  // Pipeline stage markers (colored lines)
+  if (strip.pipelineMarkers) {
+    const stages: { secs: number | undefined; color: string; label: string }[] = [
+      { secs: strip.pipelineMarkers.rawLlm, color: "rgba(244, 67, 54, 0.6)", label: "R" },
+      { secs: strip.pipelineMarkers.srtCorrected, color: "rgba(76, 175, 80, 0.6)", label: "S" },
+      { secs: strip.pipelineMarkers.yamnet, color: "rgba(33, 150, 243, 0.6)", label: "Y" },
+    ];
+    for (const stage of stages) {
+      if (stage.secs == null) continue;
+      const sx = ((stage.secs - strip.viewStart) / (strip.viewEnd - strip.viewStart)) * w;
+      if (sx < 0 || sx > w) continue;
+      ctx.strokeStyle = stage.color;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx, h); ctx.stroke();
+      ctx.setLineDash([]);
+      // Label at top
+      ctx.fillStyle = stage.color;
+      ctx.font = "bold 9px monospace";
+      ctx.fillText(stage.label, sx + 2, 10);
+    }
   }
 
   // Marker line

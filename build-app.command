@@ -2,6 +2,10 @@
 set -e
 cd "$(dirname "$0")"
 
+# whisper.cpp uses std::filesystem which requires macOS 10.15+
+export CMAKE_OSX_DEPLOYMENT_TARGET=10.15
+export MACOSX_DEPLOYMENT_TARGET=10.15
+
 echo "=== Building Whisper Transcriber ==="
 npm run tauri build -- --bundles app
 

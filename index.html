@@ -11,21 +11,22 @@
       <header>
         <h1>Whisper Transcriber</h1>
         <div class="header-actions">
-          <button id="btn-add-files">Add Files</button>
-          <button id="btn-add-folder">Add Folder</button>
-          <button id="btn-add-feed">Add Podcast Feed</button>
-          <button id="btn-detect-chapters">Detect Chapters</button>
-          <button id="btn-convert-cue">Convert to CUE</button>
-          <button id="btn-template-editor">Marker Template</button>
-          <button id="btn-settings">Settings</button>
-          <button id="btn-models">Models</button>
+          <button id="btn-add-files" title="Add individual audio files to the transcription queue">Add Files</button>
+          <button id="btn-add-folder" title="Add all audio files from a folder to the queue">Add Folder</button>
+          <button id="btn-add-feed" title="Download episodes from a podcast RSS feed">Add Podcast Feed</button>
+          <button id="btn-detect-chapters" title="Run standalone chapter detection on existing transcript files via LLM">Detect Chapters</button>
+          <button id="btn-convert-cue" title="Convert chapter JSON/TXT files to CUE sheet format">Convert to CUE</button>
+          <button id="btn-align-cue" title="Load CUE file(s) and manually adjust chapter boundaries on the waveform">Align CUE</button>
+          <button id="btn-template-editor" title="Create audio fingerprint templates to find recurring markers (e.g. intro jingles)">Marker Template</button>
+          <button id="btn-settings" title="Configure API key, LLM models, prompts, and chapter detection settings">Settings</button>
+          <button id="btn-models" title="Download and manage Whisper transcription models">Models</button>
         </div>
       </header>
 
       <div class="gpu-bar" id="gpu-bar"></div>
 
       <div class="settings-bar">
-        <label>
+        <label title="Whisper model for transcription. Larger = more accurate but slower.">
           Model:
           <select id="select-model">
             <option value="large-v3-turbo" selected>Large V3 Turbo</option>
@@ -36,7 +37,7 @@
             <option value="tiny">Tiny</option>
           </select>
         </label>
-        <label>
+        <label title="Output format for transcriptions. SRT is required for chapter detection.">
           Format:
           <select id="select-format">
             <option value="all">All Formats</option>
@@ -46,14 +47,14 @@
             <option value="json">JSON (.json)</option>
           </select>
         </label>
-        <label>
+        <label title="Where to save output files. 'Same as source' puts them next to the audio file.">
           Output Dir:
           <select id="select-output">
             <option value="same">Same as source</option>
             <option value="custom">Custom folder...</option>
           </select>
         </label>
-        <label>
+        <label title="Number of CPU threads for Whisper. More threads = faster but uses more CPU.">
           Threads:
           <select id="select-threads">
             <option value="2">2</option>
@@ -63,7 +64,7 @@
             <option value="10">10</option>
           </select>
         </label>
-        <label>
+        <label title="How many files to transcribe simultaneously. Higher values use more memory.">
           Concurrent:
           <select id="select-concurrent">
             <option value="1">1 file</option>
@@ -72,31 +73,35 @@
             <option value="4">4 files</option>
           </select>
         </label>
-        <label>
+        <label title="Which LLM to use for chapter detection via OpenRouter API.">
           LLM:
           <select id="select-llm-model"></select>
         </label>
-        <label class="auto-chapters-label">
+        <label class="auto-chapters-label" title="Automatically run LLM chapter detection after each transcription completes.">
           <input type="checkbox" id="chk-auto-chapters" />
           Auto-detect chapters
         </label>
-        <label class="auto-chapters-label">
+        <label class="auto-chapters-label" title="Use YAMNet audio classification to snap chapter boundaries to the nearest music-to-speech transition.">
           <input type="checkbox" id="chk-snap-gaps" checked />
-          Snap to gaps
+          Snap to speech onset
         </label>
-        <label class="auto-chapters-label">
-          <input type="checkbox" id="chk-raw-llm" />
-          Raw LLM times (no correction)
+        <label class="auto-chapters-label" title="Refine LLM chapter times by searching the SRT transcript for matching text near each timestamp. Improves accuracy when the LLM's times are approximate.">
+          <input type="checkbox" id="chk-srt-correct" checked />
+          Correct times from SRT
         </label>
-        <label class="auto-chapters-label">
+        <label class="auto-chapters-label" title="Force the first chapter to start at 00:00:00 instead of the LLM's detected time.">
+          <input type="checkbox" id="chk-first-zero" checked />
+          First chapter at 0:00
+        </label>
+        <label class="auto-chapters-label" title="Generate per-word timestamps in the transcription (slower but more precise).">
           <input type="checkbox" id="chk-per-word" />
           Per-word timestamps
         </label>
-        <label class="auto-chapters-label">
+        <label class="auto-chapters-label" title="Embed chapter markers as FLAC metadata tags. Only applies to FLAC files.">
           <input type="checkbox" id="chk-embed-flac" checked />
           Embed in FLAC
         </label>
-        <label class="auto-chapters-label">
+        <label class="auto-chapters-label" title="Write a .cue sheet file alongside the audio. Reprocessing will not overwrite an existing .cue — use Align + Save for that.">
           <input type="checkbox" id="chk-write-cue" checked />
           Write .cue
         </label>
@@ -229,13 +234,13 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
             <button class="modal-close">&times;</button>
           </div>
           <div class="chapters-form">
-            <p class="chapters-desc">Select one or more SRT/VTT/TXT transcript files to detect chapter boundaries via LLM. With "Snap to gaps" enabled, chapter times are snapped to the nearest quiet moment in the audio. Results auto-save next to source files. Configure API key and prompt in Settings.</p>
+            <p class="chapters-desc">Select one or more SRT/VTT/TXT transcript files to detect chapter boundaries via LLM. With "Snap to speech onset" enabled, chapter times are snapped to the nearest music-to-speech transition using YAMNet audio classification. Results auto-save next to source files. Configure API key and prompt in Settings.</p>
             <div class="chapters-input-row">
               <input type="text" id="input-chapter-file" placeholder="No file selected..." class="form-input" readonly />
               <button id="btn-choose-chapter-file" class="small">Browse...</button>
               <label class="auto-chapters-label">
                 <input type="checkbox" id="chk-modal-snap" checked />
-                Snap to gaps
+                Snap to speech onset
               </label>
               <label class="auto-chapters-label">
                 <input type="checkbox" id="chk-modal-embed" checked />

@@ -3,6 +3,7 @@ mod flac_utils;
 mod transcriber;
 mod gap_detection;
 mod template;
+mod yamnet;
 
 use commands::AppState;
 
@@ -36,6 +37,7 @@ pub fn run() {
             commands::fix_seektables_batch,
             commands::embed_chapters_in_flac,
             commands::write_cue_file,
+            commands::delete_file,
             commands::check_transcription_exists,
             commands::get_waveform_peaks,
             commands::get_audio_region_pcm,

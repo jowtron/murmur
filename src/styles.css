@@ -590,6 +590,47 @@ select, input[type="text"], input[type="password"] {
   margin-left: 6px;
 }
 
+.chapter-compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+.chapter-compare-table th {
+  text-align: left;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-dim);
+  font-weight: 500;
+  white-space: nowrap;
+}
+.chapter-compare-table td {
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  font-family: monospace;
+  font-size: 0.75rem;
+}
+.chapter-compare-table .ch-title-cell {
+  font-family: inherit;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chapter-compare-table .ch-diff {
+  color: var(--text-dim);
+}
+.chapter-compare-table .ch-match {
+  color: var(--accent);
+}
+.chapter-compare-table .ch-final {
+  color: var(--accent);
+  font-weight: 600;
+}
+.btn-reprocess {
+  background: var(--bg-input);
+  color: var(--text);
+}
+
 .chapters-export {
   margin-top: 12px;
   display: flex;
@@ -713,6 +754,14 @@ select, input[type="text"], input[type="password"] {
 }
 
 /* Align Chapters */
+.align-legend {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  padding: 4px 0 8px;
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
 .align-strip {
   margin-bottom: 14px;
   border: 1px solid var(--border);

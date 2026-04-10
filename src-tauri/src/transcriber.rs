@@ -159,29 +159,34 @@ pub fn audio_to_pcm(path: &Path) -> Result<Vec<f32>, String> {
         }
     }
 
-    // Resample to 16kHz using linear interpolation
+    // Resample to 16kHz using sinc interpolation (rubato)
     let target_rate = 16000.0;
     if (source_rate - target_rate).abs() < 1.0 {
         return Ok(all_samples);
     }
 
-    let ratio = source_rate / target_rate;
-    let output_len = (all_samples.len() as f64 / ratio) as usize;
-    let mut resampled = Vec::with_capacity(output_len);
+    use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
 
-    for i in 0..output_len {
-        let src_pos = i as f64 * ratio;
-        let idx = src_pos as usize;
-        let frac = (src_pos - idx as f64) as f32;
+    let params = SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 256,
+        window: WindowFunction::BlackmanHarris2,
+    };
 
-        if idx + 1 < all_samples.len() {
-            resampled.push(all_samples[idx] * (1.0 - frac) + all_samples[idx + 1] * frac);
-        } else if idx < all_samples.len() {
-            resampled.push(all_samples[idx]);
-        }
-    }
+    let mut resampler = SincFixedIn::<f32>::new(
+        target_rate / source_rate,
+        2.0,
+        params,
+        all_samples.len(),
+        1,
+    ).map_err(|e| format!("Failed to create resampler: {}", e))?;
 
-    Ok(resampled)
+    let result = resampler.process(&[&all_samples], None)
+        .map_err(|e| format!("Resampling failed: {}", e))?;
+
+    Ok(result.into_iter().next().unwrap_or_default())
 }
 
 /// Get audio duration in seconds using symphonia

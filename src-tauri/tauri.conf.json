@@ -31,7 +31,10 @@
     "resources": [
       "binaries/metaflac",
       "binaries/libFLAC.14.dylib",
-      "binaries/libogg.0.dylib"
+      "binaries/libogg.0.dylib",
+      "binaries/libtensorflowlite_c.dylib",
+      "resources/yamnet.tflite",
+      "resources/yamnet_class_map.csv"
     ]
   }
 }
