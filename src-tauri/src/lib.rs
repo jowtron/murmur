@@ -46,6 +46,7 @@ pub fn run() {
             commands::get_template_pcm,
             commands::delete_audio_template,
             commands::find_template_matches,
+            commands::download_podcast_episode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

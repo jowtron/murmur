@@ -185,6 +185,7 @@ function updateQueueButtons() {
 }
 
 function renderQueue() {
+  if (renderPaused) return;
   queueCount.textContent = queue.length.toString();
   updateQueueButtons();
 
@@ -337,6 +338,13 @@ function renderQueue() {
       if (item?.chapters) openAlignModal(item.path, item.chapters, item.duration || 0, item.snappedChapters);
     });
   });
+
+  // Auto-scroll to the currently active item
+  const activeItem = queue.find(q => q.status === "transcribing" || q.status === "detecting");
+  if (activeItem) {
+    const el = queueList.querySelector(`[data-id="${activeItem.id}"]`);
+    if (el) el.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  }
 }
 
 function formatHMS(secs: number): string {
@@ -402,7 +410,9 @@ function showChapterDetail(item: QueueItem) {
 }
 
 // Elapsed time updater
+let renderPaused = false;
 setInterval(() => {
+  if (renderPaused) return;
   let needsRender = false;
   for (const item of queue) {
     if (item.status === "transcribing" && item.startedAt) {
@@ -763,12 +773,71 @@ async function refreshModelList() {
 }
 
 // Feed
+interface FeedEpisode {
+  id: string;
+  title: string;
+  date: string;
+  rawDate: string;
+  audioUrl: string;
+  status: "pending" | "downloading" | "complete" | "error";
+  progress: number;
+  downloadedMb: number;
+  totalMb: number;
+  localPath?: string;
+}
+
+let feedEpisodesList: FeedEpisode[] = [];
+let feedSaveDir = "";
+
+function feedUpdateSelectedCount() {
+  const feedEpisodes = document.getElementById("feed-episodes")!;
+  const count = feedEpisodes.querySelectorAll('input[type="checkbox"]:checked').length;
+  document.getElementById("feed-selected-count")!.textContent = `${count} selected`;
+}
+
+function feedRenderEpisode(ep: FeedEpisode, idx: number): string {
+  const statusClass = ep.status !== "pending" ? ` ${ep.status}` : "";
+  const checked = ep.status === "pending" ? "checked" : "";
+  const disabled = ep.status !== "pending" ? "disabled" : "";
+
+  let progressHtml = "";
+  if (ep.status === "downloading") {
+    progressHtml = `<div class="ep-progress">
+      <div class="ep-progress-bar"><div class="ep-progress-fill" id="feed-prog-${idx}" style="width:${Math.round(ep.progress * 100)}%"></div></div>
+      <div class="ep-status">${ep.downloadedMb.toFixed(1)}/${ep.totalMb.toFixed(1)} MB</div>
+    </div>`;
+  } else if (ep.status === "complete") {
+    progressHtml = `<div class="ep-progress"><div class="ep-status" style="color:var(--primary);">Done</div></div>`;
+  } else if (ep.status === "error") {
+    progressHtml = `<div class="ep-progress"><div class="ep-status">Failed</div></div>`;
+  }
+
+  return `<div class="feed-episode${statusClass}" data-ep-idx="${idx}">
+    <input type="checkbox" ${checked} ${disabled} data-idx="${idx}" />
+    <span class="ep-title">${escapeHtml(ep.title)}</span>
+    <span class="ep-date">${ep.date}</span>
+    ${progressHtml}
+  </div>`;
+}
+
+function feedRenderList() {
+  const feedEpisodes = document.getElementById("feed-episodes")!;
+  feedEpisodes.innerHTML = feedEpisodesList.map((ep, i) => feedRenderEpisode(ep, i)).join("");
+  // Wire checkbox change events
+  feedEpisodes.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+    cb.addEventListener("change", feedUpdateSelectedCount);
+  });
+  feedUpdateSelectedCount();
+}
+
 async function loadFeed(url: string) {
   const feedStatus = document.getElementById("feed-status")!;
-  const feedEpisodes = document.getElementById("feed-episodes")!;
+  const feedActions = document.getElementById("feed-actions")!;
 
   feedStatus.textContent = "Loading feed...";
-  feedEpisodes.innerHTML = "";
+  feedActions.style.display = "none";
+  feedEpisodesList = [];
+  feedRenderList();
 
   try {
     const response = await fetch(url);
@@ -782,39 +851,163 @@ async function loadFeed(url: string) {
       return;
     }
 
-    feedStatus.textContent = `Found ${items.length} episodes. Select episodes to add:`;
-
-    let html = "";
+    feedEpisodesList = [];
     items.forEach((item, i) => {
       const title = item.querySelector("title")?.textContent || `Episode ${i + 1}`;
       const date = item.querySelector("pubDate")?.textContent || "";
       const enclosure = item.querySelector("enclosure");
       const audioUrl = enclosure?.getAttribute("url") || "";
-
       if (audioUrl) {
-        html += `
-          <div class="feed-episode">
-            <input type="checkbox" data-url="${escapeHtml(audioUrl)}" data-title="${escapeHtml(title)}" />
-            <span class="ep-title">${escapeHtml(title)}</span>
-            <span class="ep-date">${date ? new Date(date).toLocaleDateString() : ""}</span>
-          </div>`;
+        feedEpisodesList.push({
+          id: `ep-${i}`,
+          title,
+          date: date ? new Date(date).toLocaleDateString() : "",
+          rawDate: date,
+          audioUrl,
+          status: "pending",
+          progress: 0,
+          downloadedMb: 0,
+          totalMb: 0,
+        });
       }
     });
 
-    html += `<button class="primary feed-add-selected" id="btn-add-episodes">Add Selected Episodes</button>`;
-    feedEpisodes.innerHTML = html;
-
-    document.getElementById("btn-add-episodes")?.addEventListener("click", async () => {
-      const checked = feedEpisodes.querySelectorAll('input[type="checkbox"]:checked') as NodeListOf<HTMLInputElement>;
-      if (checked.length === 0) { alert("No episodes selected."); return; }
-
-      feedStatus.textContent = `Added ${checked.length} episodes. Note: podcast episode download coming soon.`;
-      feedModal.classList.add("hidden");
-    });
+    feedStatus.textContent = `Found ${feedEpisodesList.length} episodes. Select episodes to download:`;
+    feedActions.style.display = "flex";
+    feedRenderList();
   } catch (err) {
     feedStatus.textContent = `Failed to load feed: ${err}`;
   }
 }
+
+// Feed action buttons
+document.getElementById("btn-feed-select-all")!.addEventListener("click", () => {
+  document.getElementById("feed-episodes")!.querySelectorAll('input[type="checkbox"]:not(:disabled)').forEach(cb => {
+    (cb as HTMLInputElement).checked = true;
+  });
+  feedUpdateSelectedCount();
+});
+
+document.getElementById("btn-feed-select-none")!.addEventListener("click", () => {
+  document.getElementById("feed-episodes")!.querySelectorAll('input[type="checkbox"]:not(:disabled)').forEach(cb => {
+    (cb as HTMLInputElement).checked = false;
+  });
+  feedUpdateSelectedCount();
+});
+
+document.getElementById("btn-feed-download")!.addEventListener("click", async () => {
+  const feedEpisodes = document.getElementById("feed-episodes")!;
+  const feedStatus = document.getElementById("feed-status")!;
+  const checked = feedEpisodes.querySelectorAll('input[type="checkbox"]:checked:not(:disabled)') as NodeListOf<HTMLInputElement>;
+  if (checked.length === 0) { alert("No episodes selected."); return; }
+
+  // Ask for save directory
+  const dir = await open({ directory: true, title: "Select download folder for episodes" });
+  if (!dir) return;
+  feedSaveDir = Array.isArray(dir) ? dir[0] : dir;
+
+  const selectedIndices = Array.from(checked).map(cb => parseInt(cb.dataset.idx!));
+
+  // Disable checkboxes and button
+  (document.getElementById("btn-feed-download") as HTMLButtonElement).disabled = true;
+  feedStatus.textContent = `Scanning for existing files...`;
+
+  // Check which episodes already exist in the save dir
+  let skipped = 0;
+  let newlyTagged = 0;
+  let alreadyTagged = 0;
+  for (const idx of selectedIndices) {
+    const ep = feedEpisodesList[idx];
+    const safeName = ep.title.replace(/[^a-zA-Z0-9\s\-_.()]/g, "").replace(/\s+/g, "_").substring(0, 100);
+    const urlPath = new URL(ep.audioUrl).pathname;
+    const ext = urlPath.match(/\.(mp3|m4a|ogg|wav|flac|aac|opus)$/i)?.[0] || ".mp3";
+    const outputPath = `${feedSaveDir}/${safeName}${ext}`;
+    try {
+      if (await invoke<boolean>("file_exists", { path: outputPath })) {
+        const dateStr = ep.rawDate ? (() => { const d = new Date(ep.rawDate); return isNaN(d.getTime()) ? "" : `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; })() : "";
+        const result = await invoke<string>("download_podcast_episode", {
+          url: ep.audioUrl, outputPath, episodeId: ep.id, comment: dateStr,
+        });
+        ep.status = "complete";
+        ep.localPath = outputPath;
+        ep.progress = 1;
+        skipped++;
+        if (result.startsWith("exists_tagged:")) newlyTagged++;
+        else alreadyTagged++;
+      }
+    } catch {}
+  }
+  if (skipped > 0) feedRenderList();
+
+  const remaining = selectedIndices.filter(i => feedEpisodesList[i].status === "pending");
+  const tagInfo = newlyTagged > 0
+    ? ` (${newlyTagged} newly dated, ${alreadyTagged} already had dates)`
+    : alreadyTagged > 0 ? ` (all already had dates)` : "";
+
+  if (remaining.length === 0) {
+    feedStatus.textContent = `All ${skipped} episodes already exist${tagInfo}. Added to queue.`;
+    (document.getElementById("btn-feed-download") as HTMLButtonElement).disabled = false;
+    for (const idx of selectedIndices) {
+      const ep = feedEpisodesList[idx];
+      if (ep.localPath) addFiles([ep.localPath]);
+    }
+    return;
+  }
+
+  feedStatus.textContent = `${skipped} already exist${tagInfo}. Downloading ${remaining.length} remaining to ${feedSaveDir}...`;
+
+  // Download concurrently (up to 3 at a time)
+  const concurrency = 3;
+  let completed = skipped;
+  let errors = 0;
+  const total = selectedIndices.length;
+  const downloadQueue = [...remaining];
+
+  async function downloadNext(): Promise<void> {
+    while (downloadQueue.length > 0) {
+      const idx = downloadQueue.shift()!;
+      const ep = feedEpisodesList[idx];
+      ep.status = "downloading";
+      feedRenderList();
+
+      // Derive filename from title
+      const safeName = ep.title.replace(/[^a-zA-Z0-9\s\-_.()]/g, "").replace(/\s+/g, "_").substring(0, 100);
+      // Get extension from URL
+      const urlPath = new URL(ep.audioUrl).pathname;
+      const ext = urlPath.match(/\.(mp3|m4a|ogg|wav|flac|aac|opus)$/i)?.[0] || ".mp3";
+      const outputPath = `${feedSaveDir}/${safeName}${ext}`;
+
+      try {
+        const comment = ep.rawDate ? (() => { const d = new Date(ep.rawDate); return isNaN(d.getTime()) ? "" : `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; })() : "";
+        await invoke("download_podcast_episode", {
+          url: ep.audioUrl,
+          outputPath,
+          episodeId: ep.id,
+          comment,
+        });
+        ep.status = "complete";
+        ep.localPath = outputPath;
+        ep.progress = 1;
+        completed++;
+
+        // Add to transcription queue
+        addFiles([outputPath]);
+      } catch (err) {
+        ep.status = "error";
+        errors++;
+        console.warn(`Failed to download ${ep.title}:`, err);
+      }
+      feedRenderList();
+      feedStatus.textContent = `Downloaded ${completed}/${total}${errors > 0 ? ` (${errors} failed)` : ""}...`;
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, selectedIndices.length) }, () => downloadNext());
+  await Promise.all(workers);
+
+  feedStatus.textContent = `Done. Downloaded ${completed}/${total} episodes${errors > 0 ? ` (${errors} failed)` : ""}.`;
+  (document.getElementById("btn-feed-download") as HTMLButtonElement).disabled = false;
+});
 
 // Event listeners
 btnAddFiles.addEventListener("click", async () => {
@@ -840,9 +1033,19 @@ btnAddFolder.addEventListener("click", async () => {
 
 btnTranscribeAll.addEventListener("click", () => transcribeAll());
 
-btnClearQueue.addEventListener("click", () => {
-  const active = queue.some((q) => q.status === "transcribing" || q.status === "detecting");
-  if (active && !confirm("There are active transcriptions. Clear anyway?")) return;
+btnClearQueue.addEventListener("click", async () => {
+  const active = queue.filter((q) => q.status === "transcribing" || q.status === "detecting" || q.status === "queued");
+  if (active.length > 0) {
+    renderPaused = true;
+    const ok = confirm("There are active transcriptions. Clear anyway?");
+    renderPaused = false;
+    if (!ok) return;
+  }
+  // Cancel all active/queued jobs
+  for (const item of active) {
+    item.status = "cancelled";
+    try { await invoke("cancel_job", { jobId: item.id }); } catch {}
+  }
   queue.length = 0;
   renderQueue();
 });
@@ -1375,6 +1578,24 @@ listen<{status: string; progress: number}>("gap-progress", (event) => {
     detectingItem.detectStatus = data.status;
     const el = document.getElementById(`detect-status-${detectingItem.id}`);
     if (el) el.textContent = data.status;
+  }
+});
+
+listen<{episode_id: string; progress: number; status: string; downloaded_mb?: number; total_mb?: number}>("podcast-download-progress", (event) => {
+  const data = event.payload;
+  const ep = feedEpisodesList.find(e => e.id === data.episode_id);
+  if (ep) {
+    ep.progress = data.progress;
+    ep.downloadedMb = data.downloaded_mb || 0;
+    ep.totalMb = data.total_mb || 0;
+    // Update progress bar in-place without full re-render
+    const idx = feedEpisodesList.indexOf(ep);
+    const fill = document.getElementById(`feed-prog-${idx}`);
+    if (fill) {
+      fill.style.width = `${Math.round(data.progress * 100)}%`;
+      const statusEl = fill.closest(".ep-progress")?.querySelector(".ep-status");
+      if (statusEl) statusEl.textContent = `${ep.downloadedMb.toFixed(1)}/${ep.totalMb.toFixed(1)} MB`;
+    }
   }
 });
 

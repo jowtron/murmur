@@ -14,7 +14,9 @@ Murmur transcribes audio files locally using OpenAI's Whisper (via Metal GPU acc
 - **Multiple output formats** — SRT, VTT, TXT, JSON (or all at once)
 - **Per-word timestamps** option for precise alignment
 - **Model manager** — download and switch between Whisper models (tiny through large-v3-turbo)
-- **Podcast feed support** — paste an RSS URL to download and queue episodes
+- **Podcast feed support** — paste an RSS URL, select episodes, download concurrently with progress bars, and auto-queue for transcription
+- **Publication date tagging** — automatically writes the episode publication date to the audio file's year/date metadata field (supports MP3, M4A, FLAC, OGG)
+- **Smart skip** — detects existing transcriptions and skips re-processing; detects already-downloaded episodes and skips re-downloading
 
 ### Chapter Detection
 - **LLM-powered** — sends transcripts to any OpenRouter-compatible API (Gemini, Claude, GPT, etc.) to identify chapter/story boundaries
@@ -40,14 +42,20 @@ Murmur transcribes audio files locally using OpenAI's Whisper (via Metal GPU acc
 | **Audio resampling** | [Rubato](https://github.com/HEnquist/rubato) (high-quality sinc interpolation to 16kHz) |
 | **Audio classification** | [YAMNet](https://tfhub.dev/google/yamnet/1) via TensorFlow Lite C API ([libloading](https://github.com/nagisa/rust_libloading) FFI) |
 | **Chapter detection** | LLM via OpenRouter API (configurable model/prompt) |
+| **Audio tagging** | [Lofty](https://github.com/Serial-ATA/lofty-rs) (pure Rust, reads/writes ID3, MP4, Vorbis Comments, etc.) |
 | **FLAC tools** | Bundled [metaflac](https://xiph.org/flac/) for seek table repair and chapter embedding |
 | **Frontend** | TypeScript + Vite (vanilla, no framework) |
 | **Build** | Cargo + npm, bundled as native .app |
+
+No Python. No Electron. The entire backend is Rust.
 
 ### Bundled Native Libraries
 - `libtensorflowlite_c.dylib` (3.7MB) — TFLite C runtime for YAMNet inference
 - `yamnet.tflite` (3.9MB) — YAMNet audio classification model
 - `metaflac` + `libFLAC` + `libogg` — FLAC metadata tools
+
+### External Dependencies
+- `curl` — used to download Whisper models and podcast episodes (present on macOS by default)
 
 ## Supported Audio Formats
 
@@ -127,19 +135,31 @@ Click the **Reprocess** button on any completed item to re-run chapter detection
 
 ## Cross-Platform Compatibility
 
-Murmur currently only builds for **macOS on Apple Silicon**. Cross-platform support faces several challenges:
+Murmur currently only builds for **macOS on Apple Silicon**. The Rust code itself is fully cross-platform — the platform-specific parts are the GPU feature flag and the bundled native binaries.
 
-- **whisper-rs** is compiled with the `metal` feature for GPU acceleration. Building for Linux/Windows would require switching to CUDA or CPU-only mode.
-- **Bundled native binaries** (`libtensorflowlite_c.dylib`, `metaflac`, `libFLAC`, `libogg`) are macOS ARM64 binaries. Each platform would need its own prebuilt set.
-- **TFLite C API** — the prebuilt dylib is from [tphakala/tflite_c](https://github.com/tphakala/tflite_c) which provides releases for multiple platforms, so Linux/Windows TFLite is feasible.
-- **metaflac** is widely available on Linux (via package managers) and Windows (FLAC installer). The bundled binary could be replaced with a system dependency.
+### Component Portability
 
-In principle, a Linux build is achievable with:
-1. Removing the `metal` feature from whisper-rs (or adding `cuda`)
-2. Replacing the bundled dylibs with Linux `.so` equivalents
-3. Replacing `metaflac` with the system-installed version
+| Component | macOS (current) | Linux | Windows |
+|-----------|----------------|-------|---------|
+| **whisper-rs** | Metal GPU | CUDA or CPU-only | CUDA or CPU-only |
+| **TFLite** | `.dylib` (ARM64) | `.so` ([available](https://github.com/tphakala/tflite_c)) | `.dll` ([available](https://github.com/tphakala/tflite_c)) |
+| **metaflac** | bundled binary | `apt install flac` | FLAC installer |
+| **curl** | system | system | system (Win10+) |
+| **symphonia, rubato, lofty** | pure Rust | works | works |
+| **Tauri webview** | WebKit | WebKitGTK | WebView2 |
 
-Windows would additionally require handling `.dll` equivalents and potentially different audio backend configurations.
+### What a Linux Build Would Require
+
+1. Remove the `metal` feature from whisper-rs (or switch to `cuda` for NVIDIA GPU support)
+2. Replace `libtensorflowlite_c.dylib` with the Linux `.so` from [tphakala/tflite_c](https://github.com/tphakala/tflite_c)
+3. Use system-installed `metaflac` instead of the bundled binary (or bundle the Linux version)
+4. Install WebKitGTK for the Tauri webview
+
+### What a Windows Build Would Additionally Require
+
+- Replace all bundled libraries with `.dll` equivalents
+- Handle WebView2 runtime (usually pre-installed on Windows 10/11)
+- Potentially different audio backend configuration
 
 ## License
 

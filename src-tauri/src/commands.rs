@@ -219,6 +219,133 @@ pub async fn download_model(name: String, window: Window) -> Result<String, Stri
 }
 
 #[tauri::command]
+/// Tag an audio file's year field with a date string (YYYY-MM-DD)
+fn tag_audio_date(path: &std::path::Path, date: &str) {
+    use lofty::prelude::*;
+    let Ok(mut tagged_file) = lofty::read_from_path(path) else { return };
+    let tag = match tagged_file.primary_tag_mut() {
+        Some(t) => t,
+        None => {
+            let tag_type = tagged_file.primary_tag_type();
+            tagged_file.insert_tag(lofty::tag::Tag::new(tag_type));
+            tagged_file.primary_tag_mut().unwrap()
+        }
+    };
+    // Set the year key (TYER for ID3v2.3, TDRC for ID3v2.4, etc.)
+    tag.insert_text(lofty::tag::ItemKey::Year, date.to_string());
+    // Also set recording date for ID3v2.4 compatibility
+    tag.insert_text(lofty::tag::ItemKey::RecordingDate, date.to_string());
+    tagged_file.save_to_path(path, lofty::config::WriteOptions::default()).ok();
+}
+
+/// Check if an audio file already has a year/date tag
+fn has_date_tag(path: &std::path::Path) -> bool {
+    use lofty::prelude::*;
+    let Ok(tagged_file) = lofty::read_from_path(path) else { return false };
+    tagged_file.primary_tag()
+        .and_then(|t| t.get_string(lofty::tag::ItemKey::Year).map(|s| !s.is_empty()))
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+pub async fn download_podcast_episode(
+    url: String,
+    output_path: String,
+    episode_id: String,
+    comment: Option<String>,
+    window: Window,
+) -> Result<String, String> {
+    let path = PathBuf::from(&output_path);
+
+    // File already exists — just tag if needed and return
+    if path.exists() {
+        let mut tagged = false;
+        if let Some(ref c) = comment {
+            if !c.is_empty() && !has_date_tag(&path) {
+                tag_audio_date(&path, c);
+                tagged = true;
+            }
+        }
+        window.emit("podcast-download-progress", serde_json::json!({
+            "episode_id": episode_id, "progress": 1.0, "status": "complete"
+        })).ok();
+        return Ok(if tagged { format!("exists_tagged:{}", output_path) } else { format!("exists:{}", output_path) });
+    }
+
+    let tmp_path = path.with_extension("downloading");
+
+    window.emit("podcast-download-progress", serde_json::json!({
+        "episode_id": episode_id, "progress": 0.0, "status": "downloading"
+    })).ok();
+
+    // Get content-length with a HEAD request
+    let head_output = tokio::process::Command::new("curl")
+        .args(["-sI", "-L", &url])
+        .output()
+        .await
+        .ok();
+    let expected_size: u64 = head_output
+        .and_then(|o| {
+            let headers = String::from_utf8_lossy(&o.stdout).to_lowercase();
+            headers.lines()
+                .find(|l| l.starts_with("content-length:"))
+                .and_then(|l| l.split(':').nth(1)?.trim().parse().ok())
+        })
+        .unwrap_or(50_000_000);
+
+    let mut child = tokio::process::Command::new("curl")
+        .args(["-L", "-o", tmp_path.to_str().unwrap(), "-s", &url])
+        .spawn()
+        .map_err(|e| format!("Failed to start download: {}", e))?;
+
+    let win = window.clone();
+    let eid = episode_id.clone();
+    let tmp_clone = tmp_path.clone();
+    let monitor = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Ok(meta) = tokio::fs::metadata(&tmp_clone).await {
+                let progress = (meta.len() as f64 / expected_size as f64).min(0.99);
+                let downloaded_mb = meta.len() as f64 / 1_048_576.0;
+                let total_mb = expected_size as f64 / 1_048_576.0;
+                win.emit("podcast-download-progress", serde_json::json!({
+                    "episode_id": eid,
+                    "progress": progress,
+                    "status": "downloading",
+                    "downloaded_mb": downloaded_mb,
+                    "total_mb": total_mb,
+                })).ok();
+            }
+        }
+    });
+
+    let status = child.wait().await.map_err(|e| format!("Download failed: {}", e))?;
+    monitor.abort();
+
+    if !status.success() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err("Download failed".to_string());
+    }
+
+    tokio::fs::rename(&tmp_path, &path)
+        .await
+        .map_err(|e| format!("Failed to finalize download: {}", e))?;
+
+    // Tag with comment after download
+    if let Some(ref c) = comment {
+        if !c.is_empty() {
+            tag_audio_date(&path, c);
+        }
+    }
+
+    window.emit("podcast-download-progress", serde_json::json!({
+        "episode_id": episode_id, "progress": 1.0, "status": "complete"
+    })).ok();
+
+    Ok(output_path)
+}
+
+#[tauri::command]
 pub fn get_models_dir() -> String {
     transcriber::models_dir().to_string_lossy().to_string()
 }
@@ -1047,9 +1174,14 @@ pub fn check_transcription_exists(path: String, model: String, output_dir: Optio
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    // Check if SRT exists (the primary format we need for chapter detection)
-    let srt_path = dir.join(format!("{}_transcription_{}.srt", stem, model));
-    srt_path.exists()
+    // Check if any transcription format exists for this model
+    let base = format!("{}_transcription_{}", stem, model);
+    for ext in &["srt", "txt", "vtt", "json"] {
+        if dir.join(format!("{}.{}", base, ext)).exists() {
+            return true;
+        }
+    }
+    false
 }
 
 #[tauri::command]

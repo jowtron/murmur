@@ -213,6 +213,11 @@ select, input[type="text"], input[type="password"] {
   border-bottom: none;
 }
 
+.queue-item .file-info {
+  min-width: 0;
+  overflow: hidden;
+}
+
 .queue-item .file-info .file-name {
   font-size: 0.85rem;
   white-space: nowrap;
@@ -515,6 +520,57 @@ select, input[type="text"], input[type="password"] {
 .feed-add-selected {
   margin-top: 12px;
   width: 100%;
+}
+
+.feed-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.feed-selected-count {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  flex: 1;
+}
+
+.feed-episode .ep-progress {
+  width: 80px;
+  flex-shrink: 0;
+}
+
+.feed-episode .ep-progress-bar {
+  height: 6px;
+  background: var(--border);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.feed-episode .ep-progress-fill {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 3px;
+  transition: width 0.3s;
+}
+
+.feed-episode .ep-status {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  text-align: right;
+}
+
+.feed-episode.downloading {
+  background: rgba(0, 176, 240, 0.05);
+}
+
+.feed-episode.complete .ep-title {
+  color: var(--text-muted);
+}
+
+.feed-episode.error .ep-status {
+  color: #f44336;
 }
 
 /* Chapters */

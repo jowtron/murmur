@@ -25,6 +25,7 @@ dirs = "6"
 tokio-util = "0.7"
 rubato = "0.16"
 libloading = "0.8"
+lofty = "0.23"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

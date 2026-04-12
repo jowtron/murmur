@@ -209,6 +209,12 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
               <input type="text" id="input-feed-url" placeholder="Enter RSS feed URL..." class="form-input" />
               <button id="btn-load-feed" class="primary">Load Feed</button>
             </div>
+            <div id="feed-actions" class="feed-actions" style="display:none;">
+              <button id="btn-feed-select-all" class="small">Select All</button>
+              <button id="btn-feed-select-none" class="small">Select None</button>
+              <span id="feed-selected-count" class="feed-selected-count">0 selected</span>
+              <button id="btn-feed-download" class="primary small">Download Selected</button>
+            </div>
             <div id="feed-status" class="feed-status"></div>
             <div id="feed-episodes" class="feed-episodes"></div>
           </div>
