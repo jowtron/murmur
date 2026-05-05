@@ -271,12 +271,12 @@ select, input[type="text"], input[type="password"] {
   margin-top: 2px;
 }
 
-.settings-bar.engine-assemblyai .whisper-only {
+.settings-bar.engine-cloud .whisper-only {
   opacity: 0.35;
   transition: opacity 0.15s ease;
 }
 
-.settings-bar.engine-assemblyai .whisper-only:hover {
+.settings-bar.engine-cloud .whisper-only:hover {
   opacity: 0.6;
 }
 
@@ -301,6 +301,12 @@ select, input[type="text"], input[type="password"] {
   background: rgba(16, 185, 129, 0.15);
   color: #34d399;
   border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+.engine-badge.engine-deepgram {
+  background: rgba(244, 63, 94, 0.15);
+  color: #fb7185;
+  border: 1px solid rgba(244, 63, 94, 0.4);
 }
 
 .speaker-badge {

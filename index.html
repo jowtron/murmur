@@ -32,6 +32,7 @@
           <select id="select-engine">
             <option value="whisper" selected>Whisper (local)</option>
             <option value="assemblyai">AssemblyAI (diarization)</option>
+            <option value="deepgram">Deepgram (diarization)</option>
           </select>
         </label>
         <label class="whisper-only" title="Whisper model for transcription. Larger = more accurate but slower. (Whisper only.)">
@@ -169,8 +170,26 @@
                 </select>
               </label>
               <label class="form-label" style="flex:1;">
-                Language code (blank = auto-detect):
+                AssemblyAI language code (blank = auto-detect):
                 <input type="text" id="input-assemblyai-lang" class="form-input" value="en" placeholder="en" />
+              </label>
+            </div>
+            <label class="form-label">
+              Deepgram API Key:
+              <input type="password" id="input-deepgram-key" placeholder="Deepgram API token" class="form-input" />
+            </label>
+            <div style="display:flex;gap:12px;">
+              <label class="form-label" style="flex:1;">
+                Deepgram Model:
+                <select id="select-deepgram-model" class="form-input">
+                  <option value="nova-3" selected>Nova-3 ($0.0043/min, ~$0.26/hr)</option>
+                  <option value="nova-2">Nova-2</option>
+                  <option value="nova">Nova</option>
+                </select>
+              </label>
+              <label class="form-label" style="flex:1;">
+                Deepgram language code (blank = auto-detect):
+                <input type="text" id="input-deepgram-lang" class="form-input" value="en" placeholder="en" />
               </label>
             </div>
             <h3 class="settings-section-title">Chapter Detection (LLM)</h3>

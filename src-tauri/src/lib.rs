@@ -1,5 +1,6 @@
 mod assemblyai;
 mod commands;
+mod deepgram;
 mod flac_utils;
 mod transcriber;
 mod gap_detection;
@@ -50,6 +51,7 @@ pub fn run() {
             commands::download_podcast_episode,
             commands::transcribe_assemblyai,
             commands::check_diarization_exists,
+            commands::transcribe_deepgram,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

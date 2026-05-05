@@ -174,6 +174,22 @@ Murmur currently only builds for **macOS on Apple Silicon**. The Rust code itsel
 - Handle WebView2 runtime (usually pre-installed on Windows 10/11)
 - Potentially different audio backend configuration
 
+## Roadmap
+
+### Engines under consideration
+- **Sherpa-onnx (local diarization)** — official Rust crate (`sherpa-onnx` v1.13+) wraps the k2-fsa C++ toolkit. Would give offline speaker diarization (3D-Speaker models, ~30MB) without sending audio to a cloud API. Realistic Rust integration; ~2–3 days of work to bundle the native library and add model-download UX similar to Whisper.
+- **Pyannote.audio (local diarization, future)** — best-in-class accuracy but Python+PyTorch only. Would require shelling out to a Python script, which adds a heavy dependency footprint. Tracked as a longer-term option in case a Rust-friendly equivalent doesn't catch up.
+- **Distil-Whisper variants** (`distil-large-v3`, `distil-medium-en`, `distil-small-en`) — drop-in for whisper-rs, English-only, ~6× faster than Large V3. Could be added as extra entries in the model picker.
+
+### Other cloud providers worth evaluating
+The same pattern used for AssemblyAI / Deepgram could host any of:
+- **OpenAI Whisper API** — $0.006/min, no diarization in API, useful as a no-frills cheap option
+- **Speechmatics** — high accuracy, batch + real-time, custom dictionary support; more enterprise-priced
+- **Rev.ai** — strong diarization, custom vocab
+- **Google Cloud Speech-to-Text** — diarization, 125+ languages, more setup overhead
+- **Azure Speech** — comparable to Google
+- **ElevenLabs Scribe** — newer entrant, allegedly very accurate
+
 ## License
 
 MIT

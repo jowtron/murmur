@@ -1,4 +1,5 @@
 use crate::assemblyai;
+use crate::deepgram;
 use crate::flac_utils;
 use crate::transcriber::{
     self, TranscriptionProgress, TranscriptionResult, WhisperModel,
@@ -1594,5 +1595,130 @@ pub async fn transcribe_assemblyai(
         txt_path: txt_path.to_string_lossy().to_string(),
         speaker_count: speakers.len(),
         duration_secs: final_transcript.audio_duration,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeepgramJob {
+    pub id: String,
+    pub path: String,
+    pub api_key: String,
+    pub model: String,
+    pub output_dir: Option<String>,
+    pub language_code: Option<String>,
+}
+
+#[tauri::command]
+pub async fn transcribe_deepgram(
+    job: DeepgramJob,
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<AssemblyAIResult, String> {
+    if job.api_key.trim().is_empty() {
+        return Err("Deepgram API key is not set. Add it in Settings.".to_string());
+    }
+
+    let cancel_token = CancellationToken::new();
+    {
+        let mut tokens = state.cancel_tokens.lock().unwrap();
+        tokens.insert(job.id.clone(), cancel_token.clone());
+    }
+
+    let sem = state.semaphore.lock().unwrap().clone();
+    let permit = sem
+        .acquire_owned()
+        .await
+        .map_err(|e| format!("Queue error: {}", e))?;
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        return Err("Cancelled".to_string());
+    }
+
+    let audio_path = PathBuf::from(&job.path);
+    let file_name = audio_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let job_id = job.id.clone();
+
+    emit_aai(&window, &job_id, &file_name, 0.05, "uploading");
+
+    let api_key = job.api_key.clone();
+    let model = job.model.clone();
+    let lang = job.language_code.clone();
+    let path_clone = audio_path.clone();
+
+    let response = tokio::task::spawn_blocking(move || {
+        deepgram::transcribe(&path_clone, &api_key, &model, lang.as_deref())
+    })
+    .await
+    .map_err(|e| format!("Task error: {}", e))??;
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        return Err("Cancelled".to_string());
+    }
+
+    let utterances = response
+        .results
+        .as_ref()
+        .and_then(|r| r.utterances.clone())
+        .unwrap_or_default();
+
+    if utterances.is_empty() {
+        return Err("Deepgram returned no utterances. Check that diarization succeeded.".to_string());
+    }
+
+    let output_dir = job
+        .output_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| audio_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+    let stem = audio_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let srt_path = output_dir.join(format!("{}.diarized.srt", stem));
+    let txt_path = output_dir.join(format!("{}.diarized.txt", stem));
+    let json_path = output_dir.join(format!("{}.diarized.json", stem));
+
+    std::fs::write(&srt_path, deepgram::utterances_to_srt(&utterances))
+        .map_err(|e| format!("Failed to write SRT: {}", e))?;
+    std::fs::write(&txt_path, deepgram::utterances_to_text(&utterances))
+        .map_err(|e| format!("Failed to write TXT: {}", e))?;
+
+    // Write JSON in the same shape as AssemblyAI output so the speaker rename modal
+    // can consume it without engine-specific branches.
+    let aai_utts = deepgram::to_aai_style_utterances(&utterances);
+    let combined = serde_json::json!({
+        "engine": "deepgram",
+        "model": job.model,
+        "audio_duration": response.metadata.as_ref().and_then(|m| m.duration),
+        "utterances": aai_utts,
+        "raw": response,
+    });
+    std::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&combined).unwrap_or_default(),
+    )
+    .map_err(|e| format!("Failed to write JSON: {}", e))?;
+
+    let speakers: std::collections::HashSet<u32> =
+        utterances.iter().map(|u| u.speaker).collect();
+
+    emit_aai(&window, &job_id, &file_name, 1.0, "complete");
+    state.cancel_tokens.lock().unwrap().remove(&job.id);
+    drop(permit);
+
+    Ok(AssemblyAIResult {
+        transcript_id: String::new(),
+        srt_path: srt_path.to_string_lossy().to_string(),
+        json_path: json_path.to_string_lossy().to_string(),
+        txt_path: txt_path.to_string_lossy().to_string(),
+        speaker_count: speakers.len(),
+        duration_secs: response.metadata.and_then(|m| m.duration),
     })
 }

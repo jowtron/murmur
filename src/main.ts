@@ -56,7 +56,7 @@ interface ChapterWithSnap {
   snapped: boolean;
 }
 
-type Engine = "whisper" | "assemblyai";
+type Engine = "whisper" | "assemblyai" | "deepgram";
 
 interface QueueItem {
   id: string;
@@ -97,6 +97,9 @@ function loadSettings() {
     assemblyaiKey: localStorage.getItem("assemblyai_api_key") || (document.getElementById("input-assemblyai-key") as HTMLInputElement)?.value || "",
     assemblyaiModel: localStorage.getItem("assemblyai_model") || "auto",
     assemblyaiLang: localStorage.getItem("assemblyai_lang") ?? "en",
+    deepgramKey: localStorage.getItem("deepgram_api_key") || (document.getElementById("input-deepgram-key") as HTMLInputElement)?.value || "",
+    deepgramModel: localStorage.getItem("deepgram_model") || "nova-3",
+    deepgramLang: localStorage.getItem("deepgram_lang") ?? "en",
   };
 }
 
@@ -127,6 +130,9 @@ function saveSettings() {
   localStorage.setItem("assemblyai_api_key", (document.getElementById("input-assemblyai-key") as HTMLInputElement).value);
   localStorage.setItem("assemblyai_model", (document.getElementById("select-assemblyai-model") as HTMLSelectElement).value);
   localStorage.setItem("assemblyai_lang", (document.getElementById("input-assemblyai-lang") as HTMLInputElement).value);
+  localStorage.setItem("deepgram_api_key", (document.getElementById("input-deepgram-key") as HTMLInputElement).value);
+  localStorage.setItem("deepgram_model", (document.getElementById("select-deepgram-model") as HTMLSelectElement).value);
+  localStorage.setItem("deepgram_lang", (document.getElementById("input-deepgram-lang") as HTMLInputElement).value);
   const modelsText = (document.getElementById("input-llm-models") as HTMLTextAreaElement).value;
   localStorage.setItem("llm_models", modelsText);
   const modelsList = modelsText.split("\n").map(m => m.trim()).filter(Boolean);
@@ -196,6 +202,23 @@ function formatElapsed(ms: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+function engineShort(e: Engine): string {
+  switch (e) {
+    case "assemblyai": return "AssemblyAI";
+    case "deepgram": return "Deepgram";
+    case "whisper":
+    default: return "Whisper";
+  }
+}
+function engineLabel(e: Engine): string {
+  switch (e) {
+    case "assemblyai": return "AssemblyAI cloud diarization";
+    case "deepgram": return "Deepgram cloud diarization";
+    case "whisper":
+    default: return "Whisper local transcription";
+  }
+}
+
 function escapeHtml(text: string): string {
   const div = document.createElement("div");
   div.textContent = text;
@@ -226,7 +249,7 @@ function renderQueue() {
       <div class="file-info">
         <div class="file-name">
           ${escapeHtml(item.name)}
-          <span class="engine-badge engine-${item.engine}" title="${item.engine === "assemblyai" ? "AssemblyAI cloud diarization" : "Whisper local transcription"}">${item.engine === "assemblyai" ? "AssemblyAI" : "Whisper"}</span>
+          <span class="engine-badge engine-${item.engine}" title="${engineLabel(item.engine)}">${engineShort(item.engine)}</span>
           ${item.speakerCount ? `<span class="speaker-badge" title="Distinct speakers detected">${item.speakerCount} speakers</span>` : ""}
         </div>
         <div class="file-path">${escapeHtml(item.path)}</div>
@@ -260,7 +283,7 @@ function renderQueue() {
       <div class="actions">
         ${item.status === "transcribing" || item.status === "queued" || item.status === "detecting" ? `<button class="small danger btn-cancel" data-id="${item.id}">Cancel</button>` : ""}
         ${item.status === "error" || item.status === "cancelled" ? `<button class="small btn-retry" data-id="${item.id}">Retry</button>` : ""}
-        ${item.status === "complete" && item.engine === "assemblyai" && item.diarizedJsonPath ? `<button class="small btn-speakers" data-id="${item.id}">Identify speakers</button>` : ""}
+        ${item.status === "complete" && (item.engine === "assemblyai" || item.engine === "deepgram") && item.diarizedJsonPath ? `<button class="small btn-speakers" data-id="${item.id}">Identify speakers</button>` : ""}
         ${item.status === "complete" && item.engine === "whisper" ? `<button class="small btn-reprocess" data-id="${item.id}">Reprocess</button>` : ""}
         ${item.status !== "transcribing" && item.status !== "detecting" ? `<button class="small danger btn-remove" data-id="${item.id}">&times;</button>` : ""}
       </div>
@@ -1038,9 +1061,95 @@ function msToSrt(ms: number): string {
 function pad2(n: number): string { return n.toString().padStart(2, "0"); }
 function pad3(n: number): string { return n.toString().padStart(3, "0"); }
 
+async function transcribeItemDeepgram(item: QueueItem) {
+  item.modelUsed = "Deepgram";
+  item.error = undefined;
+  renderQueue();
+
+  const settings = loadSettings();
+  if (!settings.deepgramKey) {
+    item.status = "error";
+    item.error = "Deepgram API key is not set. Open Settings to add it.";
+    renderQueue();
+    return;
+  }
+
+  try {
+    if (item.status === "cancelled" || !queue.includes(item)) return;
+
+    const alreadyExists = await invoke<boolean>("check_diarization_exists", {
+      path: item.path,
+      outputDir: customOutputDir || null,
+    });
+
+    if (alreadyExists) {
+      const stem = item.path.replace(/\.[^./]+$/, "").split("/").pop() || "";
+      const dir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
+      item.diarizedSrtPath = `${dir}/${stem}.diarized.srt`;
+      item.diarizedJsonPath = `${dir}/${stem}.diarized.json`;
+      item.diarizedTxtPath = `${dir}/${stem}.diarized.txt`;
+      item.status = "complete";
+      item.progress = 1.0;
+      renderQueue();
+      return;
+    }
+
+    item.status = "queued";
+    item.progress = 0;
+    item.startedAt = undefined;
+    item.elapsed = undefined;
+    renderQueue();
+
+    const langTrimmed = (settings.deepgramLang || "").trim();
+    const result = await invoke<AssemblyAIResult>("transcribe_deepgram", {
+      job: {
+        id: item.id,
+        path: item.path,
+        api_key: settings.deepgramKey,
+        model: settings.deepgramModel,
+        output_dir: customOutputDir,
+        language_code: langTrimmed || null,
+      },
+    });
+
+    item.speakerCount = result.speaker_count;
+    item.diarizedSrtPath = result.srt_path;
+    item.diarizedJsonPath = result.json_path;
+    item.diarizedTxtPath = result.txt_path;
+    item.elapsed = Date.now() - (item.startedAt || Date.now());
+
+    if ((item.status as string) !== "cancelled") {
+      item.status = "complete";
+      item.progress = 1.0;
+    }
+  } catch (err: any) {
+    item.elapsed = item.startedAt ? Date.now() - item.startedAt : undefined;
+    const errMsg = typeof err === "string" ? err : err?.message || "Unknown error";
+    if (errMsg === "Cancelled") {
+      item.status = "cancelled";
+      item.error = "Cancelled by user";
+    } else {
+      item.status = "error";
+      item.error = errMsg;
+    }
+  }
+  renderQueue();
+
+  if (item.status === "complete" && item.diarizedJsonPath) {
+    const modal = document.getElementById("speakers-modal");
+    if (modal && modal.classList.contains("hidden")) {
+      openSpeakerModal(item);
+    }
+  }
+}
+
 async function transcribeItem(item: QueueItem) {
   if (item.engine === "assemblyai") {
     await transcribeItemAssemblyAI(item);
+    return;
+  }
+  if (item.engine === "deepgram") {
+    await transcribeItemDeepgram(item);
     return;
   }
 
@@ -1133,19 +1242,27 @@ async function transcribeAll() {
 
   const whisperItems = pendingItems.filter((i) => i.engine === "whisper");
   const aaiItems = pendingItems.filter((i) => i.engine === "assemblyai");
+  const dgItems = pendingItems.filter((i) => i.engine === "deepgram");
 
   if (whisperItems.length > 0) {
     const modelReady = await checkModelAndPromptDownload(model);
     if (!modelReady) return;
   }
 
+  const settings = loadSettings();
   if (aaiItems.length > 0) {
-    const settings = loadSettings();
     if (!settings.assemblyaiKey) {
       alert("AssemblyAI API key is not set. Open Settings to add it before submitting AssemblyAI jobs.");
       return;
     }
     if (!confirmAssemblyAICost(aaiItems)) return;
+  }
+  if (dgItems.length > 0) {
+    if (!settings.deepgramKey) {
+      alert("Deepgram API key is not set. Open Settings to add it before submitting Deepgram jobs.");
+      return;
+    }
+    if (!confirmDeepgramCost(dgItems)) return;
   }
 
   btnTranscribeAll.disabled = true;
@@ -1174,6 +1291,26 @@ function assemblyaiRatePerHour(modelChoice: string): { rate: number; label: stri
     default:
       return { rate: 0.23, label: "Universal-3 Pro + diarization" };
   }
+}
+
+function confirmDeepgramCost(items: QueueItem[]): boolean {
+  // Deepgram Nova-3 batch: $0.0043/min ≈ $0.258/hr (diarization included).
+  const ratePerMin = 0.0043;
+  const knownDurationSecs = items.map((i) => i.duration || 0).reduce((a, b) => a + b, 0);
+  const unknownCount = items.filter((i) => !i.duration).length;
+  const knownMinutes = knownDurationSecs / 60;
+  const cost = knownMinutes * ratePerMin;
+
+  let msg = `${items.length} file(s) will be sent to Deepgram (Nova-3, diarization included).\n\n`;
+  if (knownDurationSecs > 0) {
+    msg += `Total duration: ${formatDuration(knownDurationSecs)} (~${knownMinutes.toFixed(1)} min)\n`;
+    msg += `Estimated cost: $${cost.toFixed(2)} (at $${(ratePerMin * 60).toFixed(2)}/hr)\n`;
+  }
+  if (unknownCount > 0) {
+    msg += `${unknownCount} file(s) have unknown duration — final cost may be higher.\n`;
+  }
+  msg += `\nProceed?`;
+  return confirm(msg);
 }
 
 function confirmAssemblyAICost(items: QueueItem[]): boolean {
@@ -1598,6 +1735,9 @@ function loadSettingsIntoForm() {
   (document.getElementById("input-assemblyai-key") as HTMLInputElement).value = s.assemblyaiKey;
   (document.getElementById("select-assemblyai-model") as HTMLSelectElement).value = s.assemblyaiModel;
   (document.getElementById("input-assemblyai-lang") as HTMLInputElement).value = s.assemblyaiLang;
+  (document.getElementById("input-deepgram-key") as HTMLInputElement).value = s.deepgramKey;
+  (document.getElementById("select-deepgram-model") as HTMLSelectElement).value = s.deepgramModel;
+  (document.getElementById("input-deepgram-lang") as HTMLInputElement).value = s.deepgramLang;
   (document.getElementById("input-llm-models") as HTMLTextAreaElement).value = s.llmModels;
   (document.getElementById("input-api-url") as HTMLInputElement).value = s.apiUrl;
   if (s.chapterPrompt) (document.getElementById("input-chapter-prompt") as HTMLTextAreaElement).value = s.chapterPrompt;
@@ -2164,10 +2304,11 @@ function loadPreferences() {
 function applyEngineUI() {
   const bar = document.querySelector(".settings-bar");
   if (!bar) return;
+  bar.classList.remove("engine-assemblyai", "engine-deepgram", "engine-cloud");
   if (selectEngine.value === "assemblyai") {
-    bar.classList.add("engine-assemblyai");
-  } else {
-    bar.classList.remove("engine-assemblyai");
+    bar.classList.add("engine-assemblyai", "engine-cloud");
+  } else if (selectEngine.value === "deepgram") {
+    bar.classList.add("engine-deepgram", "engine-cloud");
   }
 }
 selectEngine.addEventListener("change", () => {
