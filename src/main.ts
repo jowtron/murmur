@@ -549,12 +549,20 @@ async function checkModelAndPromptDownload(modelName: string): Promise<boolean> 
   );
   if (!doDownload) return false;
 
-  // Open model manager, refresh list, then wait for user to see it
+  // Open model manager so the user sees the progress bar for this model
   modelModal.classList.remove("hidden");
   await refreshModelList();
 
-  // Wait for user to confirm by waiting for the model to exist
-  // The download starts when user clicks Download in the modal
+  // Trigger the Download button for this specific model so the user
+  // doesn't have to find and click it themselves.
+  const dlBtn = modelList.querySelector<HTMLButtonElement>(
+    `.btn-download-model[data-name="${modelName}"]`
+  );
+  if (dlBtn) {
+    dlBtn.click();
+  }
+
+  // Wait for the model to exist or the user to close the modal.
   return new Promise((resolve) => {
     const checkInterval = setInterval(async () => {
       const nowReady = await invoke<boolean>("is_model_ready", { name: modelName });
