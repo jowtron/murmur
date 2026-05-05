@@ -156,11 +156,20 @@ pub async fn download_model(name: String, window: Window) -> Result<String, Stri
     let mut child = tokio::process::Command::new("curl")
         .args([
             "-L",
-            "-o",
-            tmp_path.to_str().unwrap(),
+            "-o", tmp_path.to_str().unwrap(),
             "--progress-bar",
-            "--write-out",
-            "%{size_download}",
+            "--write-out", "%{size_download}",
+            // Resume partial downloads from a previous failed attempt.
+            "-C", "-",
+            // Retry on errors including mid-download failures, up to 5 times.
+            "--retry", "5",
+            "--retry-delay", "2",
+            "--retry-all-errors",
+            // Detect stalled connections (e.g. HF LFS signed-URL expiry).
+            // If transfer speed stays below 10 KB/s for 30 s, abort and retry.
+            "--speed-limit", "10000",
+            "--speed-time", "30",
+            "--connect-timeout", "30",
             &url,
         ])
         .stderr(std::process::Stdio::piped())
@@ -215,8 +224,12 @@ pub async fn download_model(name: String, window: Window) -> Result<String, Stri
     monitor.abort();
 
     if !status.success() {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err("Download failed".to_string());
+        // Keep the partial tmp file in place so the next attempt can resume
+        // from where this one left off via `curl -C -`.
+        return Err(format!(
+            "Download failed (curl exit {:?}). Click Retry to resume from the partial file.",
+            status.code()
+        ));
     }
 
     tokio::fs::rename(&tmp_path, &path)
