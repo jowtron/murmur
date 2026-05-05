@@ -56,6 +56,8 @@ interface ChapterWithSnap {
   snapped: boolean;
 }
 
+type Engine = "whisper" | "assemblyai";
+
 interface QueueItem {
   id: string;
   path: string;
@@ -71,6 +73,13 @@ interface QueueItem {
   chapters?: Chapter[];
   snappedChapters?: ChapterWithSnap[];
   detectStatus?: string;
+  engine: Engine;
+  speakerCount?: number;
+  stageText?: string;
+  diarizedJsonPath?: string;
+  diarizedSrtPath?: string;
+  diarizedTxtPath?: string;
+  speakerNames?: Record<string, string>;
 }
 
 const queue: QueueItem[] = [];
@@ -85,7 +94,19 @@ function loadSettings() {
     apiUrl: localStorage.getItem("api_url") || "https://openrouter.ai/api/v1/chat/completions",
     chapterPrompt: localStorage.getItem("chapter_prompt") || (document.getElementById("input-chapter-prompt") as HTMLTextAreaElement)?.value || "",
     chapterOutputFormat: localStorage.getItem("chapter_output_format") || "json",
+    assemblyaiKey: localStorage.getItem("assemblyai_api_key") || (document.getElementById("input-assemblyai-key") as HTMLInputElement)?.value || "",
+    assemblyaiModel: localStorage.getItem("assemblyai_model") || "auto",
+    assemblyaiLang: localStorage.getItem("assemblyai_lang") ?? "en",
   };
+}
+
+function assemblyaiSpeechModels(choice: string): string[] {
+  switch (choice) {
+    case "universal-3-pro": return ["universal-3-pro"];
+    case "universal-2": return ["universal-2"];
+    case "auto":
+    default: return ["universal-3-pro", "universal-2"];
+  }
 }
 
 function llmModelShort(fullModel: string): string {
@@ -103,6 +124,9 @@ function refreshLlmDropdown() {
 
 function saveSettings() {
   localStorage.setItem("openrouter_api_key", (document.getElementById("input-api-key") as HTMLInputElement).value);
+  localStorage.setItem("assemblyai_api_key", (document.getElementById("input-assemblyai-key") as HTMLInputElement).value);
+  localStorage.setItem("assemblyai_model", (document.getElementById("select-assemblyai-model") as HTMLSelectElement).value);
+  localStorage.setItem("assemblyai_lang", (document.getElementById("input-assemblyai-lang") as HTMLInputElement).value);
   const modelsText = (document.getElementById("input-llm-models") as HTMLTextAreaElement).value;
   localStorage.setItem("llm_models", modelsText);
   const modelsList = modelsText.split("\n").map(m => m.trim()).filter(Boolean);
@@ -137,6 +161,7 @@ const modelList = document.getElementById("model-list")!;
 const modelsDir = document.getElementById("models-dir")!;
 const settingsModal = document.getElementById("settings-modal")!;
 const feedModal = document.getElementById("feed-modal")!;
+const selectEngine = document.getElementById("select-engine")! as HTMLSelectElement;
 const selectModel = document.getElementById("select-model")! as HTMLSelectElement;
 const selectFormat = document.getElementById("select-format")! as HTMLSelectElement;
 const selectOutput = document.getElementById("select-output")! as HTMLSelectElement;
@@ -199,7 +224,11 @@ function renderQueue() {
       (item) => `
     <div class="queue-item" data-id="${item.id}">
       <div class="file-info">
-        <div class="file-name">${escapeHtml(item.name)}</div>
+        <div class="file-name">
+          ${escapeHtml(item.name)}
+          <span class="engine-badge engine-${item.engine}" title="${item.engine === "assemblyai" ? "AssemblyAI cloud diarization" : "Whisper local transcription"}">${item.engine === "assemblyai" ? "AssemblyAI" : "Whisper"}</span>
+          ${item.speakerCount ? `<span class="speaker-badge" title="Distinct speakers detected">${item.speakerCount} speakers</span>` : ""}
+        </div>
         <div class="file-path">${escapeHtml(item.path)}</div>
         ${item.error ? `<div class="error-msg">${escapeHtml(item.error)}</div>` : ""}
         ${item.chapters ? `<div class="chapters-badge clickable" data-id="${item.id}" style="cursor:pointer; text-decoration:underline;">${item.chapters.length} chapters detected</div> <span class="chapters-badge" style="cursor:pointer;text-decoration:underline;margin-left:6px;" data-align-id="${item.id}">Align</span>` : ""}
@@ -221,7 +250,7 @@ function renderQueue() {
         <span class="status status-${item.status}">
           ${item.status === "pending" ? "Pending" : ""}
           ${item.status === "queued" ? "Queued" : ""}
-          ${item.status === "transcribing" ? `${Math.round(item.progress * 100)}%` : ""}
+          ${item.status === "transcribing" ? (item.stageText && item.engine === "assemblyai" ? `${item.stageText} ${Math.round(item.progress * 100)}%` : `${Math.round(item.progress * 100)}%`) : ""}
           ${item.status === "detecting" ? `<span id="detect-status-${item.id}">Detecting...</span>` : ""}
           ${item.status === "complete" ? "Done" : ""}
           ${item.status === "error" ? "Error" : ""}
@@ -231,7 +260,8 @@ function renderQueue() {
       <div class="actions">
         ${item.status === "transcribing" || item.status === "queued" || item.status === "detecting" ? `<button class="small danger btn-cancel" data-id="${item.id}">Cancel</button>` : ""}
         ${item.status === "error" || item.status === "cancelled" ? `<button class="small btn-retry" data-id="${item.id}">Retry</button>` : ""}
-        ${item.status === "complete" ? `<button class="small btn-reprocess" data-id="${item.id}">Reprocess</button>` : ""}
+        ${item.status === "complete" && item.engine === "assemblyai" && item.diarizedJsonPath ? `<button class="small btn-speakers" data-id="${item.id}">Identify speakers</button>` : ""}
+        ${item.status === "complete" && item.engine === "whisper" ? `<button class="small btn-reprocess" data-id="${item.id}">Reprocess</button>` : ""}
         ${item.status !== "transcribing" && item.status !== "detecting" ? `<button class="small danger btn-remove" data-id="${item.id}">&times;</button>` : ""}
       </div>
     </div>
@@ -279,6 +309,14 @@ function renderQueue() {
         item.error = "Cancelled by user";
         renderQueue();
       }
+    });
+  });
+
+  queueList.querySelectorAll(".btn-speakers").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const id = (btn as HTMLElement).dataset.id!;
+      const item = queue.find((q) => q.id === id);
+      if (item) openSpeakerModal(item);
     });
   });
 
@@ -425,6 +463,7 @@ setInterval(() => {
 
 async function addFiles(paths: string[]) {
   const autoChapters = chkAutoChapters.checked;
+  const engine = (selectEngine.value as Engine) || "whisper";
 
   // Check for FLAC files missing seek tables
   const fixablePaths: string[] = [];
@@ -464,7 +503,8 @@ async function addFiles(paths: string[]) {
       duration: null,
       status: "pending",
       progress: 0,
-      autoDetectChapters: autoChapters,
+      autoDetectChapters: autoChapters && engine === "whisper",
+      engine,
     };
     queue.push(item);
 
@@ -613,7 +653,397 @@ async function runChapterDetection(item: QueueItem, skipCueEmbed = false): Promi
   }
 }
 
+interface AssemblyAIResult {
+  transcript_id: string;
+  srt_path: string;
+  json_path: string;
+  txt_path: string;
+  speaker_count: number;
+  duration_secs: number | null;
+}
+
+async function transcribeItemAssemblyAI(item: QueueItem) {
+  item.modelUsed = "AssemblyAI";
+  item.error = undefined;
+  renderQueue();
+
+  const settings = loadSettings();
+  if (!settings.assemblyaiKey) {
+    item.status = "error";
+    item.error = "AssemblyAI API key is not set. Open Settings to add it.";
+    renderQueue();
+    return;
+  }
+
+  try {
+    if (item.status === "cancelled" || !queue.includes(item)) return;
+
+    const alreadyExists = await invoke<boolean>("check_diarization_exists", {
+      path: item.path,
+      outputDir: customOutputDir || null,
+    });
+
+    if (alreadyExists) {
+      const stem = item.path.replace(/\.[^./]+$/, "").split("/").pop() || "";
+      const dir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
+      item.diarizedSrtPath = `${dir}/${stem}.diarized.srt`;
+      item.diarizedJsonPath = `${dir}/${stem}.diarized.json`;
+      item.diarizedTxtPath = `${dir}/${stem}.diarized.txt`;
+      item.status = "complete";
+      item.progress = 1.0;
+      renderQueue();
+      return;
+    }
+
+    item.status = "queued";
+    item.progress = 0;
+    item.startedAt = undefined;
+    item.elapsed = undefined;
+    renderQueue();
+
+    const langTrimmed = (settings.assemblyaiLang || "").trim();
+    const result = await invoke<AssemblyAIResult>("transcribe_assemblyai", {
+      job: {
+        id: item.id,
+        path: item.path,
+        api_key: settings.assemblyaiKey,
+        output_dir: customOutputDir,
+        language_code: langTrimmed || null,
+        speech_models: assemblyaiSpeechModels(settings.assemblyaiModel),
+      },
+    });
+
+    item.speakerCount = result.speaker_count;
+    item.diarizedSrtPath = result.srt_path;
+    item.diarizedJsonPath = result.json_path;
+    item.diarizedTxtPath = result.txt_path;
+    item.elapsed = Date.now() - (item.startedAt || Date.now());
+
+    if ((item.status as string) !== "cancelled") {
+      item.status = "complete";
+      item.progress = 1.0;
+    }
+  } catch (err: any) {
+    item.elapsed = item.startedAt ? Date.now() - item.startedAt : undefined;
+    const errMsg = typeof err === "string" ? err : err?.message || "Unknown error";
+    if (errMsg === "Cancelled") {
+      item.status = "cancelled";
+      item.error = "Cancelled by user";
+    } else {
+      item.status = "error";
+      item.error = errMsg;
+    }
+  }
+  renderQueue();
+
+  if (item.status === "complete" && item.engine === "assemblyai" && item.diarizedJsonPath) {
+    const modal = document.getElementById("speakers-modal");
+    if (modal && modal.classList.contains("hidden")) {
+      openSpeakerModal(item);
+    }
+  }
+}
+
+interface AAIUtterance {
+  start: number;
+  end: number;
+  text: string;
+  speaker: string;
+}
+
+interface SpeakerSample {
+  speaker: string;
+  count: number;
+  totalSecs: number;
+  samples: { text: string; start: number; secs: number }[];
+}
+
+function summarizeSpeakers(utterances: AAIUtterance[]): SpeakerSample[] {
+  const byKey = new Map<string, AAIUtterance[]>();
+  for (const u of utterances) {
+    const key = u.speaker;
+    if (!byKey.has(key)) byKey.set(key, []);
+    byKey.get(key)!.push(u);
+  }
+  const out: SpeakerSample[] = [];
+  for (const [speaker, group] of byKey) {
+    const totalSecs = group.reduce((acc, u) => acc + Math.max(0, (u.end - u.start) / 1000), 0);
+    // Pick up to 3 longest utterances for context
+    const sorted = [...group].sort((a, b) => (b.end - b.start) - (a.end - a.start));
+    const samples = sorted.slice(0, 3).map((u) => ({
+      text: u.text.trim(),
+      start: u.start,
+      secs: (u.end - u.start) / 1000,
+    }));
+    out.push({ speaker, count: group.length, totalSecs, samples });
+  }
+  out.sort((a, b) => a.speaker.localeCompare(b.speaker));
+  return out;
+}
+
+interface SpeakerModalState {
+  item: QueueItem | null;          // null in standalone mode
+  utterances: AAIUtterance[];
+  raw: any | null;                 // present when source is JSON
+  prefixIsLiteral: boolean;        // false: "Speaker A:", true: any "<Label>:"
+  paths: { srtPath?: string; txtPath?: string; jsonPath?: string };
+}
+
+let speakerModalState: SpeakerModalState | null = null;
+
+function showSpeakerModal(state: SpeakerModalState, prefilledNames?: Record<string, string>) {
+  speakerModalState = state;
+  const summary = summarizeSpeakers(state.utterances);
+
+  const list = document.getElementById("speakers-list")!;
+  list.innerHTML = summary.map((s) => {
+    const heading = state.prefixIsLiteral ? escapeHtml(s.speaker) : `Speaker ${escapeHtml(s.speaker)}`;
+    const prefilled = prefilledNames?.[s.speaker] || "";
+    return `
+      <div class="speaker-block">
+        <div class="speaker-block-head">
+          <span class="speaker-tag">${heading}</span>
+          <span class="speaker-stats">${s.count} utterances · ${formatDuration(s.totalSecs)} total</span>
+        </div>
+        <div class="speaker-samples">
+          ${s.samples.map((sm) => `<div class="speaker-sample"><span class="sample-time">${formatDuration(sm.start / 1000)}</span> <span class="sample-text">${escapeHtml(sm.text)}</span></div>`).join("")}
+        </div>
+        <label class="speaker-name-row">
+          Name:
+          <input type="text" class="form-input speaker-name-input" data-speaker="${escapeHtml(s.speaker)}" value="${escapeHtml(prefilled)}" placeholder="e.g. Narrator" />
+        </label>
+      </div>
+    `;
+  }).join("");
+
+  document.getElementById("speakers-modal")!.classList.remove("hidden");
+}
+
+async function openSpeakerModal(item: QueueItem) {
+  if (!item.diarizedJsonPath) {
+    alert("No diarized JSON file found for this item.");
+    return;
+  }
+  let raw: any;
+  try {
+    const content = await invoke<string>("read_text_file", { path: item.diarizedJsonPath });
+    raw = JSON.parse(content);
+  } catch (err) {
+    alert(`Failed to load diarized JSON: ${err}`);
+    return;
+  }
+  const utterances: AAIUtterance[] = raw.utterances || [];
+  if (utterances.length === 0) {
+    alert("No utterances found in diarized JSON.");
+    return;
+  }
+  showSpeakerModal({
+    item,
+    utterances,
+    raw,
+    prefixIsLiteral: false, // queue items use "Speaker A" naming
+    paths: {
+      srtPath: item.diarizedSrtPath,
+      txtPath: item.diarizedTxtPath,
+      jsonPath: item.diarizedJsonPath,
+    },
+  }, item.speakerNames);
+}
+
+function siblingPaths(srcPath: string): { srtPath?: string; txtPath?: string; jsonPath?: string } {
+  const stem = srcPath.replace(/\.(srt|txt|json)$/i, "");
+  return {
+    srtPath: stem + ".srt",
+    txtPath: stem + ".txt",
+    jsonPath: stem + ".json",
+  };
+}
+
+function parseDiarizedSrt(text: string): { utterances: AAIUtterance[] } {
+  const utterances: AAIUtterance[] = [];
+  const blocks = text.split(/\r?\n\r?\n+/);
+  for (const block of blocks) {
+    const lines = block.split(/\r?\n/).filter((l) => l.length > 0);
+    if (lines.length < 2) continue;
+    let timeIdx = 0;
+    if (/^\d+$/.test(lines[0].trim())) timeIdx = 1;
+    const timeLine = lines[timeIdx];
+    const m = timeLine.match(/(\d{1,2}:\d{2}:\d{2},\d{3})\s*-->\s*(\d{1,2}:\d{2}:\d{2},\d{3})/);
+    if (!m) continue;
+    const start = srtTimeToMs(m[1]);
+    const end = srtTimeToMs(m[2]);
+    const textLines = lines.slice(timeIdx + 1).join(" ").trim();
+    const colonIdx = textLines.indexOf(":");
+    if (colonIdx < 1 || colonIdx > 60) continue; // no speaker prefix recognized
+    const speaker = textLines.substring(0, colonIdx).trim();
+    const text = textLines.substring(colonIdx + 1).trim();
+    utterances.push({ start, end, text, speaker });
+  }
+  return { utterances };
+}
+
+function parseDiarizedTxt(text: string): { utterances: AAIUtterance[] } {
+  const utterances: AAIUtterance[] = [];
+  const blocks = text.split(/\r?\n\r?\n+/);
+  let cursor = 0;
+  for (const block of blocks) {
+    const trimmed = block.trim();
+    if (!trimmed) continue;
+    const colonIdx = trimmed.indexOf(":");
+    if (colonIdx < 1 || colonIdx > 60) continue;
+    const speaker = trimmed.substring(0, colonIdx).trim();
+    const utteranceText = trimmed.substring(colonIdx + 1).trim();
+    // No timestamps in TXT — fabricate increasing range so summary ordering works
+    utterances.push({ start: cursor, end: cursor + 1000, text: utteranceText, speaker });
+    cursor += 1000;
+  }
+  return { utterances };
+}
+
+function srtTimeToMs(t: string): number {
+  const m = t.match(/(\d{1,2}):(\d{2}):(\d{2}),(\d{3})/);
+  if (!m) return 0;
+  return parseInt(m[1]) * 3600000 + parseInt(m[2]) * 60000 + parseInt(m[3]) * 1000 + parseInt(m[4]);
+}
+
+async function openStandaloneSpeakerModal(filePath: string) {
+  const lower = filePath.toLowerCase();
+  let utterances: AAIUtterance[] = [];
+  let raw: any | null = null;
+  let prefixIsLiteral = true;
+
+  try {
+    const content = await invoke<string>("read_text_file", { path: filePath });
+    if (lower.endsWith(".json")) {
+      raw = JSON.parse(content);
+      utterances = raw.utterances || [];
+      prefixIsLiteral = false; // JSON keys are still raw "A", "B" speaker codes
+    } else if (lower.endsWith(".srt")) {
+      ({ utterances } = parseDiarizedSrt(content));
+    } else if (lower.endsWith(".txt")) {
+      ({ utterances } = parseDiarizedTxt(content));
+    } else {
+      alert("Please pick a .srt, .txt, or .json file.");
+      return;
+    }
+  } catch (err) {
+    alert(`Failed to read file: ${err}`);
+    return;
+  }
+
+  if (utterances.length === 0) {
+    alert("No speaker-labelled utterances found in this file.");
+    return;
+  }
+
+  const sib = siblingPaths(filePath);
+  // Only target paths that actually exist
+  const exists = await Promise.all([
+    sib.srtPath ? invoke<boolean>("file_exists", { path: sib.srtPath }).catch(() => false) : Promise.resolve(false),
+    sib.txtPath ? invoke<boolean>("file_exists", { path: sib.txtPath }).catch(() => false) : Promise.resolve(false),
+    sib.jsonPath ? invoke<boolean>("file_exists", { path: sib.jsonPath }).catch(() => false) : Promise.resolve(false),
+  ]);
+  const paths = {
+    srtPath: exists[0] ? sib.srtPath : undefined,
+    txtPath: exists[1] ? sib.txtPath : undefined,
+    jsonPath: exists[2] ? sib.jsonPath : undefined,
+  };
+
+  // Pre-fill from JSON's speaker_names map if present
+  const prefilled: Record<string, string> = (raw && raw.speaker_names) || {};
+
+  showSpeakerModal({
+    item: null,
+    utterances,
+    raw,
+    prefixIsLiteral,
+    paths,
+  }, prefilled);
+}
+
+function closeSpeakerModal() {
+  document.getElementById("speakers-modal")!.classList.add("hidden");
+  speakerModalState = null;
+}
+
+async function saveSpeakerNames() {
+  if (!speakerModalState) return;
+  const { item, utterances, raw, prefixIsLiteral, paths } = speakerModalState;
+
+  const inputs = document.querySelectorAll<HTMLInputElement>(".speaker-name-input");
+  const names: Record<string, string> = {};
+  inputs.forEach((inp) => {
+    const k = inp.dataset.speaker!;
+    const v = inp.value.trim();
+    if (v) names[k] = v;
+  });
+
+  const labelFor = (speaker: string) => {
+    if (names[speaker]) return names[speaker];
+    return prefixIsLiteral ? speaker : `Speaker ${speaker}`;
+  };
+
+  // Rewrite SRT (only if we have real timestamps — i.e. not fabricated by TXT parsing)
+  const haveTimestamps = utterances.some((u) => u.end > u.start && u.end > 0);
+  let srt: string | null = null;
+  if (haveTimestamps) {
+    const srtLines: string[] = [];
+    utterances.forEach((u, i) => {
+      srtLines.push(String(i + 1));
+      srtLines.push(`${msToSrt(u.start)} --> ${msToSrt(u.end)}`);
+      srtLines.push(`${labelFor(u.speaker)}: ${u.text.trim()}`);
+      srtLines.push("");
+    });
+    srt = srtLines.join("\n");
+  }
+
+  const txt = utterances.map((u) => `${labelFor(u.speaker)}: ${u.text.trim()}`).join("\n\n") + "\n";
+
+  let json: string | null = null;
+  if (raw) {
+    const updated = { ...raw, speaker_names: names };
+    if (updated.utterances) {
+      updated.utterances = updated.utterances.map((u: any) => ({
+        ...u,
+        speaker_name: names[u.speaker] || null,
+      }));
+    }
+    json = JSON.stringify(updated, null, 2);
+  }
+
+  try {
+    if (paths.srtPath && srt !== null) await invoke("write_text_file", { path: paths.srtPath, content: srt });
+    if (paths.txtPath) await invoke("write_text_file", { path: paths.txtPath, content: txt });
+    if (paths.jsonPath && json !== null) await invoke("write_text_file", { path: paths.jsonPath, content: json });
+  } catch (err) {
+    alert(`Failed to write files: ${err}`);
+    return;
+  }
+
+  if (item) {
+    item.speakerNames = names;
+    renderQueue();
+  }
+  closeSpeakerModal();
+}
+
+function msToSrt(ms: number): string {
+  const totalSecs = Math.floor(ms / 1000);
+  const h = Math.floor(totalSecs / 3600);
+  const m = Math.floor((totalSecs % 3600) / 60);
+  const s = totalSecs % 60;
+  const mmm = Math.floor(ms % 1000);
+  return `${pad2(h)}:${pad2(m)}:${pad2(s)},${pad3(mmm)}`;
+}
+function pad2(n: number): string { return n.toString().padStart(2, "0"); }
+function pad3(n: number): string { return n.toString().padStart(3, "0"); }
+
 async function transcribeItem(item: QueueItem) {
+  if (item.engine === "assemblyai") {
+    await transcribeItemAssemblyAI(item);
+    return;
+  }
+
   const model = selectModel.value;
   const format = selectFormat.value;
   const threads = parseInt(selectThreads.value);
@@ -701,16 +1131,30 @@ async function transcribeAll() {
   const pendingItems = queue.filter((q) => q.status === "pending");
   if (pendingItems.length === 0) return;
 
-  const modelReady = await checkModelAndPromptDownload(model);
-  if (!modelReady) return;
+  const whisperItems = pendingItems.filter((i) => i.engine === "whisper");
+  const aaiItems = pendingItems.filter((i) => i.engine === "assemblyai");
+
+  if (whisperItems.length > 0) {
+    const modelReady = await checkModelAndPromptDownload(model);
+    if (!modelReady) return;
+  }
+
+  if (aaiItems.length > 0) {
+    const settings = loadSettings();
+    if (!settings.assemblyaiKey) {
+      alert("AssemblyAI API key is not set. Open Settings to add it before submitting AssemblyAI jobs.");
+      return;
+    }
+    if (!confirmAssemblyAICost(aaiItems)) return;
+  }
 
   btnTranscribeAll.disabled = true;
 
   const concurrent = parseInt(selectConcurrent.value);
   await invoke("set_concurrency", { permits: concurrent });
 
-  // Update autoDetectChapters based on current checkbox state
-  pendingItems.forEach((item) => {
+  // Update autoDetectChapters based on current checkbox state (Whisper items only)
+  whisperItems.forEach((item) => {
     item.autoDetectChapters = chkAutoChapters.checked;
   });
 
@@ -718,6 +1162,42 @@ async function transcribeAll() {
   await Promise.all(promises);
 
   btnTranscribeAll.disabled = false;
+}
+
+function assemblyaiRatePerHour(modelChoice: string): { rate: number; label: string } {
+  // AssemblyAI: U2 = $0.15/hr, U3-Pro = $0.21/hr, +$0.02/hr diarization add-on
+  switch (modelChoice) {
+    case "universal-2":
+      return { rate: 0.17, label: "Universal-2 + diarization" };
+    case "universal-3-pro":
+    case "auto":
+    default:
+      return { rate: 0.23, label: "Universal-3 Pro + diarization" };
+  }
+}
+
+function confirmAssemblyAICost(items: QueueItem[]): boolean {
+  const settings = loadSettings();
+  const { rate: ratePerHour, label } = assemblyaiRatePerHour(settings.assemblyaiModel);
+  const ratePerMin = ratePerHour / 60;
+
+  const knownDurationSecs = items
+    .map((i) => i.duration || 0)
+    .reduce((a, b) => a + b, 0);
+  const unknownCount = items.filter((i) => !i.duration).length;
+  const knownMinutes = knownDurationSecs / 60;
+  const cost = knownMinutes * ratePerMin;
+
+  let msg = `${items.length} file(s) will be sent to AssemblyAI (${label}).\n\n`;
+  if (knownDurationSecs > 0) {
+    msg += `Total duration: ${formatDuration(knownDurationSecs)} (~${knownMinutes.toFixed(1)} min)\n`;
+    msg += `Estimated cost: $${cost.toFixed(2)} (at $${ratePerHour.toFixed(2)}/hr)\n`;
+  }
+  if (unknownCount > 0) {
+    msg += `${unknownCount} file(s) have unknown duration — final cost may be higher.\n`;
+  }
+  msg += `\nProceed?`;
+  return confirm(msg);
 }
 
 // GPU info
@@ -1097,6 +1577,13 @@ setupModal(btnModels, modelModal);
 setupModal(btnSettings, settingsModal);
 setupModal(btnAddFeed, feedModal);
 
+// Speaker modal close + save handlers
+const speakersModal = document.getElementById("speakers-modal")!;
+speakersModal.querySelector(".modal-close")!.addEventListener("click", closeSpeakerModal);
+speakersModal.addEventListener("click", (e) => { if (e.target === speakersModal) closeSpeakerModal(); });
+document.getElementById("btn-speakers-cancel")!.addEventListener("click", closeSpeakerModal);
+document.getElementById("btn-speakers-save")!.addEventListener("click", () => { saveSpeakerNames(); });
+
 btnModels.addEventListener("click", () => refreshModelList());
 
 // Settings
@@ -1108,6 +1595,9 @@ document.getElementById("btn-save-settings")!.addEventListener("click", () => {
 function loadSettingsIntoForm() {
   const s = loadSettings();
   (document.getElementById("input-api-key") as HTMLInputElement).value = s.apiKey;
+  (document.getElementById("input-assemblyai-key") as HTMLInputElement).value = s.assemblyaiKey;
+  (document.getElementById("select-assemblyai-model") as HTMLSelectElement).value = s.assemblyaiModel;
+  (document.getElementById("input-assemblyai-lang") as HTMLInputElement).value = s.assemblyaiLang;
   (document.getElementById("input-llm-models") as HTMLTextAreaElement).value = s.llmModels;
   (document.getElementById("input-api-url") as HTMLInputElement).value = s.apiUrl;
   if (s.chapterPrompt) (document.getElementById("input-chapter-prompt") as HTMLTextAreaElement).value = s.chapterPrompt;
@@ -1121,6 +1611,17 @@ function loadSettingsIntoForm() {
 document.getElementById("btn-load-feed")!.addEventListener("click", () => {
   const url = (document.getElementById("input-feed-url") as HTMLInputElement).value.trim();
   if (url) loadFeed(url);
+});
+
+// Rename speakers (standalone)
+document.getElementById("btn-rename-speakers")!.addEventListener("click", async () => {
+  const selected = await open({
+    multiple: false,
+    filters: [{ name: "Diarized transcripts", extensions: ["srt", "txt", "json"] }],
+  });
+  if (!selected) return;
+  const path = Array.isArray(selected) ? selected[0] : selected;
+  await openStandaloneSpeakerModal(path);
 });
 
 // Convert to CUE
@@ -1544,15 +2045,33 @@ listen<TranscriptionProgress>("transcription-progress", (event) => {
   const item = queue.find((q) => q.id === data.job_id);
   if (item) {
     item.progress = data.progress;
-    if (data.status === "transcribing") {
-      if (item.status !== "transcribing") {
-        item.status = "transcribing";
-        item.startedAt = Date.now();
-      }
+    item.stageText = formatStageText(data.status);
+    const isActiveStage =
+      data.status === "transcribing" ||
+      data.status === "uploading" ||
+      data.status === "submitting" ||
+      data.status.startsWith("processing");
+    if (isActiveStage && item.status !== "transcribing") {
+      item.status = "transcribing";
+      item.startedAt = Date.now();
     }
     renderQueue();
   }
 });
+
+function formatStageText(status: string): string {
+  if (status === "uploading") return "Uploading…";
+  if (status === "submitting") return "Submitting…";
+  if (status === "processing") return "Processing…";
+  if (status.startsWith("processing (")) {
+    const inner = status.substring("processing (".length, status.length - 1);
+    return `Processing (${inner})…`;
+  }
+  if (status === "loading_model") return "Loading model…";
+  if (status === "transcribing") return "Transcribing…";
+  if (status === "complete") return "Complete";
+  return status;
+}
 
 listen<ModelDownloadProgress>("model-download-progress", (event) => {
   const data = event.payload;
@@ -1601,6 +2120,7 @@ listen<{episode_id: string; progress: number; status: string; downloaded_mb?: nu
 
 // Persist UI preferences
 function savePreferences() {
+  localStorage.setItem("pref_engine", selectEngine.value);
   localStorage.setItem("pref_model", selectModel.value);
   localStorage.setItem("pref_format", selectFormat.value);
   localStorage.setItem("pref_threads", selectThreads.value);
@@ -1615,6 +2135,8 @@ function savePreferences() {
 }
 
 function loadPreferences() {
+  const engine = localStorage.getItem("pref_engine");
+  if (engine) selectEngine.value = engine;
   const model = localStorage.getItem("pref_model");
   if (model) selectModel.value = model;
   const format = localStorage.getItem("pref_format");
@@ -1639,6 +2161,20 @@ function loadPreferences() {
   if (firstZero !== null) chkFirstZero.checked = firstZero === "1";
 }
 
+function applyEngineUI() {
+  const bar = document.querySelector(".settings-bar");
+  if (!bar) return;
+  if (selectEngine.value === "assemblyai") {
+    bar.classList.add("engine-assemblyai");
+  } else {
+    bar.classList.remove("engine-assemblyai");
+  }
+}
+selectEngine.addEventListener("change", () => {
+  savePreferences();
+  applyEngineUI();
+});
+applyEngineUI();
 selectModel.addEventListener("change", savePreferences);
 selectFormat.addEventListener("change", savePreferences);
 selectThreads.addEventListener("change", savePreferences);
@@ -2746,4 +3282,5 @@ btnAlignApply.addEventListener("click", async () => {
 loadGpuInfo();
 loadSettingsIntoForm();
 loadPreferences();
+applyEngineUI();
 renderQueue();

@@ -271,6 +271,147 @@ select, input[type="text"], input[type="password"] {
   margin-top: 2px;
 }
 
+.settings-bar.engine-assemblyai .whisper-only {
+  opacity: 0.35;
+  transition: opacity 0.15s ease;
+}
+
+.settings-bar.engine-assemblyai .whisper-only:hover {
+  opacity: 0.6;
+}
+
+.engine-badge {
+  display: inline-block;
+  font-size: 0.65rem;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-left: 8px;
+  vertical-align: middle;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+.engine-badge.engine-whisper {
+  background: rgba(99, 102, 241, 0.15);
+  color: #818cf8;
+  border: 1px solid rgba(99, 102, 241, 0.4);
+}
+
+.engine-badge.engine-assemblyai {
+  background: rgba(16, 185, 129, 0.15);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+.speaker-badge {
+  display: inline-block;
+  font-size: 0.65rem;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-left: 6px;
+  vertical-align: middle;
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.settings-section-title {
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary, #888);
+  margin: 16px 0 4px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid var(--border, #333);
+}
+
+.settings-section-title:first-child {
+  margin-top: 0;
+}
+
+.speakers-form {
+  padding: 16px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.speakers-desc {
+  margin: 0 0 4px;
+  font-size: 0.85rem;
+  color: var(--text-secondary, #aaa);
+}
+
+.speakers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.speaker-block {
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.speaker-block-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.speaker-tag {
+  font-weight: 600;
+  font-size: 0.95rem;
+}
+
+.speaker-stats {
+  font-size: 0.75rem;
+  color: var(--text-secondary, #888);
+}
+
+.speaker-samples {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 6px 0 10px;
+  font-size: 0.85rem;
+}
+
+.speaker-sample {
+  line-height: 1.4;
+}
+
+.sample-time {
+  color: var(--text-secondary, #888);
+  font-family: monospace;
+  font-size: 0.75rem;
+  margin-right: 6px;
+}
+
+.speaker-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+}
+
+.speaker-name-input {
+  flex: 1;
+}
+
+.speakers-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border, #333);
+}
+
 .chapter-file-header {
   font-size: 0.85rem;
   font-weight: 600;

@@ -1,3 +1,4 @@
+use crate::assemblyai;
 use crate::flac_utils;
 use crate::transcriber::{
     self, TranscriptionProgress, TranscriptionResult, WhisperModel,
@@ -1398,4 +1399,200 @@ pub async fn find_template_matches(
     })
     .await
     .map_err(|e| format!("Task error: {}", e))?
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssemblyAIJob {
+    pub id: String,
+    pub path: String,
+    pub api_key: String,
+    pub output_dir: Option<String>,
+    pub language_code: Option<String>,
+    #[serde(default)]
+    pub speech_models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssemblyAIResult {
+    pub transcript_id: String,
+    pub srt_path: String,
+    pub json_path: String,
+    pub txt_path: String,
+    pub speaker_count: usize,
+    pub duration_secs: Option<f64>,
+}
+
+fn emit_aai(window: &Window, job_id: &str, file: &str, progress: f32, status: &str) {
+    window
+        .emit(
+            "transcription-progress",
+            TranscriptionProgress {
+                job_id: job_id.to_string(),
+                file: file.to_string(),
+                progress,
+                status: status.to_string(),
+            },
+        )
+        .ok();
+}
+
+#[tauri::command]
+pub fn check_diarization_exists(path: String, output_dir: Option<String>) -> bool {
+    let audio_path = PathBuf::from(&path);
+    let dir = output_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| audio_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+    let stem = audio_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let base = format!("{}.diarized", stem);
+    for ext in &["srt", "txt", "json"] {
+        if dir.join(format!("{}.{}", base, ext)).exists() {
+            return true;
+        }
+    }
+    false
+}
+
+#[tauri::command]
+pub async fn transcribe_assemblyai(
+    job: AssemblyAIJob,
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<AssemblyAIResult, String> {
+    if job.api_key.trim().is_empty() {
+        return Err("AssemblyAI API key is not set. Add it in Settings.".to_string());
+    }
+
+    let cancel_token = CancellationToken::new();
+    {
+        let mut tokens = state.cancel_tokens.lock().unwrap();
+        tokens.insert(job.id.clone(), cancel_token.clone());
+    }
+
+    let sem = state.semaphore.lock().unwrap().clone();
+    let permit = sem
+        .acquire_owned()
+        .await
+        .map_err(|e| format!("Queue error: {}", e))?;
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        return Err("Cancelled".to_string());
+    }
+
+    let audio_path = PathBuf::from(&job.path);
+    let file_name = audio_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let job_id = job.id.clone();
+
+    emit_aai(&window, &job_id, &file_name, 0.02, "uploading");
+
+    let api_key = job.api_key.clone();
+    let path_for_upload = audio_path.clone();
+    let upload_url = tokio::task::spawn_blocking(move || {
+        assemblyai::upload_file(&path_for_upload, &api_key)
+    })
+    .await
+    .map_err(|e| format!("Upload task error: {}", e))??;
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        return Err("Cancelled".to_string());
+    }
+
+    emit_aai(&window, &job_id, &file_name, 0.10, "submitting");
+
+    let api_key_2 = job.api_key.clone();
+    let lang = job.language_code.clone();
+    let models = job.speech_models.clone();
+    let transcript_id = tokio::task::spawn_blocking(move || {
+        assemblyai::submit(&upload_url, &api_key_2, lang.as_deref(), &models)
+    })
+    .await
+    .map_err(|e| format!("Submit task error: {}", e))??;
+
+    emit_aai(&window, &job_id, &file_name, 0.15, "processing");
+
+    let mut last_status = String::new();
+    let mut elapsed_polls: u32 = 0;
+    let final_transcript = loop {
+        if cancel_token.is_cancelled() {
+            drop(permit);
+            state.cancel_tokens.lock().unwrap().remove(&job.id);
+            return Err("Cancelled".to_string());
+        }
+
+        let t = assemblyai::poll(&transcript_id, &job.api_key).await?;
+        if t.status != last_status {
+            last_status = t.status.clone();
+        }
+
+        match t.status.as_str() {
+            "completed" => break t,
+            "error" => {
+                state.cancel_tokens.lock().unwrap().remove(&job.id);
+                drop(permit);
+                return Err(format!(
+                    "AssemblyAI error: {}",
+                    t.error.unwrap_or_else(|| "unknown".to_string())
+                ));
+            }
+            _ => {
+                elapsed_polls += 1;
+                let est = (0.15 + (elapsed_polls as f32 * 0.01)).min(0.95);
+                emit_aai(&window, &job_id, &file_name, est, &format!("processing ({})", t.status));
+                tokio::time::sleep(assemblyai::poll_interval()).await;
+            }
+        }
+    };
+
+    let utterances = final_transcript.utterances.clone().unwrap_or_default();
+    if utterances.is_empty() {
+        return Err("AssemblyAI returned no utterances. Diarization may have failed.".to_string());
+    }
+
+    let output_dir = job
+        .output_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| audio_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+    let stem = audio_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let srt_path = output_dir.join(format!("{}.diarized.srt", stem));
+    let txt_path = output_dir.join(format!("{}.diarized.txt", stem));
+    let json_path = output_dir.join(format!("{}.diarized.json", stem));
+
+    std::fs::write(&srt_path, assemblyai::utterances_to_srt(&utterances))
+        .map_err(|e| format!("Failed to write SRT: {}", e))?;
+    std::fs::write(&txt_path, assemblyai::utterances_to_text(&utterances))
+        .map_err(|e| format!("Failed to write TXT: {}", e))?;
+    std::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&final_transcript).unwrap_or_default(),
+    )
+    .map_err(|e| format!("Failed to write JSON: {}", e))?;
+
+    let speakers: std::collections::HashSet<&str> =
+        utterances.iter().map(|u| u.speaker.as_str()).collect();
+
+    emit_aai(&window, &job_id, &file_name, 1.0, "complete");
+    state.cancel_tokens.lock().unwrap().remove(&job.id);
+    drop(permit);
+
+    Ok(AssemblyAIResult {
+        transcript_id,
+        srt_path: srt_path.to_string_lossy().to_string(),
+        json_path: json_path.to_string_lossy().to_string(),
+        txt_path: txt_path.to_string_lossy().to_string(),
+        speaker_count: speakers.len(),
+        duration_secs: final_transcript.audio_duration,
+    })
 }

@@ -1,3 +1,4 @@
+mod assemblyai;
 mod commands;
 mod flac_utils;
 mod transcriber;
@@ -47,6 +48,8 @@ pub fn run() {
             commands::delete_audio_template,
             commands::find_template_matches,
             commands::download_podcast_episode,
+            commands::transcribe_assemblyai,
+            commands::check_diarization_exists,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

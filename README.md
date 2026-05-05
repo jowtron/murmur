@@ -2,7 +2,7 @@
 
 A desktop app for bulk audio transcription and automatic chapter detection, built for audiobook and podcast workflows.
 
-Murmur transcribes audio files locally using OpenAI's Whisper (via Metal GPU acceleration on Mac), then detects chapter boundaries using an LLM and refines them with YAMNet audio classification. Results can be embedded as FLAC metadata, exported as CUE sheets, and manually fine-tuned with a waveform-based alignment tool.
+Murmur transcribes audio files locally using OpenAI's Whisper (via Metal GPU acceleration on Mac), then detects chapter boundaries using an LLM and refines them with YAMNet audio classification. Results can be embedded as FLAC metadata, exported as CUE sheets, and manually fine-tuned with a waveform-based alignment tool. Optional cloud transcription with **speaker diarization** is available via AssemblyAI.
 
 ![macOS](https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-blue)
 
@@ -10,13 +10,21 @@ Murmur transcribes audio files locally using OpenAI's Whisper (via Metal GPU acc
 
 ### Transcription
 - **Local Whisper inference** with Metal GPU acceleration (no cloud API needed)
-- **Bulk processing** — queue hundreds of files with configurable concurrency
+- **AssemblyAI cloud engine** — optional per-file alternative for jobs that need speaker diarization (Universal-3 Pro by default, with Universal-2 fallback). Switch engines via the **Engine** dropdown; AssemblyAI-specific controls are in **Settings**
+- **Bulk processing** — queue hundreds of files with configurable concurrency (engines can be mixed in the same queue)
 - **Multiple output formats** — SRT, VTT, TXT, JSON (or all at once)
 - **Per-word timestamps** option for precise alignment
 - **Model manager** — download and switch between Whisper models (tiny through large-v3-turbo)
 - **Podcast feed support** — paste an RSS URL, select episodes, download concurrently with progress bars, and auto-queue for transcription
 - **Publication date tagging** — automatically writes the episode publication date to the audio file's year/date metadata field (supports MP3, M4A, FLAC, OGG)
-- **Smart skip** — detects existing transcriptions and skips re-processing; detects already-downloaded episodes and skips re-downloading
+- **Smart skip** — detects existing transcriptions (and existing diarizations) and skips re-processing; detects already-downloaded episodes and skips re-downloading
+
+### Speaker Diarization (AssemblyAI)
+- **One-click diarization** — pick `Engine: AssemblyAI` and submit; output lands as `<basename>.diarized.{srt,txt,json}` next to the audio (or in your custom output dir)
+- **Cost preview** — confirm dialog shows estimated cost ($0.17/hr for Universal-2 + diarization, $0.23/hr for Universal-3 Pro + diarization) before submitting
+- **Per-job progress** — live status (Uploading → Submitting → Processing) with progress bar
+- **Speaker rename modal** — auto-pops after diarization completes; shows up to 3 of each speaker's longest utterances as samples and lets you assign real names. Saves rewrite the SRT/TXT/JSON in place (`Speaker A:` → `Narrator:` etc.)
+- **Standalone rename** — top-bar **Rename Speakers** button opens any existing `.diarized.{srt,txt,json}` file. Sibling files are also rewritten if present
 
 ### Chapter Detection
 - **LLM-powered** — sends transcripts to any OpenRouter-compatible API (Gemini, Claude, GPT, etc.) to identify chapter/story boundaries
@@ -116,11 +124,16 @@ Hover over any control for a tooltip description. Key options:
 
 | Setting | Description |
 |---------|-------------|
-| **Correct times from SRT** | Refine LLM timestamps by matching chapter titles in the transcript |
-| **Snap to speech onset** | Use YAMNet to find the nearest music-to-speech transition |
-| **First chapter at 0:00** | Force the first chapter to start at the beginning |
-| **Embed in FLAC** | Write chapter markers as FLAC metadata |
-| **Write .cue** | Generate a CUE sheet alongside the audio |
+| **Engine** | `Whisper (local)` or `AssemblyAI (diarization)`. Mixed-engine queues are supported |
+| **AssemblyAI Model** *(Settings)* | `Universal-3 Pro → Universal-2 fallback` (default), `Universal-3 Pro only`, or `Universal-2 only` |
+| **AssemblyAI Language code** *(Settings)* | Default `en`. Leave blank for auto-detect |
+| **Correct times from SRT** | Refine LLM timestamps by matching chapter titles in the transcript (Whisper only) |
+| **Snap to speech onset** | Use YAMNet to find the nearest music-to-speech transition (Whisper only) |
+| **First chapter at 0:00** | Force the first chapter to start at the beginning (Whisper only) |
+| **Embed in FLAC** | Write chapter markers as FLAC metadata (Whisper only) |
+| **Write .cue** | Generate a CUE sheet alongside the audio (Whisper only) |
+
+When AssemblyAI is selected as the engine, Whisper-only controls are visually dimmed (chapter detection is bypassed for AssemblyAI jobs).
 
 ### FLAC Seek Table Repair
 

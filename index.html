@@ -18,6 +18,7 @@
           <button id="btn-convert-cue" title="Convert chapter JSON/TXT files to CUE sheet format">Convert to CUE</button>
           <button id="btn-align-cue" title="Load CUE file(s) and manually adjust chapter boundaries on the waveform">Align CUE</button>
           <button id="btn-template-editor" title="Create audio fingerprint templates to find recurring markers (e.g. intro jingles)">Marker Template</button>
+          <button id="btn-rename-speakers" title="Open an existing .diarized.srt / .diarized.txt / .diarized.json and rename speakers">Rename Speakers</button>
           <button id="btn-settings" title="Configure API key, LLM models, prompts, and chapter detection settings">Settings</button>
           <button id="btn-models" title="Download and manage Whisper transcription models">Models</button>
         </div>
@@ -26,7 +27,14 @@
       <div class="gpu-bar" id="gpu-bar"></div>
 
       <div class="settings-bar">
-        <label title="Whisper model for transcription. Larger = more accurate but slower.">
+        <label title="Transcription engine. Whisper runs locally. AssemblyAI is a cloud service that supports speaker diarization.">
+          Engine:
+          <select id="select-engine">
+            <option value="whisper" selected>Whisper (local)</option>
+            <option value="assemblyai">AssemblyAI (diarization)</option>
+          </select>
+        </label>
+        <label class="whisper-only" title="Whisper model for transcription. Larger = more accurate but slower. (Whisper only.)">
           Model:
           <select id="select-model">
             <option value="large-v3-turbo" selected>Large V3 Turbo</option>
@@ -37,7 +45,7 @@
             <option value="tiny">Tiny</option>
           </select>
         </label>
-        <label title="Output format for transcriptions. SRT is required for chapter detection.">
+        <label class="whisper-only" title="Output format for transcriptions. SRT is required for chapter detection. (Whisper only — AssemblyAI always writes SRT/TXT/JSON.)">
           Format:
           <select id="select-format">
             <option value="all">All Formats</option>
@@ -54,7 +62,7 @@
             <option value="custom">Custom folder...</option>
           </select>
         </label>
-        <label title="Number of CPU threads for Whisper. More threads = faster but uses more CPU.">
+        <label class="whisper-only" title="Number of CPU threads for Whisper. More threads = faster but uses more CPU. (Whisper only.)">
           Threads:
           <select id="select-threads">
             <option value="2">2</option>
@@ -73,35 +81,35 @@
             <option value="4">4 files</option>
           </select>
         </label>
-        <label title="Which LLM to use for chapter detection via OpenRouter API.">
+        <label class="whisper-only" title="Which LLM to use for chapter detection via OpenRouter API. (Whisper only — AssemblyAI jobs skip chapter detection.)">
           LLM:
           <select id="select-llm-model"></select>
         </label>
-        <label class="auto-chapters-label" title="Automatically run LLM chapter detection after each transcription completes.">
+        <label class="auto-chapters-label whisper-only" title="Automatically run LLM chapter detection after each transcription completes.">
           <input type="checkbox" id="chk-auto-chapters" />
           Auto-detect chapters
         </label>
-        <label class="auto-chapters-label" title="Use YAMNet audio classification to snap chapter boundaries to the nearest music-to-speech transition.">
+        <label class="auto-chapters-label whisper-only" title="Use YAMNet audio classification to snap chapter boundaries to the nearest music-to-speech transition.">
           <input type="checkbox" id="chk-snap-gaps" checked />
           Snap to speech onset
         </label>
-        <label class="auto-chapters-label" title="Refine LLM chapter times by searching the SRT transcript for matching text near each timestamp. Improves accuracy when the LLM's times are approximate.">
+        <label class="auto-chapters-label whisper-only" title="Refine LLM chapter times by searching the SRT transcript for matching text near each timestamp. Improves accuracy when the LLM's times are approximate.">
           <input type="checkbox" id="chk-srt-correct" checked />
           Correct times from SRT
         </label>
-        <label class="auto-chapters-label" title="Force the first chapter to start at 00:00:00 instead of the LLM's detected time.">
+        <label class="auto-chapters-label whisper-only" title="Force the first chapter to start at 00:00:00 instead of the LLM's detected time.">
           <input type="checkbox" id="chk-first-zero" checked />
           First chapter at 0:00
         </label>
-        <label class="auto-chapters-label" title="Generate per-word timestamps in the transcription (slower but more precise).">
+        <label class="auto-chapters-label whisper-only" title="Generate per-word timestamps in the transcription (slower but more precise).">
           <input type="checkbox" id="chk-per-word" />
           Per-word timestamps
         </label>
-        <label class="auto-chapters-label" title="Embed chapter markers as FLAC metadata tags. Only applies to FLAC files.">
+        <label class="auto-chapters-label whisper-only" title="Embed chapter markers as FLAC metadata tags. Only applies to FLAC files.">
           <input type="checkbox" id="chk-embed-flac" checked />
           Embed in FLAC
         </label>
-        <label class="auto-chapters-label" title="Write a .cue sheet file alongside the audio. Reprocessing will not overwrite an existing .cue — use Align + Save for that.">
+        <label class="auto-chapters-label whisper-only" title="Write a .cue sheet file alongside the audio. Reprocessing will not overwrite an existing .cue — use Align + Save for that.">
           <input type="checkbox" id="chk-write-cue" checked />
           Write .cue
         </label>
@@ -142,10 +150,30 @@
       <div id="settings-modal" class="modal hidden">
         <div class="modal-content wide">
           <div class="modal-header">
-            <h2>Chapter Detection Settings</h2>
+            <h2>Settings</h2>
             <button class="modal-close">&times;</button>
           </div>
           <div class="settings-form">
+            <h3 class="settings-section-title">Transcription Engines</h3>
+            <label class="form-label">
+              AssemblyAI API Key (for cloud diarization):
+              <input type="password" id="input-assemblyai-key" placeholder="AssemblyAI API key" class="form-input" />
+            </label>
+            <div style="display:flex;gap:12px;">
+              <label class="form-label" style="flex:1;">
+                AssemblyAI Model:
+                <select id="select-assemblyai-model" class="form-input">
+                  <option value="auto" selected>Universal-3 Pro &rarr; Universal-2 fallback</option>
+                  <option value="universal-3-pro">Universal-3 Pro only ($0.23/hr)</option>
+                  <option value="universal-2">Universal-2 only ($0.17/hr)</option>
+                </select>
+              </label>
+              <label class="form-label" style="flex:1;">
+                Language code (blank = auto-detect):
+                <input type="text" id="input-assemblyai-lang" class="form-input" value="en" placeholder="en" />
+              </label>
+            </div>
+            <h3 class="settings-section-title">Chapter Detection (LLM)</h3>
             <label class="form-label">
               OpenRouter API Key:
               <input type="password" id="input-api-key" placeholder="sk-or-..." class="form-input" />
@@ -222,6 +250,24 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
       </div>
 
       <!-- Chapter Detail Modal -->
+      <!-- Speaker Identification Modal -->
+      <div id="speakers-modal" class="modal hidden">
+        <div class="modal-content wide">
+          <div class="modal-header">
+            <h2>Identify Speakers</h2>
+            <button class="modal-close">&times;</button>
+          </div>
+          <div class="speakers-form">
+            <p class="speakers-desc">AssemblyAI labelled each speaker as Speaker A, Speaker B, etc. Enter real names below to rewrite the diarized SRT/TXT/JSON files. Leave blank to keep the generic label.</p>
+            <div id="speakers-list" class="speakers-list"></div>
+            <div class="speakers-actions">
+              <button id="btn-speakers-cancel" class="small">Cancel</button>
+              <button id="btn-speakers-save" class="primary">Save names &amp; rewrite files</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div id="chapter-detail-modal" class="modal hidden">
         <div class="modal-content wide">
           <div class="modal-header">
@@ -244,15 +290,15 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
             <div class="chapters-input-row">
               <input type="text" id="input-chapter-file" placeholder="No file selected..." class="form-input" readonly />
               <button id="btn-choose-chapter-file" class="small">Browse...</button>
-              <label class="auto-chapters-label">
+              <label class="auto-chapters-label whisper-only">
                 <input type="checkbox" id="chk-modal-snap" checked />
                 Snap to speech onset
               </label>
-              <label class="auto-chapters-label">
+              <label class="auto-chapters-label whisper-only">
                 <input type="checkbox" id="chk-modal-embed" checked />
                 Embed in FLAC
               </label>
-              <label class="auto-chapters-label">
+              <label class="auto-chapters-label whisper-only">
                 <input type="checkbox" id="chk-modal-cue" checked />
                 Write .cue
               </label>
