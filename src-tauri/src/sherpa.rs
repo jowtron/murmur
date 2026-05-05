@@ -11,7 +11,7 @@ pub struct Segment {
 pub fn models_dir() -> PathBuf {
     let dir = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("whisper-transcriber")
+        .join("murmur")
         .join("sherpa-models");
     std::fs::create_dir_all(&dir).ok();
     dir

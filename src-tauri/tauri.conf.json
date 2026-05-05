@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/nicholascm/tauri/dev/crates/tauri-utils/schema.json",
   "productName": "Murmur",
   "version": "0.1.0",
-  "identifier": "com.whisper-transcriber.app",
+  "identifier": "com.jowtron.murmur",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",

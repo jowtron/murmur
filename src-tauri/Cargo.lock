@@ -2075,6 +2075,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "murmur"
+version = "0.1.0"
+dependencies = [
+ "dirs",
+ "libloading 0.8.9",
+ "lofty",
+ "rubato",
+ "serde",
+ "serde_json",
+ "sherpa-onnx",
+ "symphonia",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-shell",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "whisper-rs",
+]
+
+[[package]]
 name = "ndk"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5087,28 +5109,6 @@ dependencies = [
  "cfg-if",
  "cmake",
  "fs_extra",
-]
-
-[[package]]
-name = "whisper-transcriber"
-version = "0.1.0"
-dependencies = [
- "dirs",
- "libloading 0.8.9",
- "lofty",
- "rubato",
- "serde",
- "serde_json",
- "sherpa-onnx",
- "symphonia",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-shell",
- "tokio",
- "tokio-util",
- "uuid",
- "whisper-rs",
 ]
 
 [[package]]

@@ -18,6 +18,8 @@ CMAKE_OSX_DEPLOYMENT_TARGET=10.15 MACOSX_DEPLOYMENT_TARGET=10.15 npx tauri build
 
 For a fast dev iteration: `cd src-tauri && cargo check` (~3s). Frontend typecheck: `npx tsc --noEmit`.
 
+Note: the project directory is still `whisper-transcriber/` for path-stability reasons even though the app is named Murmur. Cargo package, lib, and binary are all `murmur` now. Bundle identifier: `com.jowtron.murmur`. Data dir: `~/Library/Application Support/murmur/{models,sherpa-models,templates}` (one-shot startup migration in `lib.rs::migrate_legacy_data_dir` moves a legacy `whisper-transcriber/` dir over).
+
 ## Layout
 
 - `index.html` — single-page UI markup. Top settings bar, queue, modals.

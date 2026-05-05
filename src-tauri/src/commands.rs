@@ -693,9 +693,9 @@ pub async fn detect_chapters(req: ChapterRequest) -> Result<Vec<Chapter>, String
             "-H",
             &format!("Authorization: Bearer {}", req.api_key),
             "-H",
-            "HTTP-Referer: https://whisper-transcriber.app",
+            "HTTP-Referer: https://github.com/jowtron/murmur",
             "-H",
-            "X-Title: Whisper_Transcriber",
+            "X-Title: Murmur",
             "-d",
             &body.to_string(),
         ])

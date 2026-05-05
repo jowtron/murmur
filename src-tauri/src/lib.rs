@@ -10,8 +10,35 @@ mod yamnet;
 
 use commands::AppState;
 
+/// One-shot migration from the legacy `whisper-transcriber/` data dir to `murmur/`.
+/// Runs at startup. If the old dir exists and the new one doesn't, rename it so
+/// users keep their downloaded models, templates, and sherpa-models.
+fn migrate_legacy_data_dir() {
+    let Some(data_root) = dirs::data_local_dir() else { return };
+    let old_dir = data_root.join("whisper-transcriber");
+    let new_dir = data_root.join("murmur");
+    if old_dir.exists() && !new_dir.exists() {
+        if let Err(e) = std::fs::rename(&old_dir, &new_dir) {
+            eprintln!(
+                "[migrate] failed to rename {} -> {}: {}",
+                old_dir.display(),
+                new_dir.display(),
+                e
+            );
+        } else {
+            eprintln!(
+                "[migrate] moved data dir {} -> {}",
+                old_dir.display(),
+                new_dir.display()
+            );
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    migrate_legacy_data_dir();
+
     let state = AppState::new(2);
 
     tauri::Builder::default()

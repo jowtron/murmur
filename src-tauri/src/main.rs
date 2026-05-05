@@ -1,5 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    whisper_transcriber_lib::run()
+    murmur_lib::run()
 }
