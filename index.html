@@ -21,6 +21,7 @@
           <button id="btn-rename-speakers" title="Open an existing .diarized.srt / .diarized.txt / .diarized.json and rename speakers">Rename Speakers</button>
           <button id="btn-settings" title="Configure API key, LLM models, prompts, and chapter detection settings">Settings</button>
           <button id="btn-models" title="Download and manage Whisper transcription models">Models</button>
+          <button id="btn-about" class="btn-about" title="About engines and models">?</button>
         </div>
       </header>
 
@@ -273,6 +274,97 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
       </div>
 
       <!-- Chapter Detail Modal -->
+      <!-- About / Models Reference Modal -->
+      <div id="about-modal" class="modal hidden">
+        <div class="modal-content wide">
+          <div class="modal-header">
+            <h2>About Engines &amp; Models</h2>
+            <button class="modal-close">&times;</button>
+          </div>
+          <div class="about-form">
+            <h3 class="settings-section-title">Transcription Engines</h3>
+            <p class="about-desc">Pick an engine for each file via the <strong>Engine</strong> dropdown. All four produce the same <code>.diarized.{srt,txt,json}</code> outputs (except plain Whisper, which writes <code>_transcription_&lt;model&gt;.{srt,vtt,txt,json}</code> without speaker labels).</p>
+            <table class="about-table">
+              <thead><tr><th>Engine</th><th>Cost</th><th>Network</th><th>Diarization</th><th>Notes</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td><strong>Whisper</strong></td>
+                  <td>Free</td>
+                  <td>Offline</td>
+                  <td>—</td>
+                  <td>Local Whisper transcription only. Pair with the LLM chapter-detection pipeline.</td>
+                </tr>
+                <tr>
+                  <td><strong>Whisper + Sherpa</strong></td>
+                  <td>Free</td>
+                  <td>Offline</td>
+                  <td>Yes</td>
+                  <td>Whisper for text + Sherpa-onnx (pyannote + NeMo SpeakerNet) for speakers. Pick any Whisper model in the Model dropdown. ~28 MB model download on first use.</td>
+                </tr>
+                <tr>
+                  <td><strong>AssemblyAI</strong></td>
+                  <td>$0.17–$0.23/hr</td>
+                  <td>Cloud</td>
+                  <td>Yes</td>
+                  <td>Universal-2 ($0.17/hr) or Universal-3 Pro ($0.23/hr) + diarization add-on. Auto-fallback default. Configurable in Settings.</td>
+                </tr>
+                <tr>
+                  <td><strong>Deepgram</strong></td>
+                  <td>~$0.26/hr</td>
+                  <td>Cloud</td>
+                  <td>Yes</td>
+                  <td>Nova-3 model ($0.0043/min, diarization included). Faster than AssemblyAI on long files (single sync POST instead of upload+poll).</td>
+                </tr>
+              </tbody>
+            </table>
+
+            <h3 class="settings-section-title">Whisper Models</h3>
+            <p class="about-desc">Larger models are more accurate but slower. <code>turbo</code> and <code>distil</code> variants are speed-optimized derivatives of Large V3.</p>
+            <table class="about-table">
+              <thead><tr><th>Model</th><th>Size</th><th>Languages</th><th>Speed (rel. to Large V3)</th><th>Notes</th></tr></thead>
+              <tbody>
+                <tr><td>Tiny</td><td>~75 MB</td><td>Multilingual</td><td>~32×</td><td>Fast but rough; useful for quick previews.</td></tr>
+                <tr><td>Base</td><td>~142 MB</td><td>Multilingual</td><td>~16×</td><td>Step up from Tiny.</td></tr>
+                <tr><td>Small</td><td>~466 MB</td><td>Multilingual</td><td>~6×</td><td>Decent accuracy on clean audio.</td></tr>
+                <tr><td>Medium</td><td>~1.5 GB</td><td>Multilingual</td><td>~2×</td><td>Solid all-purpose model.</td></tr>
+                <tr><td>Large V3</td><td>~3 GB</td><td>Multilingual</td><td>1× (baseline)</td><td>Highest multilingual accuracy. Slowest.</td></tr>
+                <tr><td><strong>Large V3 Turbo</strong></td><td>~1.6 GB</td><td>Multilingual</td><td>~6×</td><td>OpenAI's pruned variant (32→4 decoder layers). Small accuracy loss; recommended general default.</td></tr>
+                <tr><td><strong>Distil Large V3</strong></td><td>~1.5 GB</td><td><strong>English-only</strong></td><td>~6–7×</td><td>Distilled (32→2 decoder layers). On par with Large V3 on long-form English; faster than Turbo. Great for English audiobooks.</td></tr>
+                <tr><td>Distil Medium.en</td><td>~794 MB</td><td>English-only</td><td>~10×</td><td>Faster, slightly less accurate than Distil Large V3.</td></tr>
+                <tr><td>Distil Small.en</td><td>~336 MB</td><td>English-only</td><td>~15×</td><td>Smallest English-optimized variant. Good for quick drafts.</td></tr>
+              </tbody>
+            </table>
+
+            <h3 class="settings-section-title">AssemblyAI Models</h3>
+            <table class="about-table">
+              <thead><tr><th>Model</th><th>Cost (with diarization)</th><th>Languages</th><th>Notes</th></tr></thead>
+              <tbody>
+                <tr><td>Universal-2</td><td>$0.17/hr</td><td>99 languages</td><td>Fast, broad coverage. Long the default.</td></tr>
+                <tr><td><strong>Universal-3 Pro</strong></td><td>$0.23/hr</td><td>~6 languages</td><td>Highest accuracy. Supports fine-tuning &amp; prompting. English coverage strong.</td></tr>
+                <tr><td>Auto-fallback (default)</td><td>U3-Pro where supported, U2 elsewhere</td><td>—</td><td>Sends <code>speech_models: ["universal-3-pro", "universal-2"]</code>. Best of both.</td></tr>
+              </tbody>
+            </table>
+
+            <h3 class="settings-section-title">Deepgram Models</h3>
+            <table class="about-table">
+              <thead><tr><th>Model</th><th>Cost (batch)</th><th>Notes</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Nova-3</strong></td><td>$0.0043/min (~$0.26/hr)</td><td>Newest, highest accuracy. Diarization included in base price.</td></tr>
+                <tr><td>Nova-2</td><td>$0.0043/min</td><td>Previous generation; still strong.</td></tr>
+                <tr><td>Nova</td><td>$0.0043/min</td><td>Older; kept for compatibility.</td></tr>
+              </tbody>
+            </table>
+
+            <h3 class="settings-section-title">Sherpa-onnx Diarization Models</h3>
+            <p class="about-desc">Auto-downloaded on first use of the <strong>Whisper + Sherpa</strong> engine.</p>
+            <ul class="about-list">
+              <li><code>sherpa-onnx-pyannote-segmentation-3-0/model.onnx</code> — speech segmentation (~6 MB)</li>
+              <li><code>nemo_en_speakerverification_speakernet.onnx</code> — speaker embedding (~22 MB)</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
       <!-- Speaker Identification Modal -->
       <div id="speakers-modal" class="modal hidden">
         <div class="modal-content wide">

@@ -343,6 +343,77 @@ select, input[type="text"], input[type="password"] {
   margin-top: 0;
 }
 
+.btn-about {
+  width: 28px;
+  height: 28px;
+  padding: 0 !important;
+  border-radius: 50%;
+  font-weight: 600;
+  font-size: 0.9rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.about-form {
+  padding: 16px 20px;
+  max-height: 75vh;
+  overflow-y: auto;
+}
+
+.about-desc {
+  margin: 6px 0 12px;
+  font-size: 0.88rem;
+  color: var(--text-secondary, #aaa);
+  line-height: 1.5;
+}
+
+.about-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+  margin-bottom: 8px;
+}
+
+.about-table th,
+.about-table td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border, #333);
+  vertical-align: top;
+}
+
+.about-table th {
+  font-weight: 600;
+  color: var(--text-secondary, #aaa);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.about-table tr:last-child td {
+  border-bottom: none;
+}
+
+.about-table code {
+  font-size: 0.78rem;
+  padding: 1px 4px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.about-list {
+  margin: 4px 0 12px 18px;
+  padding: 0;
+  font-size: 0.85rem;
+  color: var(--text-secondary, #bbb);
+}
+
+.about-list li {
+  margin-bottom: 4px;
+}
+
 .speakers-form {
   padding: 16px 20px;
   display: flex;

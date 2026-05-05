@@ -1811,6 +1811,7 @@ function setupModal(btnOpen: HTMLElement, modal: HTMLElement) {
 setupModal(btnModels, modelModal);
 setupModal(btnSettings, settingsModal);
 setupModal(btnAddFeed, feedModal);
+setupModal(document.getElementById("btn-about")!, document.getElementById("about-modal")!);
 
 // Speaker modal close + save handlers
 const speakersModal = document.getElementById("speakers-modal")!;
