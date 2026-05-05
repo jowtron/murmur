@@ -178,6 +178,12 @@ const selectOutput = document.getElementById("select-output")! as HTMLSelectElem
 const selectThreads = document.getElementById("select-threads")! as HTMLSelectElement;
 const selectConcurrent = document.getElementById("select-concurrent")! as HTMLSelectElement;
 const chkAutoChapters = document.getElementById("chk-auto-chapters")! as HTMLInputElement;
+const chkForceOverwrite = document.getElementById("chk-force-overwrite")! as HTMLInputElement;
+
+async function checkOutputExists<T>(cmd: string, args: T): Promise<boolean> {
+  if (chkForceOverwrite.checked) return false;
+  return await invoke<boolean>(cmd, args as any);
+}
 const chkSnapGaps = document.getElementById("chk-snap-gaps")! as HTMLInputElement;
 const chkSrtCorrect = document.getElementById("chk-srt-correct")! as HTMLInputElement;
 const chkFirstZero = document.getElementById("chk-first-zero")! as HTMLInputElement;
@@ -716,7 +722,7 @@ async function transcribeItemAssemblyAI(item: QueueItem) {
   try {
     if (item.status === "cancelled" || !queue.includes(item)) return;
 
-    const alreadyExists = await invoke<boolean>("check_diarization_exists", {
+    const alreadyExists = await checkOutputExists("check_diarization_exists", {
       path: item.path,
       engine: "assemblyai",
       outputDir: customOutputDir || null,
@@ -1087,7 +1093,7 @@ async function transcribeItemSherpa(item: QueueItem) {
   try {
     if (item.status === "cancelled" || !queue.includes(item)) return;
 
-    const alreadyExists = await invoke<boolean>("check_diarization_exists", {
+    const alreadyExists = await checkOutputExists("check_diarization_exists", {
       path: item.path,
       engine: "sherpa",
       outputDir: customOutputDir || null,
@@ -1171,7 +1177,7 @@ async function transcribeItemDeepgram(item: QueueItem) {
   try {
     if (item.status === "cancelled" || !queue.includes(item)) return;
 
-    const alreadyExists = await invoke<boolean>("check_diarization_exists", {
+    const alreadyExists = await checkOutputExists("check_diarization_exists", {
       path: item.path,
       engine: "deepgram",
       outputDir: customOutputDir || null,
@@ -1265,7 +1271,7 @@ async function transcribeItem(item: QueueItem) {
     if (item.status === "cancelled" || !queue.includes(item)) return;
 
     // Check if transcription already exists for this model
-    const alreadyExists = await invoke<boolean>("check_transcription_exists", {
+    const alreadyExists = await checkOutputExists("check_transcription_exists", {
       path: item.path,
       model,
       outputDir: customOutputDir || null,

@@ -147,6 +147,46 @@ fn fmt_srt_time(secs: f64) -> String {
     format!("{:02}:{:02}:{:02},{:03}", h, m, s, mmm)
 }
 
+/// Parse an existing whisper-produced SRT into (start_secs, end_secs, text) tuples.
+/// Used by the Sherpa engine to skip Whisper inference when a previous transcription
+/// is already on disk for the selected model.
+pub fn parse_srt(content: &str) -> Vec<(f64, f64, String)> {
+    let mut out = Vec::new();
+    for block in content.split("\n\n") {
+        let lines: Vec<&str> = block.lines().filter(|l| !l.is_empty()).collect();
+        if lines.len() < 2 {
+            continue;
+        }
+        // Time line is the first one containing "-->"
+        let time_idx = lines.iter().position(|l| l.contains("-->"));
+        let Some(idx) = time_idx else { continue };
+        let parts: Vec<&str> = lines[idx].split("-->").collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let start = srt_time_to_secs(parts[0].trim());
+        let end = srt_time_to_secs(parts[1].trim());
+        let text = lines[idx + 1..].join(" ").trim().to_string();
+        if !text.is_empty() {
+            out.push((start, end, text));
+        }
+    }
+    out
+}
+
+fn srt_time_to_secs(t: &str) -> f64 {
+    // "HH:MM:SS,mmm"
+    let parts: Vec<&str> = t.split(|c: char| c == ':' || c == ',').collect();
+    if parts.len() != 4 {
+        return 0.0;
+    }
+    let h: f64 = parts[0].parse().unwrap_or(0.0);
+    let m: f64 = parts[1].parse().unwrap_or(0.0);
+    let s: f64 = parts[2].parse().unwrap_or(0.0);
+    let ms: f64 = parts[3].parse().unwrap_or(0.0);
+    h * 3600.0 + m * 60.0 + s + ms / 1000.0
+}
+
 pub fn segments_to_srt(segs: &[(f64, f64, String, String)]) -> String {
     let mut out = String::new();
     for (i, (start, end, text, speaker)) in segs.iter().enumerate() {

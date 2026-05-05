@@ -2022,43 +2022,82 @@ pub async fn transcribe_sherpa(
 
     emit_aai(&window, &job_id, &file_name, 0.02, "loading_model");
 
-    // Run Whisper to get text segments
-    let win = window.clone();
-    let jid = job_id.clone();
-    let fname = file_name.clone();
-    let ct = cancel_token.clone();
-    let model_for_whisper = model.clone();
-    let path_for_whisper = audio_path.clone();
+    // Look for an existing Whisper SRT for this file + model. If found, skip the
+    // (often slow) Whisper inference and just diarize on top of those segments.
+    let stem = audio_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let output_dir = job
+        .output_dir
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| audio_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+    let existing_srt = output_dir.join(format!("{}_transcription_{}.srt", stem, job.model));
 
-    let whisper_result = tokio::task::spawn_blocking(move || {
-        let transcriber = transcriber::Transcriber::new(&model_for_whisper, threads)?;
-        let progress_cb: Arc<Mutex<dyn FnMut(f32) + Send>> = Arc::new(Mutex::new({
-            let win = win.clone();
-            let jid = jid.clone();
-            let fname = fname.clone();
-            let ct = ct.clone();
-            move |progress: f32| {
-                if ct.is_cancelled() {
-                    return;
+    let whisper_segments: Vec<(f64, f64, String)>;
+    let whisper_duration: f64;
+
+    if existing_srt.exists() {
+        emit_aai(&window, &job_id, &file_name, 0.65, "reusing existing whisper srt");
+        let content = std::fs::read_to_string(&existing_srt)
+            .map_err(|e| format!("Failed to read existing SRT: {}", e))?;
+        whisper_segments = sherpa::parse_srt(&content);
+        if whisper_segments.is_empty() {
+            return Err(format!(
+                "Existing SRT at {} contained no parseable segments.",
+                existing_srt.display()
+            ));
+        }
+        whisper_duration = whisper_segments
+            .iter()
+            .map(|(_, end, _)| *end)
+            .fold(0.0_f64, f64::max);
+    } else {
+        // No existing SRT — run Whisper.
+        let win = window.clone();
+        let jid = job_id.clone();
+        let fname = file_name.clone();
+        let ct = cancel_token.clone();
+        let model_for_whisper = model.clone();
+        let path_for_whisper = audio_path.clone();
+
+        let whisper_result = tokio::task::spawn_blocking(move || {
+            let transcriber = transcriber::Transcriber::new(&model_for_whisper, threads)?;
+            let progress_cb: Arc<Mutex<dyn FnMut(f32) + Send>> = Arc::new(Mutex::new({
+                let win = win.clone();
+                let jid = jid.clone();
+                let fname = fname.clone();
+                let ct = ct.clone();
+                move |progress: f32| {
+                    if ct.is_cancelled() {
+                        return;
+                    }
+                    let scaled = 0.05 + progress * 0.65;
+                    win.emit(
+                        "transcription-progress",
+                        TranscriptionProgress {
+                            job_id: jid.clone(),
+                            file: fname.clone(),
+                            progress: scaled,
+                            status: "transcribing".to_string(),
+                        },
+                    )
+                    .ok();
                 }
-                // Map whisper progress to 0.05..0.7 (rest is for sherpa + writing)
-                let scaled = 0.05 + progress * 0.65;
-                win.emit(
-                    "transcription-progress",
-                    TranscriptionProgress {
-                        job_id: jid.clone(),
-                        file: fname.clone(),
-                        progress: scaled,
-                        status: "transcribing".to_string(),
-                    },
-                )
-                .ok();
-            }
-        }));
-        transcriber.transcribe(&path_for_whisper, Some(progress_cb))
-    })
-    .await
-    .map_err(|e| format!("Whisper task error: {}", e))??;
+            }));
+            transcriber.transcribe(&path_for_whisper, Some(progress_cb))
+        })
+        .await
+        .map_err(|e| format!("Whisper task error: {}", e))??;
+
+        whisper_segments = whisper_result
+            .segments
+            .iter()
+            .map(|s| (s.start, s.end, s.text.clone()))
+            .collect();
+        whisper_duration = whisper_result.duration_secs;
+    }
 
     if cancel_token.is_cancelled() {
         drop(permit);
@@ -2088,21 +2127,7 @@ pub async fn transcribe_sherpa(
     emit_aai(&window, &job_id, &file_name, 0.92, "merging");
 
     // Merge: assign each Whisper segment to its dominant Sherpa speaker
-    let whisper_segs: Vec<(f64, f64, String)> = whisper_result
-        .segments
-        .iter()
-        .map(|s| (s.start, s.end, s.text.clone()))
-        .collect();
-    let merged = sherpa::assign_speakers_to_segments(&whisper_segs, &sherpa_segs);
-
-    let output_dir = job
-        .output_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| audio_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
-    let stem = audio_path
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let merged = sherpa::assign_speakers_to_segments(&whisper_segments, &sherpa_segs);
 
     let srt_path = output_dir.join(format!("{}.diarized.sherpa.srt", stem));
     let txt_path = output_dir.join(format!("{}.diarized.sherpa.txt", stem));
@@ -2112,7 +2137,7 @@ pub async fn transcribe_sherpa(
         .map_err(|e| format!("Failed to write SRT: {}", e))?;
     std::fs::write(&txt_path, sherpa::segments_to_text(&merged))
         .map_err(|e| format!("Failed to write TXT: {}", e))?;
-    let json_value = sherpa::segments_to_aai_json(&merged, whisper_result.duration_secs, &job.model);
+    let json_value = sherpa::segments_to_aai_json(&merged, whisper_duration, &job.model);
     std::fs::write(
         &json_path,
         serde_json::to_string_pretty(&json_value).unwrap_or_default(),
@@ -2132,6 +2157,6 @@ pub async fn transcribe_sherpa(
         json_path: json_path.to_string_lossy().to_string(),
         txt_path: txt_path.to_string_lossy().to_string(),
         speaker_count: speakers.len(),
-        duration_secs: Some(whisper_result.duration_secs),
+        duration_secs: Some(whisper_duration),
     })
 }

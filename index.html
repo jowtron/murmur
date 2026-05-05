@@ -118,6 +118,10 @@
           <input type="checkbox" id="chk-write-cue" checked />
           Write .cue
         </label>
+        <label class="auto-chapters-label" title="Re-run even if outputs already exist for the chosen engine. For Whisper this overwrites the existing transcription; for diarization engines it overwrites the .diarized.<engine>.* files (and re-runs cloud calls — they will be re-billed).">
+          <input type="checkbox" id="chk-force-overwrite" />
+          Force overwrite
+        </label>
         <button id="btn-transcribe-all" class="primary">Transcribe All</button>
       </div>
 
