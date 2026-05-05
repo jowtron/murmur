@@ -57,6 +57,8 @@ pub fn run() {
             commands::sherpa_models_ready,
             commands::sherpa_models_dir,
             commands::download_sherpa_models,
+            commands::download_sherpa_model,
+            commands::list_sherpa_models,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

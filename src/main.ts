@@ -714,15 +714,16 @@ async function transcribeItemAssemblyAI(item: QueueItem) {
 
     const alreadyExists = await invoke<boolean>("check_diarization_exists", {
       path: item.path,
+      engine: "assemblyai",
       outputDir: customOutputDir || null,
     });
 
     if (alreadyExists) {
       const stem = item.path.replace(/\.[^./]+$/, "").split("/").pop() || "";
       const dir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
-      item.diarizedSrtPath = `${dir}/${stem}.diarized.srt`;
-      item.diarizedJsonPath = `${dir}/${stem}.diarized.json`;
-      item.diarizedTxtPath = `${dir}/${stem}.diarized.txt`;
+      item.diarizedSrtPath = `${dir}/${stem}.diarized.assemblyai.srt`;
+      item.diarizedJsonPath = `${dir}/${stem}.diarized.assemblyai.json`;
+      item.diarizedTxtPath = `${dir}/${stem}.diarized.assemblyai.txt`;
       item.status = "complete";
       item.progress = 1.0;
       renderQueue();
@@ -1084,15 +1085,16 @@ async function transcribeItemSherpa(item: QueueItem) {
 
     const alreadyExists = await invoke<boolean>("check_diarization_exists", {
       path: item.path,
+      engine: "sherpa",
       outputDir: customOutputDir || null,
     });
 
     if (alreadyExists) {
       const stem = item.path.replace(/\.[^./]+$/, "").split("/").pop() || "";
       const dir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
-      item.diarizedSrtPath = `${dir}/${stem}.diarized.srt`;
-      item.diarizedJsonPath = `${dir}/${stem}.diarized.json`;
-      item.diarizedTxtPath = `${dir}/${stem}.diarized.txt`;
+      item.diarizedSrtPath = `${dir}/${stem}.diarized.sherpa.srt`;
+      item.diarizedJsonPath = `${dir}/${stem}.diarized.sherpa.json`;
+      item.diarizedTxtPath = `${dir}/${stem}.diarized.sherpa.txt`;
       item.status = "complete";
       item.progress = 1.0;
       renderQueue();
@@ -1164,15 +1166,16 @@ async function transcribeItemDeepgram(item: QueueItem) {
 
     const alreadyExists = await invoke<boolean>("check_diarization_exists", {
       path: item.path,
+      engine: "deepgram",
       outputDir: customOutputDir || null,
     });
 
     if (alreadyExists) {
       const stem = item.path.replace(/\.[^./]+$/, "").split("/").pop() || "";
       const dir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
-      item.diarizedSrtPath = `${dir}/${stem}.diarized.srt`;
-      item.diarizedJsonPath = `${dir}/${stem}.diarized.json`;
-      item.diarizedTxtPath = `${dir}/${stem}.diarized.txt`;
+      item.diarizedSrtPath = `${dir}/${stem}.diarized.deepgram.srt`;
+      item.diarizedJsonPath = `${dir}/${stem}.diarized.deepgram.json`;
+      item.diarizedTxtPath = `${dir}/${stem}.diarized.deepgram.txt`;
       item.status = "complete";
       item.progress = 1.0;
       renderQueue();
@@ -1458,39 +1461,62 @@ async function loadGpuInfo() {
 }
 
 // Model manager
+interface SherpaModelInfo {
+  name: string;
+  display_name: string;
+  downloaded: boolean;
+  size_bytes: number;
+  expected_bytes: number;
+}
+
 async function refreshModelList() {
   const models = await invoke<ModelInfo[]>("list_models");
   const dir = await invoke<string>("get_models_dir");
+  const sherpaModels = await invoke<SherpaModelInfo[]>("list_sherpa_models");
   modelsDir.textContent = dir;
 
-  modelList.innerHTML = models
-    .map(
-      (m) => `
+  const whisperRow = (m: ModelInfo) => `
     <div class="model-item" data-model="${m.name}">
       <span class="model-name">${m.display_name}</span>
       ${
         m.downloaded
           ? `<span class="model-status downloaded">Downloaded</span>`
-          : `<button class="small btn-download-model" data-name="${m.name}">Download</button>`
+          : `<button class="small btn-download-model" data-name="${m.name}" data-kind="whisper">Download</button>`
       }
-    </div>
-  `
-    )
-    .join("");
+    </div>`;
+
+  const sherpaRow = (m: SherpaModelInfo) => `
+    <div class="model-item" data-model="${m.name}">
+      <span class="model-name">${escapeHtml(m.display_name)}</span>
+      ${
+        m.downloaded
+          ? `<span class="model-status downloaded">Downloaded</span>`
+          : `<button class="small btn-download-model" data-name="${m.name}" data-kind="sherpa">Download</button>`
+      }
+    </div>`;
+
+  modelList.innerHTML = `
+    <div class="model-section-title">Whisper Transcription Models</div>
+    ${models.map(whisperRow).join("")}
+    <div class="model-section-title">Sherpa-onnx Diarization Models</div>
+    ${sherpaModels.map(sherpaRow).join("")}
+  `;
 
   modelList.querySelectorAll(".btn-download-model").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const name = (btn as HTMLElement).dataset.name!;
+      const kind = (btn as HTMLElement).dataset.kind || "whisper";
       const item = btn.closest(".model-item")!;
       (btn as HTMLElement).outerHTML = `<div class="download-progress"><div class="progress-bar"><div class="fill model-dl-fill" data-model="${name}" style="width: 0%"></div></div><span class="model-dl-text" data-model="${name}">Starting...</span></div>`;
 
       try {
-        await invoke("download_model", { name });
+        const cmd = kind === "sherpa" ? "download_sherpa_model" : "download_model";
+        await invoke(cmd, { name });
         const statusEl = item.querySelector(".download-progress");
         if (statusEl) statusEl.outerHTML = `<span class="model-status downloaded">Downloaded</span>`;
       } catch {
         const statusEl = item.querySelector(".download-progress");
-        if (statusEl) statusEl.outerHTML = `<button class="small btn-download-model" data-name="${name}">Retry</button>`;
+        if (statusEl) statusEl.outerHTML = `<button class="small btn-download-model" data-name="${name}" data-kind="${kind}">Retry</button>`;
       }
     });
   });

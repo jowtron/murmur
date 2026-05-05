@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/nicholascm/tauri/dev/crates/tauri-utils/schema.json",
-  "productName": "Whisper Transcriber",
+  "productName": "Murmur",
   "version": "0.1.0",
   "identifier": "com.whisper-transcriber.app",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Whisper Transcriber",
+        "title": "Murmur",
         "width": 1100,
         "height": 750,
         "minWidth": 900,

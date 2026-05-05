@@ -1464,7 +1464,11 @@ fn emit_aai(window: &Window, job_id: &str, file: &str, progress: f32, status: &s
 }
 
 #[tauri::command]
-pub fn check_diarization_exists(path: String, output_dir: Option<String>) -> bool {
+pub fn check_diarization_exists(
+    path: String,
+    engine: String,
+    output_dir: Option<String>,
+) -> bool {
     let audio_path = PathBuf::from(&path);
     let dir = output_dir
         .map(PathBuf::from)
@@ -1473,7 +1477,7 @@ pub fn check_diarization_exists(path: String, output_dir: Option<String>) -> boo
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
-    let base = format!("{}.diarized", stem);
+    let base = format!("{}.diarized.{}", stem, engine);
     for ext in &["srt", "txt", "json"] {
         if dir.join(format!("{}.{}", base, ext)).exists() {
             return true;
@@ -1593,9 +1597,9 @@ pub async fn transcribe_assemblyai(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let srt_path = output_dir.join(format!("{}.diarized.srt", stem));
-    let txt_path = output_dir.join(format!("{}.diarized.txt", stem));
-    let json_path = output_dir.join(format!("{}.diarized.json", stem));
+    let srt_path = output_dir.join(format!("{}.diarized.assemblyai.srt", stem));
+    let txt_path = output_dir.join(format!("{}.diarized.assemblyai.txt", stem));
+    let json_path = output_dir.join(format!("{}.diarized.assemblyai.json", stem));
 
     std::fs::write(&srt_path, assemblyai::utterances_to_srt(&utterances))
         .map_err(|e| format!("Failed to write SRT: {}", e))?;
@@ -1707,9 +1711,9 @@ pub async fn transcribe_deepgram(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let srt_path = output_dir.join(format!("{}.diarized.srt", stem));
-    let txt_path = output_dir.join(format!("{}.diarized.txt", stem));
-    let json_path = output_dir.join(format!("{}.diarized.json", stem));
+    let srt_path = output_dir.join(format!("{}.diarized.deepgram.srt", stem));
+    let txt_path = output_dir.join(format!("{}.diarized.deepgram.txt", stem));
+    let json_path = output_dir.join(format!("{}.diarized.deepgram.json", stem));
 
     std::fs::write(&srt_path, deepgram::utterances_to_srt(&utterances))
         .map_err(|e| format!("Failed to write SRT: {}", e))?;
@@ -1768,59 +1772,197 @@ pub fn sherpa_models_dir() -> String {
     sherpa::models_dir().to_string_lossy().to_string()
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SherpaModelInfo {
+    pub name: String,
+    pub display_name: String,
+    pub downloaded: bool,
+    pub size_bytes: u64,
+    pub expected_bytes: u64,
+}
+
 #[tauri::command]
-pub async fn download_sherpa_models(window: Window) -> Result<(), String> {
-    let dir = sherpa::models_dir();
-
-    // Segmentation model (tar.bz2 archive containing model.onnx)
-    let seg_dir = dir.join("sherpa-onnx-pyannote-segmentation-3-0");
-    if !seg_dir.join("model.onnx").exists() {
-        window
-            .emit("sherpa-model-progress", serde_json::json!({"status": "downloading_segmentation"}))
-            .ok();
-        let archive_url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
-        let archive_path = dir.join("sherpa-onnx-pyannote-segmentation-3-0.tar.bz2");
-        let status = std::process::Command::new("curl")
-            .args(["-L", "-o", archive_path.to_str().unwrap(), archive_url])
-            .status()
-            .map_err(|e| format!("curl failed: {}", e))?;
-        if !status.success() {
-            return Err("Failed to download segmentation archive".to_string());
-        }
-        let status = std::process::Command::new("tar")
-            .args([
-                "-xjf",
-                archive_path.to_str().unwrap(),
-                "-C",
-                dir.to_str().unwrap(),
-            ])
-            .status()
-            .map_err(|e| format!("tar failed: {}", e))?;
-        if !status.success() {
-            return Err("Failed to extract segmentation archive".to_string());
-        }
-        let _ = std::fs::remove_file(&archive_path);
-    }
-
-    // Speaker embedding model (single .onnx file)
+pub fn list_sherpa_models() -> Vec<SherpaModelInfo> {
+    let seg_path = sherpa::segmentation_path();
     let emb_path = sherpa::embedding_path();
-    if !emb_path.exists() {
+    vec![
+        SherpaModelInfo {
+            name: "sherpa-segmentation".to_string(),
+            display_name: "Sherpa Pyannote Segmentation (~6 MB)".to_string(),
+            downloaded: seg_path.exists(),
+            size_bytes: std::fs::metadata(&seg_path).map(|m| m.len()).unwrap_or(0),
+            expected_bytes: 6_000_000,
+        },
+        SherpaModelInfo {
+            name: "sherpa-embedding".to_string(),
+            display_name: "Sherpa NeMo SpeakerNet (~22 MB)".to_string(),
+            downloaded: emb_path.exists(),
+            size_bytes: std::fs::metadata(&emb_path).map(|m| m.len()).unwrap_or(0),
+            expected_bytes: 22_300_000,
+        },
+    ]
+}
+
+async fn download_with_progress(
+    name: String,
+    url: String,
+    target_path: PathBuf,
+    expected_size: u64,
+    window: Window,
+) -> Result<(), String> {
+    if target_path.exists() {
         window
-            .emit("sherpa-model-progress", serde_json::json!({"status": "downloading_embedding"}))
+            .emit(
+                "model-download-progress",
+                serde_json::json!({"model": name, "progress": 1.0, "status": "complete"}),
+            )
             .ok();
-        let url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_speakerverification_speakernet.onnx";
-        let status = std::process::Command::new("curl")
-            .args(["-L", "-o", emb_path.to_str().unwrap(), url])
-            .status()
-            .map_err(|e| format!("curl failed: {}", e))?;
-        if !status.success() {
-            return Err("Failed to download embedding model".to_string());
-        }
+        return Ok(());
     }
+    let tmp_path = target_path.with_extension("downloading");
+    window
+        .emit(
+            "model-download-progress",
+            serde_json::json!({"model": &name, "progress": 0.0, "status": "downloading"}),
+        )
+        .ok();
+
+    let mut child = tokio::process::Command::new("curl")
+        .args([
+            "-L",
+            "-o", tmp_path.to_str().unwrap(),
+            "-C", "-",
+            "--retry", "5",
+            "--retry-delay", "2",
+            "--retry-all-errors",
+            "--speed-limit", "10000",
+            "--speed-time", "30",
+            "--connect-timeout", "30",
+            &url,
+        ])
+        .stderr(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start download: {}", e))?;
+
+    let win = window.clone();
+    let model_name = name.clone();
+    let tmp_path_clone = tmp_path.clone();
+    let monitor = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            if let Ok(meta) = tokio::fs::metadata(&tmp_path_clone).await {
+                let progress = (meta.len() as f64 / expected_size as f64).min(0.99);
+                let downloaded_mb = meta.len() as f64 / 1_048_576.0;
+                let total_mb = expected_size as f64 / 1_048_576.0;
+                win.emit(
+                    "model-download-progress",
+                    serde_json::json!({
+                        "model": &model_name,
+                        "progress": progress,
+                        "status": "downloading",
+                        "downloaded_mb": downloaded_mb,
+                        "total_mb": total_mb,
+                    }),
+                )
+                .ok();
+            }
+        }
+    });
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Download failed: {}", e))?;
+    monitor.abort();
+
+    if !status.success() {
+        return Err(format!(
+            "Download failed (curl exit {:?}). Click Retry to resume from the partial file.",
+            status.code()
+        ));
+    }
+
+    tokio::fs::rename(&tmp_path, &target_path)
+        .await
+        .map_err(|e| format!("Failed to finalize download: {}", e))?;
 
     window
-        .emit("sherpa-model-progress", serde_json::json!({"status": "complete"}))
+        .emit(
+            "model-download-progress",
+            serde_json::json!({"model": name, "progress": 1.0, "status": "complete"}),
+        )
         .ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn download_sherpa_model(name: String, window: Window) -> Result<(), String> {
+    match name.as_str() {
+        "sherpa-segmentation" => {
+            let dir = sherpa::models_dir();
+            let final_target = sherpa::segmentation_path();
+            if final_target.exists() {
+                window
+                    .emit(
+                        "model-download-progress",
+                        serde_json::json!({"model": &name, "progress": 1.0, "status": "complete"}),
+                    )
+                    .ok();
+                return Ok(());
+            }
+            let archive_url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
+            let archive_path = dir.join("sherpa-onnx-pyannote-segmentation-3-0.tar.bz2");
+            download_with_progress(
+                name.clone(),
+                archive_url.to_string(),
+                archive_path.clone(),
+                6_600_000,
+                window.clone(),
+            )
+            .await?;
+            // Extract the tar.bz2
+            let status = tokio::process::Command::new("tar")
+                .args([
+                    "-xjf",
+                    archive_path.to_str().unwrap(),
+                    "-C",
+                    dir.to_str().unwrap(),
+                ])
+                .status()
+                .await
+                .map_err(|e| format!("tar failed: {}", e))?;
+            if !status.success() {
+                return Err("Failed to extract segmentation archive".to_string());
+            }
+            let _ = std::fs::remove_file(&archive_path);
+            window
+                .emit(
+                    "model-download-progress",
+                    serde_json::json!({"model": &name, "progress": 1.0, "status": "complete"}),
+                )
+                .ok();
+            Ok(())
+        }
+        "sherpa-embedding" => {
+            let url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_speakerverification_speakernet.onnx";
+            download_with_progress(
+                name,
+                url.to_string(),
+                sherpa::embedding_path(),
+                22_300_000,
+                window,
+            )
+            .await
+        }
+        other => Err(format!("Unknown sherpa model: {}", other)),
+    }
+}
+
+#[tauri::command]
+pub async fn download_sherpa_models(window: Window) -> Result<(), String> {
+    download_sherpa_model("sherpa-segmentation".to_string(), window.clone()).await?;
+    download_sherpa_model("sherpa-embedding".to_string(), window).await?;
     Ok(())
 }
 
@@ -1950,9 +2092,9 @@ pub async fn transcribe_sherpa(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
 
-    let srt_path = output_dir.join(format!("{}.diarized.srt", stem));
-    let txt_path = output_dir.join(format!("{}.diarized.txt", stem));
-    let json_path = output_dir.join(format!("{}.diarized.json", stem));
+    let srt_path = output_dir.join(format!("{}.diarized.sherpa.srt", stem));
+    let txt_path = output_dir.join(format!("{}.diarized.sherpa.txt", stem));
+    let json_path = output_dir.join(format!("{}.diarized.sherpa.json", stem));
 
     std::fs::write(&srt_path, sherpa::segments_to_srt(&merged))
         .map_err(|e| format!("Failed to write SRT: {}", e))?;

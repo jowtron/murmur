@@ -343,6 +343,20 @@ select, input[type="text"], input[type="password"] {
   margin-top: 0;
 }
 
+.model-section-title {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary, #888);
+  margin: 14px 0 6px;
+  padding: 6px 10px 4px;
+  border-bottom: 1px solid var(--border, #333);
+}
+
+.model-section-title:first-child {
+  margin-top: 0;
+}
+
 .btn-about {
   width: 28px;
   height: 28px;
