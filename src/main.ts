@@ -56,7 +56,7 @@ interface ChapterWithSnap {
   snapped: boolean;
 }
 
-type Engine = "whisper" | "assemblyai" | "deepgram";
+type Engine = "whisper" | "assemblyai" | "deepgram" | "sherpa";
 
 interface QueueItem {
   id: string;
@@ -206,6 +206,7 @@ function engineShort(e: Engine): string {
   switch (e) {
     case "assemblyai": return "AssemblyAI";
     case "deepgram": return "Deepgram";
+    case "sherpa": return "Sherpa";
     case "whisper":
     default: return "Whisper";
   }
@@ -214,6 +215,7 @@ function engineLabel(e: Engine): string {
   switch (e) {
     case "assemblyai": return "AssemblyAI cloud diarization";
     case "deepgram": return "Deepgram cloud diarization";
+    case "sherpa": return "Whisper + Sherpa local diarization";
     case "whisper":
     default: return "Whisper local transcription";
   }
@@ -273,7 +275,7 @@ function renderQueue() {
         <span class="status status-${item.status}">
           ${item.status === "pending" ? "Pending" : ""}
           ${item.status === "queued" ? "Queued" : ""}
-          ${item.status === "transcribing" ? (item.stageText && item.engine === "assemblyai" ? `${item.stageText} ${Math.round(item.progress * 100)}%` : `${Math.round(item.progress * 100)}%`) : ""}
+          ${item.status === "transcribing" ? (item.stageText && item.engine !== "whisper" ? `${item.stageText} ${Math.round(item.progress * 100)}%` : `${Math.round(item.progress * 100)}%`) : ""}
           ${item.status === "detecting" ? `<span id="detect-status-${item.id}">Detecting...</span>` : ""}
           ${item.status === "complete" ? "Done" : ""}
           ${item.status === "error" ? "Error" : ""}
@@ -283,7 +285,7 @@ function renderQueue() {
       <div class="actions">
         ${item.status === "transcribing" || item.status === "queued" || item.status === "detecting" ? `<button class="small danger btn-cancel" data-id="${item.id}">Cancel</button>` : ""}
         ${item.status === "error" || item.status === "cancelled" ? `<button class="small btn-retry" data-id="${item.id}">Retry</button>` : ""}
-        ${item.status === "complete" && (item.engine === "assemblyai" || item.engine === "deepgram") && item.diarizedJsonPath ? `<button class="small btn-speakers" data-id="${item.id}">Identify speakers</button>` : ""}
+        ${item.status === "complete" && (item.engine === "assemblyai" || item.engine === "deepgram" || item.engine === "sherpa") && item.diarizedJsonPath ? `<button class="small btn-speakers" data-id="${item.id}">Identify speakers</button>` : ""}
         ${item.status === "complete" && item.engine === "whisper" ? `<button class="small btn-reprocess" data-id="${item.id}">Reprocess</button>` : ""}
         ${item.status !== "transcribing" && item.status !== "detecting" ? `<button class="small danger btn-remove" data-id="${item.id}">&times;</button>` : ""}
       </div>
@@ -1061,6 +1063,80 @@ function msToSrt(ms: number): string {
 function pad2(n: number): string { return n.toString().padStart(2, "0"); }
 function pad3(n: number): string { return n.toString().padStart(3, "0"); }
 
+async function transcribeItemSherpa(item: QueueItem) {
+  const model = selectModel.value;
+  const threads = parseInt(selectThreads.value);
+  item.modelUsed = `${model} + Sherpa`;
+  item.error = undefined;
+  renderQueue();
+
+  try {
+    if (item.status === "cancelled" || !queue.includes(item)) return;
+
+    const alreadyExists = await invoke<boolean>("check_diarization_exists", {
+      path: item.path,
+      outputDir: customOutputDir || null,
+    });
+
+    if (alreadyExists) {
+      const stem = item.path.replace(/\.[^./]+$/, "").split("/").pop() || "";
+      const dir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
+      item.diarizedSrtPath = `${dir}/${stem}.diarized.srt`;
+      item.diarizedJsonPath = `${dir}/${stem}.diarized.json`;
+      item.diarizedTxtPath = `${dir}/${stem}.diarized.txt`;
+      item.status = "complete";
+      item.progress = 1.0;
+      renderQueue();
+      return;
+    }
+
+    item.status = "queued";
+    item.progress = 0;
+    item.startedAt = undefined;
+    item.elapsed = undefined;
+    renderQueue();
+
+    const result = await invoke<AssemblyAIResult>("transcribe_sherpa", {
+      job: {
+        id: item.id,
+        path: item.path,
+        model,
+        output_dir: customOutputDir,
+        threads,
+      },
+    });
+
+    item.speakerCount = result.speaker_count;
+    item.diarizedSrtPath = result.srt_path;
+    item.diarizedJsonPath = result.json_path;
+    item.diarizedTxtPath = result.txt_path;
+    item.elapsed = Date.now() - (item.startedAt || Date.now());
+
+    if ((item.status as string) !== "cancelled") {
+      item.status = "complete";
+      item.progress = 1.0;
+    }
+  } catch (err: any) {
+    item.elapsed = item.startedAt ? Date.now() - item.startedAt : undefined;
+    const errMsg = typeof err === "string" ? err : err?.message || "Unknown error";
+    if (errMsg === "Cancelled") {
+      item.status = "cancelled";
+      item.error = "Cancelled by user";
+    } else {
+      item.status = "error";
+      item.error = errMsg;
+    }
+  }
+  renderQueue();
+
+  if (item.status === "complete" && item.diarizedJsonPath) {
+    const modal = document.getElementById("speakers-modal");
+    if (modal && modal.classList.contains("hidden")) {
+      openSpeakerModal(item);
+    }
+  }
+}
+
 async function transcribeItemDeepgram(item: QueueItem) {
   item.modelUsed = "Deepgram";
   item.error = undefined;
@@ -1150,6 +1226,10 @@ async function transcribeItem(item: QueueItem) {
   }
   if (item.engine === "deepgram") {
     await transcribeItemDeepgram(item);
+    return;
+  }
+  if (item.engine === "sherpa") {
+    await transcribeItemSherpa(item);
     return;
   }
 
@@ -1243,10 +1323,28 @@ async function transcribeAll() {
   const whisperItems = pendingItems.filter((i) => i.engine === "whisper");
   const aaiItems = pendingItems.filter((i) => i.engine === "assemblyai");
   const dgItems = pendingItems.filter((i) => i.engine === "deepgram");
+  const sherpaItems = pendingItems.filter((i) => i.engine === "sherpa");
 
-  if (whisperItems.length > 0) {
+  // Sherpa needs the Whisper model too
+  if (whisperItems.length > 0 || sherpaItems.length > 0) {
     const modelReady = await checkModelAndPromptDownload(model);
     if (!modelReady) return;
+  }
+
+  if (sherpaItems.length > 0) {
+    const ready = await invoke<boolean>("sherpa_models_ready");
+    if (!ready) {
+      const doDownload = confirm(
+        "Sherpa-onnx diarization models are not downloaded yet (~28 MB total: pyannote segmentation + speaker embedding).\n\nDownload them now?"
+      );
+      if (!doDownload) return;
+      try {
+        await invoke("download_sherpa_models");
+      } catch (err) {
+        alert(`Failed to download Sherpa models: ${err}`);
+        return;
+      }
+    }
   }
 
   const settings = loadSettings();
@@ -2190,6 +2288,9 @@ listen<TranscriptionProgress>("transcription-progress", (event) => {
       data.status === "transcribing" ||
       data.status === "uploading" ||
       data.status === "submitting" ||
+      data.status === "diarizing" ||
+      data.status === "merging" ||
+      data.status === "loading_model" ||
       data.status.startsWith("processing");
     if (isActiveStage && item.status !== "transcribing") {
       item.status = "transcribing";
@@ -2209,6 +2310,8 @@ function formatStageText(status: string): string {
   }
   if (status === "loading_model") return "Loading model…";
   if (status === "transcribing") return "Transcribing…";
+  if (status === "diarizing") return "Diarizing…";
+  if (status === "merging") return "Merging speakers…";
   if (status === "complete") return "Complete";
   return status;
 }
@@ -2304,11 +2407,13 @@ function loadPreferences() {
 function applyEngineUI() {
   const bar = document.querySelector(".settings-bar");
   if (!bar) return;
-  bar.classList.remove("engine-assemblyai", "engine-deepgram", "engine-cloud");
+  bar.classList.remove("engine-assemblyai", "engine-deepgram", "engine-sherpa", "engine-cloud");
   if (selectEngine.value === "assemblyai") {
     bar.classList.add("engine-assemblyai", "engine-cloud");
   } else if (selectEngine.value === "deepgram") {
     bar.classList.add("engine-deepgram", "engine-cloud");
+  } else if (selectEngine.value === "sherpa") {
+    bar.classList.add("engine-sherpa");
   }
 }
 selectEngine.addEventListener("change", () => {

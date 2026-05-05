@@ -10,7 +10,10 @@ Murmur transcribes audio files locally using OpenAI's Whisper (via Metal GPU acc
 
 ### Transcription
 - **Local Whisper inference** with Metal GPU acceleration (no cloud API needed)
+- **Distil-Whisper variants** — `distil-large-v3`, `distil-medium.en`, `distil-small.en` available in the Model picker. English-only, ~6× faster than Large V3
+- **Local diarization (Whisper + Sherpa-onnx)** — fully offline alternative to cloud diarization engines. Uses Whisper for text and Sherpa-onnx (pyannote segmentation + NeMo SpeakerNet embedding) for speaker labels. ~28 MB of models downloaded on first use
 - **AssemblyAI cloud engine** — optional per-file alternative for jobs that need speaker diarization (Universal-3 Pro by default, with Universal-2 fallback). Switch engines via the **Engine** dropdown; AssemblyAI-specific controls are in **Settings**
+- **Deepgram Nova-3 cloud engine** — alternate cloud diarization with lower per-hour pricing. Same engine-picker pattern
 - **Bulk processing** — queue hundreds of files with configurable concurrency (engines can be mixed in the same queue)
 - **Multiple output formats** — SRT, VTT, TXT, JSON (or all at once)
 - **Per-word timestamps** option for precise alignment
@@ -19,10 +22,17 @@ Murmur transcribes audio files locally using OpenAI's Whisper (via Metal GPU acc
 - **Publication date tagging** — automatically writes the episode publication date to the audio file's year/date metadata field (supports MP3, M4A, FLAC, OGG)
 - **Smart skip** — detects existing transcriptions (and existing diarizations) and skips re-processing; detects already-downloaded episodes and skips re-downloading
 
-### Speaker Diarization (AssemblyAI)
-- **One-click diarization** — pick `Engine: AssemblyAI` and submit; output lands as `<basename>.diarized.{srt,txt,json}` next to the audio (or in your custom output dir)
-- **Cost preview** — confirm dialog shows estimated cost ($0.17/hr for Universal-2 + diarization, $0.23/hr for Universal-3 Pro + diarization) before submitting
-- **Per-job progress** — live status (Uploading → Submitting → Processing) with progress bar
+### Speaker Diarization
+Murmur supports four diarization paths, all writing the same `<basename>.diarized.{srt,txt,json}` output and feeding the same speaker-rename modal:
+
+| Engine | Cost | Network | Notes |
+|--------|------|---------|-------|
+| **Whisper + Sherpa** | Free | Offline | Local pyannote segmentation + NeMo SpeakerNet embedding via sherpa-onnx. ~28 MB model download |
+| **AssemblyAI** | $0.17–$0.23/hr | Cloud | Universal-2 or Universal-3 Pro + diarization add-on |
+| **Deepgram** | ~$0.26/hr | Cloud | Nova-3 with diarization included |
+
+- **Cost preview** for cloud engines, with a confirm dialog before submitting
+- **Per-job progress** — live status (Uploading → Submitting → Processing for cloud; Loading model → Transcribing → Diarizing → Merging for Sherpa)
 - **Speaker rename modal** — auto-pops after diarization completes; shows up to 3 of each speaker's longest utterances as samples and lets you assign real names. Saves rewrite the SRT/TXT/JSON in place (`Speaker A:` → `Narrator:` etc.)
 - **Standalone rename** — top-bar **Rename Speakers** button opens any existing `.diarized.{srt,txt,json}` file. Sibling files are also rewritten if present
 
@@ -177,9 +187,7 @@ Murmur currently only builds for **macOS on Apple Silicon**. The Rust code itsel
 ## Roadmap
 
 ### Engines under consideration
-- **Sherpa-onnx (local diarization)** — official Rust crate (`sherpa-onnx` v1.13+) wraps the k2-fsa C++ toolkit. Would give offline speaker diarization (3D-Speaker models, ~30MB) without sending audio to a cloud API. Realistic Rust integration; ~2–3 days of work to bundle the native library and add model-download UX similar to Whisper.
 - **Pyannote.audio (local diarization, future)** — best-in-class accuracy but Python+PyTorch only. Would require shelling out to a Python script, which adds a heavy dependency footprint. Tracked as a longer-term option in case a Rust-friendly equivalent doesn't catch up.
-- **Distil-Whisper variants** (`distil-large-v3`, `distil-medium-en`, `distil-small-en`) — drop-in for whisper-rs, English-only, ~6× faster than Large V3. Could be added as extra entries in the model picker.
 
 ### Other cloud providers worth evaluating
 The same pattern used for AssemblyAI / Deepgram could host any of:

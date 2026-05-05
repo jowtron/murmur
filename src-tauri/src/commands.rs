@@ -1,6 +1,7 @@
 use crate::assemblyai;
 use crate::deepgram;
 use crate::flac_utils;
+use crate::sherpa;
 use crate::transcriber::{
     self, TranscriptionProgress, TranscriptionResult, WhisperModel,
 };
@@ -84,6 +85,9 @@ fn parse_model(name: &str) -> WhisperModel {
         "small" => WhisperModel::Small,
         "medium" => WhisperModel::Medium,
         "large-v3" => WhisperModel::LargeV3,
+        "distil-small-en" => WhisperModel::DistilSmallEn,
+        "distil-medium-en" => WhisperModel::DistilMediumEn,
+        "distil-large-v3" => WhisperModel::DistilLargeV3,
         _ => WhisperModel::LargeV3Turbo,
     }
 }
@@ -97,6 +101,9 @@ pub fn list_models() -> Vec<ModelInfo> {
         WhisperModel::Medium,
         WhisperModel::LargeV3,
         WhisperModel::LargeV3Turbo,
+        WhisperModel::DistilSmallEn,
+        WhisperModel::DistilMediumEn,
+        WhisperModel::DistilLargeV3,
     ];
 
     models
@@ -107,6 +114,9 @@ pub fn list_models() -> Vec<ModelInfo> {
             ModelInfo {
                 name: format!("{:?}", m)
                     .to_lowercase()
+                    .replace("distilmediumen", "distil-medium-en")
+                    .replace("distilsmallen", "distil-small-en")
+                    .replace("distillargev3", "distil-large-v3")
                     .replace("largev3turbo", "large-v3-turbo")
                     .replace("largev3", "large-v3"),
                 display_name: m.display_name().to_string(),
@@ -1720,5 +1730,238 @@ pub async fn transcribe_deepgram(
         txt_path: txt_path.to_string_lossy().to_string(),
         speaker_count: speakers.len(),
         duration_secs: response.metadata.and_then(|m| m.duration),
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SherpaJob {
+    pub id: String,
+    pub path: String,
+    pub model: String, // Whisper model name
+    pub output_dir: Option<String>,
+    pub threads: Option<i32>,
+}
+
+#[tauri::command]
+pub fn sherpa_models_ready() -> bool {
+    sherpa::models_ready()
+}
+
+#[tauri::command]
+pub fn sherpa_models_dir() -> String {
+    sherpa::models_dir().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+pub async fn download_sherpa_models(window: Window) -> Result<(), String> {
+    let dir = sherpa::models_dir();
+
+    // Segmentation model (tar.bz2 archive containing model.onnx)
+    let seg_dir = dir.join("sherpa-onnx-pyannote-segmentation-3-0");
+    if !seg_dir.join("model.onnx").exists() {
+        window
+            .emit("sherpa-model-progress", serde_json::json!({"status": "downloading_segmentation"}))
+            .ok();
+        let archive_url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2";
+        let archive_path = dir.join("sherpa-onnx-pyannote-segmentation-3-0.tar.bz2");
+        let status = std::process::Command::new("curl")
+            .args(["-L", "-o", archive_path.to_str().unwrap(), archive_url])
+            .status()
+            .map_err(|e| format!("curl failed: {}", e))?;
+        if !status.success() {
+            return Err("Failed to download segmentation archive".to_string());
+        }
+        let status = std::process::Command::new("tar")
+            .args([
+                "-xjf",
+                archive_path.to_str().unwrap(),
+                "-C",
+                dir.to_str().unwrap(),
+            ])
+            .status()
+            .map_err(|e| format!("tar failed: {}", e))?;
+        if !status.success() {
+            return Err("Failed to extract segmentation archive".to_string());
+        }
+        let _ = std::fs::remove_file(&archive_path);
+    }
+
+    // Speaker embedding model (single .onnx file)
+    let emb_path = sherpa::embedding_path();
+    if !emb_path.exists() {
+        window
+            .emit("sherpa-model-progress", serde_json::json!({"status": "downloading_embedding"}))
+            .ok();
+        let url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_speakerverification_speakernet.onnx";
+        let status = std::process::Command::new("curl")
+            .args(["-L", "-o", emb_path.to_str().unwrap(), url])
+            .status()
+            .map_err(|e| format!("curl failed: {}", e))?;
+        if !status.success() {
+            return Err("Failed to download embedding model".to_string());
+        }
+    }
+
+    window
+        .emit("sherpa-model-progress", serde_json::json!({"status": "complete"}))
+        .ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn transcribe_sherpa(
+    job: SherpaJob,
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<AssemblyAIResult, String> {
+    if !sherpa::models_ready() {
+        return Err("Sherpa-onnx diarization models are not downloaded.".to_string());
+    }
+
+    let model = parse_model(&job.model);
+    if !transcriber::is_model_downloaded(&model) {
+        return Err(format!(
+            "Whisper model '{}' is not downloaded.",
+            job.model
+        ));
+    }
+
+    let cancel_token = CancellationToken::new();
+    {
+        let mut tokens = state.cancel_tokens.lock().unwrap();
+        tokens.insert(job.id.clone(), cancel_token.clone());
+    }
+
+    let sem = state.semaphore.lock().unwrap().clone();
+    let permit = sem
+        .acquire_owned()
+        .await
+        .map_err(|e| format!("Queue error: {}", e))?;
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        return Err("Cancelled".to_string());
+    }
+
+    let audio_path = PathBuf::from(&job.path);
+    let file_name = audio_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let job_id = job.id.clone();
+    let threads = job.threads.unwrap_or(8);
+
+    emit_aai(&window, &job_id, &file_name, 0.02, "loading_model");
+
+    // Run Whisper to get text segments
+    let win = window.clone();
+    let jid = job_id.clone();
+    let fname = file_name.clone();
+    let ct = cancel_token.clone();
+    let model_for_whisper = model.clone();
+    let path_for_whisper = audio_path.clone();
+
+    let whisper_result = tokio::task::spawn_blocking(move || {
+        let transcriber = transcriber::Transcriber::new(&model_for_whisper, threads)?;
+        let progress_cb: Arc<Mutex<dyn FnMut(f32) + Send>> = Arc::new(Mutex::new({
+            let win = win.clone();
+            let jid = jid.clone();
+            let fname = fname.clone();
+            let ct = ct.clone();
+            move |progress: f32| {
+                if ct.is_cancelled() {
+                    return;
+                }
+                // Map whisper progress to 0.05..0.7 (rest is for sherpa + writing)
+                let scaled = 0.05 + progress * 0.65;
+                win.emit(
+                    "transcription-progress",
+                    TranscriptionProgress {
+                        job_id: jid.clone(),
+                        file: fname.clone(),
+                        progress: scaled,
+                        status: "transcribing".to_string(),
+                    },
+                )
+                .ok();
+            }
+        }));
+        transcriber.transcribe(&path_for_whisper, Some(progress_cb))
+    })
+    .await
+    .map_err(|e| format!("Whisper task error: {}", e))??;
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        return Err("Cancelled".to_string());
+    }
+
+    emit_aai(&window, &job_id, &file_name, 0.72, "diarizing");
+
+    // Decode 16kHz mono PCM and run Sherpa diarization
+    let path_for_sherpa = audio_path.clone();
+    let sherpa_segs = tokio::task::spawn_blocking(move || -> Result<Vec<sherpa::Segment>, String> {
+        let pcm = transcriber::audio_to_pcm(&path_for_sherpa)?;
+        sherpa::diarize(&pcm)
+    })
+    .await
+    .map_err(|e| format!("Sherpa task error: {}", e))??;
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        return Err("Cancelled".to_string());
+    }
+
+    emit_aai(&window, &job_id, &file_name, 0.92, "merging");
+
+    // Merge: assign each Whisper segment to its dominant Sherpa speaker
+    let whisper_segs: Vec<(f64, f64, String)> = whisper_result
+        .segments
+        .iter()
+        .map(|s| (s.start, s.end, s.text.clone()))
+        .collect();
+    let merged = sherpa::assign_speakers_to_segments(&whisper_segs, &sherpa_segs);
+
+    let output_dir = job
+        .output_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| audio_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+    let stem = audio_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let srt_path = output_dir.join(format!("{}.diarized.srt", stem));
+    let txt_path = output_dir.join(format!("{}.diarized.txt", stem));
+    let json_path = output_dir.join(format!("{}.diarized.json", stem));
+
+    std::fs::write(&srt_path, sherpa::segments_to_srt(&merged))
+        .map_err(|e| format!("Failed to write SRT: {}", e))?;
+    std::fs::write(&txt_path, sherpa::segments_to_text(&merged))
+        .map_err(|e| format!("Failed to write TXT: {}", e))?;
+    let json_value = sherpa::segments_to_aai_json(&merged, whisper_result.duration_secs, &job.model);
+    std::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&json_value).unwrap_or_default(),
+    )
+    .map_err(|e| format!("Failed to write JSON: {}", e))?;
+
+    let speakers: std::collections::HashSet<String> =
+        merged.iter().map(|(_, _, _, sp)| sp.clone()).collect();
+
+    emit_aai(&window, &job_id, &file_name, 1.0, "complete");
+    state.cancel_tokens.lock().unwrap().remove(&job.id);
+    drop(permit);
+
+    Ok(AssemblyAIResult {
+        transcript_id: String::new(),
+        srt_path: srt_path.to_string_lossy().to_string(),
+        json_path: json_path.to_string_lossy().to_string(),
+        txt_path: txt_path.to_string_lossy().to_string(),
+        speaker_count: speakers.len(),
+        duration_secs: Some(whisper_result.duration_secs),
     })
 }

@@ -40,6 +40,9 @@ pub enum WhisperModel {
     Medium,
     LargeV3,
     LargeV3Turbo,
+    DistilSmallEn,
+    DistilMediumEn,
+    DistilLargeV3,
 }
 
 impl WhisperModel {
@@ -51,6 +54,9 @@ impl WhisperModel {
             WhisperModel::Medium => "ggml-medium.bin",
             WhisperModel::LargeV3 => "ggml-large-v3.bin",
             WhisperModel::LargeV3Turbo => "ggml-large-v3-turbo.bin",
+            WhisperModel::DistilSmallEn => "ggml-distil-small.en.bin",
+            WhisperModel::DistilMediumEn => "ggml-distil-medium.en.bin",
+            WhisperModel::DistilLargeV3 => "ggml-distil-large-v3.bin",
         }
     }
 
@@ -62,12 +68,36 @@ impl WhisperModel {
             WhisperModel::Medium => "Medium (~1.5 GB)",
             WhisperModel::LargeV3 => "Large V3 (~3 GB)",
             WhisperModel::LargeV3Turbo => "Large V3 Turbo (~1.6 GB)",
+            WhisperModel::DistilSmallEn => "Distil Small.en (~336 MB, English-only)",
+            WhisperModel::DistilMediumEn => "Distil Medium.en (~794 MB, English-only)",
+            WhisperModel::DistilLargeV3 => "Distil Large V3 (~1.5 GB, English-only)",
         }
     }
 
     pub fn url(&self) -> String {
-        let base = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main";
-        format!("{}/{}", base, self.filename())
+        match self {
+            // Whisper baseline models — hosted on the canonical whisper.cpp repo
+            WhisperModel::Tiny
+            | WhisperModel::Base
+            | WhisperModel::Small
+            | WhisperModel::Medium
+            | WhisperModel::LargeV3
+            | WhisperModel::LargeV3Turbo => format!(
+                "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
+                self.filename()
+            ),
+            // Distil-Whisper variants — hosted on distil-whisper org
+            WhisperModel::DistilSmallEn => {
+                "https://huggingface.co/distil-whisper/distil-small.en/resolve/main/ggml-distil-small.en.bin".to_string()
+            }
+            WhisperModel::DistilMediumEn => {
+                // distil-whisper repo uses an unconventional upstream filename
+                "https://huggingface.co/distil-whisper/distil-medium.en/resolve/main/ggml-medium-32-2.en.bin".to_string()
+            }
+            WhisperModel::DistilLargeV3 => {
+                "https://huggingface.co/distil-whisper/distil-large-v3-ggml/resolve/main/ggml-distil-large-v3.bin".to_string()
+            }
+        }
     }
 }
 

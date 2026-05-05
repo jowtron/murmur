@@ -2,6 +2,7 @@ mod assemblyai;
 mod commands;
 mod deepgram;
 mod flac_utils;
+mod sherpa;
 mod transcriber;
 mod gap_detection;
 mod template;
@@ -52,6 +53,10 @@ pub fn run() {
             commands::transcribe_assemblyai,
             commands::check_diarization_exists,
             commands::transcribe_deepgram,
+            commands::transcribe_sherpa,
+            commands::sherpa_models_ready,
+            commands::sherpa_models_dir,
+            commands::download_sherpa_models,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

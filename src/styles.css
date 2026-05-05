@@ -271,12 +271,14 @@ select, input[type="text"], input[type="password"] {
   margin-top: 2px;
 }
 
-.settings-bar.engine-cloud .whisper-only {
+.settings-bar.engine-cloud .whisper-only,
+.settings-bar.engine-sherpa .whisper-features {
   opacity: 0.35;
   transition: opacity 0.15s ease;
 }
 
-.settings-bar.engine-cloud .whisper-only:hover {
+.settings-bar.engine-cloud .whisper-only:hover,
+.settings-bar.engine-sherpa .whisper-features:hover {
   opacity: 0.6;
 }
 
@@ -307,6 +309,12 @@ select, input[type="text"], input[type="password"] {
   background: rgba(244, 63, 94, 0.15);
   color: #fb7185;
   border: 1px solid rgba(244, 63, 94, 0.4);
+}
+
+.engine-badge.engine-sherpa {
+  background: rgba(168, 85, 247, 0.15);
+  color: #c084fc;
+  border: 1px solid rgba(168, 85, 247, 0.4);
 }
 
 .speaker-badge {

@@ -31,8 +31,9 @@
           Engine:
           <select id="select-engine">
             <option value="whisper" selected>Whisper (local)</option>
-            <option value="assemblyai">AssemblyAI (diarization)</option>
-            <option value="deepgram">Deepgram (diarization)</option>
+            <option value="sherpa">Whisper + Sherpa (local diarization)</option>
+            <option value="assemblyai">AssemblyAI (cloud diarization)</option>
+            <option value="deepgram">Deepgram (cloud diarization)</option>
           </select>
         </label>
         <label class="whisper-only" title="Whisper model for transcription. Larger = more accurate but slower. (Whisper only.)">
@@ -44,9 +45,12 @@
             <option value="small">Small</option>
             <option value="base">Base</option>
             <option value="tiny">Tiny</option>
+            <option value="distil-large-v3">Distil Large V3 (English-only)</option>
+            <option value="distil-medium-en">Distil Medium.en (English-only)</option>
+            <option value="distil-small-en">Distil Small.en (English-only)</option>
           </select>
         </label>
-        <label class="whisper-only" title="Output format for transcriptions. SRT is required for chapter detection. (Whisper only — AssemblyAI always writes SRT/TXT/JSON.)">
+        <label class="whisper-only whisper-features" title="Output format for transcriptions. SRT is required for chapter detection. (Pure Whisper only — diarization engines always write SRT/TXT/JSON.)">
           Format:
           <select id="select-format">
             <option value="all">All Formats</option>
@@ -82,35 +86,35 @@
             <option value="4">4 files</option>
           </select>
         </label>
-        <label class="whisper-only" title="Which LLM to use for chapter detection via OpenRouter API. (Whisper only — AssemblyAI jobs skip chapter detection.)">
+        <label class="whisper-only whisper-features" title="Which LLM to use for chapter detection via OpenRouter API. (Pure Whisper only — diarization engines skip chapter detection.)">
           LLM:
           <select id="select-llm-model"></select>
         </label>
-        <label class="auto-chapters-label whisper-only" title="Automatically run LLM chapter detection after each transcription completes.">
+        <label class="auto-chapters-label whisper-only whisper-features" title="Automatically run LLM chapter detection after each transcription completes.">
           <input type="checkbox" id="chk-auto-chapters" />
           Auto-detect chapters
         </label>
-        <label class="auto-chapters-label whisper-only" title="Use YAMNet audio classification to snap chapter boundaries to the nearest music-to-speech transition.">
+        <label class="auto-chapters-label whisper-only whisper-features" title="Use YAMNet audio classification to snap chapter boundaries to the nearest music-to-speech transition.">
           <input type="checkbox" id="chk-snap-gaps" checked />
           Snap to speech onset
         </label>
-        <label class="auto-chapters-label whisper-only" title="Refine LLM chapter times by searching the SRT transcript for matching text near each timestamp. Improves accuracy when the LLM's times are approximate.">
+        <label class="auto-chapters-label whisper-only whisper-features" title="Refine LLM chapter times by searching the SRT transcript for matching text near each timestamp. Improves accuracy when the LLM's times are approximate.">
           <input type="checkbox" id="chk-srt-correct" checked />
           Correct times from SRT
         </label>
-        <label class="auto-chapters-label whisper-only" title="Force the first chapter to start at 00:00:00 instead of the LLM's detected time.">
+        <label class="auto-chapters-label whisper-only whisper-features" title="Force the first chapter to start at 00:00:00 instead of the LLM's detected time.">
           <input type="checkbox" id="chk-first-zero" checked />
           First chapter at 0:00
         </label>
-        <label class="auto-chapters-label whisper-only" title="Generate per-word timestamps in the transcription (slower but more precise).">
+        <label class="auto-chapters-label whisper-only whisper-features" title="Generate per-word timestamps in the transcription (slower but more precise).">
           <input type="checkbox" id="chk-per-word" />
           Per-word timestamps
         </label>
-        <label class="auto-chapters-label whisper-only" title="Embed chapter markers as FLAC metadata tags. Only applies to FLAC files.">
+        <label class="auto-chapters-label whisper-only whisper-features" title="Embed chapter markers as FLAC metadata tags. Only applies to FLAC files.">
           <input type="checkbox" id="chk-embed-flac" checked />
           Embed in FLAC
         </label>
-        <label class="auto-chapters-label whisper-only" title="Write a .cue sheet file alongside the audio. Reprocessing will not overwrite an existing .cue — use Align + Save for that.">
+        <label class="auto-chapters-label whisper-only whisper-features" title="Write a .cue sheet file alongside the audio. Reprocessing will not overwrite an existing .cue — use Align + Save for that.">
           <input type="checkbox" id="chk-write-cue" checked />
           Write .cue
         </label>
@@ -309,15 +313,15 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
             <div class="chapters-input-row">
               <input type="text" id="input-chapter-file" placeholder="No file selected..." class="form-input" readonly />
               <button id="btn-choose-chapter-file" class="small">Browse...</button>
-              <label class="auto-chapters-label whisper-only">
+              <label class="auto-chapters-label whisper-only whisper-features">
                 <input type="checkbox" id="chk-modal-snap" checked />
                 Snap to speech onset
               </label>
-              <label class="auto-chapters-label whisper-only">
+              <label class="auto-chapters-label whisper-only whisper-features">
                 <input type="checkbox" id="chk-modal-embed" checked />
                 Embed in FLAC
               </label>
-              <label class="auto-chapters-label whisper-only">
+              <label class="auto-chapters-label whisper-only whisper-features">
                 <input type="checkbox" id="chk-modal-cue" checked />
                 Write .cue
               </label>
