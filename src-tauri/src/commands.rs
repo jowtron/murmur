@@ -178,6 +178,9 @@ pub async fn download_model(name: String, window: Window) -> Result<String, Stri
         ("medium", 1_533_700_000),
         ("large-v3", 3_094_400_000),
         ("large-v3-turbo", 1_627_800_000),
+        ("distil-small-en", 336_191_657),
+        ("distil-medium-en", 794_018_180),
+        ("distil-large-v3", 1_519_521_155),
     ]
     .into();
     let expected = *expected_sizes.get(name.as_str()).unwrap_or(&500_000_000);

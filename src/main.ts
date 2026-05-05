@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { open } from "@tauri-apps/plugin-dialog";
+import { open, ask } from "@tauri-apps/plugin-dialog";
 
 interface ModelInfo {
   name: string;
@@ -544,8 +544,9 @@ async function checkModelAndPromptDownload(modelName: string): Promise<boolean> 
   const ready = await invoke<boolean>("is_model_ready", { name: modelName });
   if (ready) return true;
 
-  const doDownload = confirm(
-    `The model "${modelName}" is not downloaded yet.\n\nWould you like to download it now?`
+  const doDownload = await ask(
+    `The model "${modelName}" is not downloaded yet.\n\nWould you like to download it now?`,
+    { title: "Download model?", kind: "info" }
   );
   if (!doDownload) return false;
 
