@@ -31,7 +31,17 @@ pub fn models_ready() -> bool {
 
 /// Run speaker diarization on 16kHz mono f32 PCM.
 /// Returns segments sorted by start time.
-pub fn diarize(samples_16k_mono: &[f32]) -> Result<Vec<Segment>, String> {
+///
+/// `num_speakers` — if > 0, force clustering to this exact count (use when you know
+///   how many speakers are in the file). If 0, the threshold is used to auto-cluster.
+/// `threshold` — distance threshold for the FastClustering algorithm. With the NeMo
+///   SpeakerNet embedding, ~0.7 works well for clean two-speaker conversations;
+///   lower values (0.5) over-split, higher values (0.9+) over-merge.
+pub fn diarize(
+    samples_16k_mono: &[f32],
+    num_speakers: i32,
+    threshold: f32,
+) -> Result<Vec<Segment>, String> {
     use sherpa_onnx::{
         FastClusteringConfig, OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
         OfflineSpeakerSegmentationModelConfig, OfflineSpeakerSegmentationPyannoteModelConfig,
@@ -66,8 +76,8 @@ pub fn diarize(samples_16k_mono: &[f32]) -> Result<Vec<Segment>, String> {
             ..Default::default()
         },
         clustering: FastClusteringConfig {
-            num_clusters: 0,
-            threshold: 0.5,
+            num_clusters: num_speakers,
+            threshold,
         },
         ..Default::default()
     };

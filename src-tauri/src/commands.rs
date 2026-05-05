@@ -1760,6 +1760,16 @@ pub struct SherpaJob {
     pub model: String, // Whisper model name
     pub output_dir: Option<String>,
     pub threads: Option<i32>,
+    /// 0 = auto-cluster using threshold; >0 = force this exact speaker count.
+    #[serde(default)]
+    pub num_speakers: i32,
+    /// Clustering threshold. ~0.7 is a good default for NeMo SpeakerNet embeddings.
+    #[serde(default = "default_sherpa_threshold")]
+    pub threshold: f32,
+}
+
+fn default_sherpa_threshold() -> f32 {
+    0.7
 }
 
 #[tauri::command]
@@ -2060,9 +2070,11 @@ pub async fn transcribe_sherpa(
 
     // Decode 16kHz mono PCM and run Sherpa diarization
     let path_for_sherpa = audio_path.clone();
+    let num_speakers = job.num_speakers;
+    let threshold = job.threshold;
     let sherpa_segs = tokio::task::spawn_blocking(move || -> Result<Vec<sherpa::Segment>, String> {
         let pcm = transcriber::audio_to_pcm(&path_for_sherpa)?;
-        sherpa::diarize(&pcm)
+        sherpa::diarize(&pcm, num_speakers, threshold)
     })
     .await
     .map_err(|e| format!("Sherpa task error: {}", e))??;

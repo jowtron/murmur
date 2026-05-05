@@ -100,6 +100,8 @@ function loadSettings() {
     deepgramKey: localStorage.getItem("deepgram_api_key") || (document.getElementById("input-deepgram-key") as HTMLInputElement)?.value || "",
     deepgramModel: localStorage.getItem("deepgram_model") || "nova-3",
     deepgramLang: localStorage.getItem("deepgram_lang") ?? "en",
+    sherpaNumSpeakers: parseInt(localStorage.getItem("sherpa_num_speakers") || "0"),
+    sherpaThreshold: parseFloat(localStorage.getItem("sherpa_threshold") || "0.7"),
   };
 }
 
@@ -133,6 +135,8 @@ function saveSettings() {
   localStorage.setItem("deepgram_api_key", (document.getElementById("input-deepgram-key") as HTMLInputElement).value);
   localStorage.setItem("deepgram_model", (document.getElementById("select-deepgram-model") as HTMLSelectElement).value);
   localStorage.setItem("deepgram_lang", (document.getElementById("input-deepgram-lang") as HTMLInputElement).value);
+  localStorage.setItem("sherpa_num_speakers", (document.getElementById("input-sherpa-num-speakers") as HTMLInputElement).value);
+  localStorage.setItem("sherpa_threshold", (document.getElementById("input-sherpa-threshold") as HTMLInputElement).value);
   const modelsText = (document.getElementById("input-llm-models") as HTMLTextAreaElement).value;
   localStorage.setItem("llm_models", modelsText);
   const modelsList = modelsText.split("\n").map(m => m.trim()).filter(Boolean);
@@ -1107,6 +1111,7 @@ async function transcribeItemSherpa(item: QueueItem) {
     item.elapsed = undefined;
     renderQueue();
 
+    const settings = loadSettings();
     const result = await invoke<AssemblyAIResult>("transcribe_sherpa", {
       job: {
         id: item.id,
@@ -1114,6 +1119,8 @@ async function transcribeItemSherpa(item: QueueItem) {
         model,
         output_dir: customOutputDir,
         threads,
+        num_speakers: settings.sherpaNumSpeakers,
+        threshold: settings.sherpaThreshold,
       },
     });
 
@@ -1872,6 +1879,8 @@ function loadSettingsIntoForm() {
   (document.getElementById("input-deepgram-key") as HTMLInputElement).value = s.deepgramKey;
   (document.getElementById("select-deepgram-model") as HTMLSelectElement).value = s.deepgramModel;
   (document.getElementById("input-deepgram-lang") as HTMLInputElement).value = s.deepgramLang;
+  (document.getElementById("input-sherpa-num-speakers") as HTMLInputElement).value = String(s.sherpaNumSpeakers);
+  (document.getElementById("input-sherpa-threshold") as HTMLInputElement).value = String(s.sherpaThreshold);
   (document.getElementById("input-llm-models") as HTMLTextAreaElement).value = s.llmModels;
   (document.getElementById("input-api-url") as HTMLInputElement).value = s.apiUrl;
   if (s.chapterPrompt) (document.getElementById("input-chapter-prompt") as HTMLTextAreaElement).value = s.chapterPrompt;

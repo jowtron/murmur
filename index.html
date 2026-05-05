@@ -9,7 +9,6 @@
   <body>
     <div id="app">
       <header>
-        <h1>Murmur</h1>
         <div class="header-actions">
           <button id="btn-add-files" title="Add individual audio files to the transcription queue">Add Files</button>
           <button id="btn-add-folder" title="Add all audio files from a folder to the queue">Add Folder</button>
@@ -195,6 +194,16 @@
               <label class="form-label" style="flex:1;">
                 Deepgram language code (blank = auto-detect):
                 <input type="text" id="input-deepgram-lang" class="form-input" value="en" placeholder="en" />
+              </label>
+            </div>
+            <div style="display:flex;gap:12px;">
+              <label class="form-label" style="flex:1;" title="If you know exactly how many distinct speakers are in the file, enter it here. 0 means auto-detect using the threshold below.">
+                Sherpa speaker count (0 = auto):
+                <input type="number" id="input-sherpa-num-speakers" class="form-input" value="0" min="0" max="20" step="1" />
+              </label>
+              <label class="form-label" style="flex:1;" title="Clustering threshold. Lower = more speakers split apart, higher = more merged into one. 0.7 is a good default for clean audio with NeMo SpeakerNet. If Sherpa is finding way too many speakers, raise this to 0.8–0.9.">
+                Sherpa clustering threshold:
+                <input type="number" id="input-sherpa-threshold" class="form-input" value="0.7" min="0.3" max="1.0" step="0.05" />
               </label>
             </div>
             <h3 class="settings-section-title">Chapter Detection (LLM)</h3>
