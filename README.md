@@ -55,7 +55,9 @@ Murmur supports four diarization paths, all writing the same `<basename>.diarize
 | Layer | Technology |
 |-------|-----------|
 | **App framework** | [Tauri 2](https://tauri.app/) (Rust backend + web frontend) |
-| **Transcription** | [whisper-rs](https://github.com/tazz4843/whisper-rs) (whisper.cpp bindings with Metal) |
+| **Local transcription** | [whisper-rs](https://github.com/tazz4843/whisper-rs) (whisper.cpp bindings with Metal) |
+| **Local diarization** | [sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (Rust crate, statically linked; pyannote segmentation + NeMo SpeakerNet embedding) |
+| **Cloud diarization** | [AssemblyAI](https://www.assemblyai.com) (Universal-2 / Universal-3 Pro) and [Deepgram](https://deepgram.com) (Nova-3) via REST APIs |
 | **Audio decoding** | [Symphonia](https://github.com/pdeljanov/Symphonia) (pure Rust, supports FLAC/MP3/WAV/OGG/AAC/M4A/WMA/Opus) |
 | **Audio resampling** | [Rubato](https://github.com/HEnquist/rubato) (high-quality sinc interpolation to 16kHz) |
 | **Audio classification** | [YAMNet](https://tfhub.dev/google/yamnet/1) via TensorFlow Lite C API ([libloading](https://github.com/nagisa/rust_libloading) FFI) |
