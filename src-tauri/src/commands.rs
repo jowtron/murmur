@@ -2,6 +2,7 @@ use crate::assemblyai;
 use crate::deepgram;
 use crate::flac_utils;
 use crate::sherpa;
+use crate::silence_trim;
 use crate::transcriber::{
     self, TranscriptionProgress, TranscriptionResult, WhisperModel,
 };
@@ -16,9 +17,17 @@ use tauri::{Emitter, State, Window};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
+pub struct CachedTrim {
+    pub temp_wav: PathBuf,
+    pub map: Vec<silence_trim::SegmentMap>,
+    pub original_duration: f64,
+    pub trimmed_duration: f64,
+}
+
 pub struct AppState {
     pub semaphore: Arc<Mutex<Arc<Semaphore>>>,
     pub cancel_tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
+    pub trim_cache: Arc<Mutex<HashMap<String, CachedTrim>>>,
 }
 
 impl AppState {
@@ -26,6 +35,7 @@ impl AppState {
         Self {
             semaphore: Arc::new(Mutex::new(Arc::new(Semaphore::new(permits)))),
             cancel_tokens: Arc::new(Mutex::new(HashMap::new())),
+            trim_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -1437,6 +1447,88 @@ pub struct AssemblyAIJob {
     pub language_code: Option<String>,
     #[serde(default)]
     pub speech_models: Vec<String>,
+    #[serde(default)]
+    pub trim_silence: bool,
+    #[serde(default = "default_silence_threshold_db")]
+    pub silence_threshold_db: f32,
+    #[serde(default = "default_min_silence_secs")]
+    pub min_silence_secs: f32,
+    #[serde(default = "default_silence_padding_secs")]
+    pub silence_padding_secs: f32,
+}
+
+fn default_silence_threshold_db() -> f32 { -35.0 }
+fn default_min_silence_secs() -> f32 { 0.75 }
+fn default_silence_padding_secs() -> f32 { 0.1 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrimPreview {
+    pub original_duration: f64,
+    pub trimmed_duration: f64,
+}
+
+#[tauri::command]
+pub async fn preview_silence_trim(
+    path: String,
+    threshold_db: f32,
+    min_silence_secs: f32,
+    padding_secs: f32,
+    state: State<'_, AppState>,
+) -> Result<TrimPreview, String> {
+    let cache = state.trim_cache.clone();
+    let path_for_task = path.clone();
+    let trim = tokio::task::spawn_blocking(move || {
+        silence_trim::trim_audio_to_temp_wav(
+            std::path::Path::new(&path_for_task),
+            threshold_db,
+            min_silence_secs,
+            padding_secs,
+        )
+    })
+    .await
+    .map_err(|e| format!("Trim preview task error: {}", e))??;
+
+    let original = trim.original_duration;
+    let trimmed = trim.trimmed_duration;
+
+    {
+        let mut guard = cache.lock().unwrap();
+        if let Some(old) = guard.remove(&path) {
+            let _ = std::fs::remove_file(&old.temp_wav);
+        }
+        guard.insert(
+            path,
+            CachedTrim {
+                temp_wav: trim.temp_wav,
+                map: trim.map,
+                original_duration: trim.original_duration,
+                trimmed_duration: trim.trimmed_duration,
+            },
+        );
+    }
+
+    Ok(TrimPreview {
+        original_duration: original,
+        trimmed_duration: trimmed,
+    })
+}
+
+#[tauri::command]
+pub fn discard_trim_preview(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.trim_cache.lock().unwrap();
+    if let Some(entry) = guard.remove(&path) {
+        let _ = std::fs::remove_file(&entry.temp_wav);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn discard_all_trim_previews(state: State<'_, AppState>) -> Result<(), String> {
+    let mut guard = state.trim_cache.lock().unwrap();
+    for (_, entry) in guard.drain() {
+        let _ = std::fs::remove_file(&entry.temp_wav);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1521,15 +1613,75 @@ pub async fn transcribe_assemblyai(
         .unwrap_or_default();
     let job_id = job.id.clone();
 
-    emit_aai(&window, &job_id, &file_name, 0.02, "uploading");
+    let mut trim_map: Vec<silence_trim::SegmentMap> = Vec::new();
+    let mut temp_upload_path: Option<PathBuf> = None;
+    let path_for_upload = if job.trim_silence {
+        let cached = state.trim_cache.lock().unwrap().remove(&job.path);
+        let trim_result = if let Some(c) = cached {
+            silence_trim::TrimResult {
+                temp_wav: c.temp_wav,
+                map: c.map,
+                original_duration: c.original_duration,
+                trimmed_duration: c.trimmed_duration,
+            }
+        } else {
+            emit_aai(&window, &job_id, &file_name, 0.01, "trimming silence");
+            let src = audio_path.clone();
+            let thr = job.silence_threshold_db;
+            let min_sil = job.min_silence_secs;
+            let pad = job.silence_padding_secs;
+            tokio::task::spawn_blocking(move || {
+                silence_trim::trim_audio_to_temp_wav(&src, thr, min_sil, pad)
+            })
+            .await
+            .map_err(|e| format!("Silence-trim task error: {}", e))??
+        };
+
+        let saved_pct = if trim_result.original_duration > 0.0 {
+            (1.0 - trim_result.trimmed_duration / trim_result.original_duration) * 100.0
+        } else {
+            0.0
+        };
+        emit_aai(
+            &window,
+            &job_id,
+            &file_name,
+            0.04,
+            &format!(
+                "trimmed silence: {:.0}s -> {:.0}s ({:.0}% saved)",
+                trim_result.original_duration, trim_result.trimmed_duration, saved_pct
+            ),
+        );
+
+        trim_map = trim_result.map;
+        temp_upload_path = Some(trim_result.temp_wav.clone());
+        trim_result.temp_wav
+    } else {
+        audio_path.clone()
+    };
+
+    if cancel_token.is_cancelled() {
+        if let Some(p) = &temp_upload_path {
+            let _ = std::fs::remove_file(p);
+        }
+        drop(permit);
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        return Err("Cancelled".to_string());
+    }
+
+    emit_aai(&window, &job_id, &file_name, 0.05, "uploading");
 
     let api_key = job.api_key.clone();
-    let path_for_upload = audio_path.clone();
+    let path_for_upload_clone = path_for_upload.clone();
     let upload_url = tokio::task::spawn_blocking(move || {
-        assemblyai::upload_file(&path_for_upload, &api_key)
+        assemblyai::upload_file(&path_for_upload_clone, &api_key)
     })
     .await
     .map_err(|e| format!("Upload task error: {}", e))??;
+
+    if let Some(p) = &temp_upload_path {
+        let _ = std::fs::remove_file(p);
+    }
 
     if cancel_token.is_cancelled() {
         drop(permit);
@@ -1552,7 +1704,7 @@ pub async fn transcribe_assemblyai(
 
     let mut last_status = String::new();
     let mut elapsed_polls: u32 = 0;
-    let final_transcript = loop {
+    let mut final_transcript = loop {
         if cancel_token.is_cancelled() {
             drop(permit);
             state.cancel_tokens.lock().unwrap().remove(&job.id);
@@ -1582,6 +1734,28 @@ pub async fn transcribe_assemblyai(
             }
         }
     };
+
+    if !trim_map.is_empty() {
+        if let Some(utts) = final_transcript.utterances.as_mut() {
+            for u in utts.iter_mut() {
+                u.start = silence_trim::map_trimmed_ms_to_original_ms(u.start, &trim_map);
+                u.end = silence_trim::map_trimmed_ms_to_original_ms(u.end, &trim_map);
+                for w in u.words.iter_mut() {
+                    w.start = silence_trim::map_trimmed_ms_to_original_ms(w.start, &trim_map);
+                    w.end = silence_trim::map_trimmed_ms_to_original_ms(w.end, &trim_map);
+                }
+            }
+        }
+        if let Some(words) = final_transcript.words.as_mut() {
+            for w in words.iter_mut() {
+                w.start = silence_trim::map_trimmed_ms_to_original_ms(w.start, &trim_map);
+                w.end = silence_trim::map_trimmed_ms_to_original_ms(w.end, &trim_map);
+            }
+        }
+        if let Some(last) = trim_map.last() {
+            final_transcript.audio_duration = Some(last.original_start + last.duration);
+        }
+    }
 
     let utterances = final_transcript.utterances.clone().unwrap_or_default();
     if utterances.is_empty() {

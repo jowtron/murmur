@@ -182,6 +182,24 @@
                 <input type="text" id="input-assemblyai-lang" class="form-input" value="en" placeholder="en" />
               </label>
             </div>
+            <label class="form-label" style="display:flex;align-items:center;gap:8px;">
+              <input type="checkbox" id="chk-aai-trim-silence" />
+              Trim silence before upload (lower AssemblyAI cost, timestamps remapped to original)
+            </label>
+            <div style="display:flex;gap:12px;">
+              <label class="form-label" style="flex:1;">
+                Silence threshold (dB):
+                <input type="number" id="input-aai-silence-db" class="form-input" value="-35" step="1" />
+              </label>
+              <label class="form-label" style="flex:1;">
+                Min silence length (sec):
+                <input type="number" id="input-aai-min-silence" class="form-input" value="0.75" step="0.05" min="0.1" />
+              </label>
+              <label class="form-label" style="flex:1;">
+                Padding around speech (sec):
+                <input type="number" id="input-aai-silence-pad" class="form-input" value="0.1" step="0.05" min="0" />
+              </label>
+            </div>
             <label class="form-label">
               Deepgram API Key:
               <input type="password" id="input-deepgram-key" placeholder="Deepgram API token" class="form-input" />

@@ -3,6 +3,7 @@ mod commands;
 mod deepgram;
 mod flac_utils;
 mod sherpa;
+mod silence_trim;
 mod transcriber;
 mod gap_detection;
 mod template;
@@ -78,6 +79,9 @@ pub fn run() {
             commands::find_template_matches,
             commands::download_podcast_episode,
             commands::transcribe_assemblyai,
+            commands::preview_silence_trim,
+            commands::discard_trim_preview,
+            commands::discard_all_trim_previews,
             commands::check_diarization_exists,
             commands::transcribe_deepgram,
             commands::transcribe_sherpa,

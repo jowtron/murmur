@@ -97,6 +97,10 @@ function loadSettings() {
     assemblyaiKey: localStorage.getItem("assemblyai_api_key") || (document.getElementById("input-assemblyai-key") as HTMLInputElement)?.value || "",
     assemblyaiModel: localStorage.getItem("assemblyai_model") || "auto",
     assemblyaiLang: localStorage.getItem("assemblyai_lang") ?? "en",
+    assemblyaiTrimSilence: localStorage.getItem("assemblyai_trim_silence") === "1",
+    assemblyaiSilenceDb: parseFloat(localStorage.getItem("assemblyai_silence_db") || "-35"),
+    assemblyaiMinSilenceSecs: parseFloat(localStorage.getItem("assemblyai_min_silence_secs") || "0.75"),
+    assemblyaiSilencePadSecs: parseFloat(localStorage.getItem("assemblyai_silence_pad_secs") || "0.1"),
     deepgramKey: localStorage.getItem("deepgram_api_key") || (document.getElementById("input-deepgram-key") as HTMLInputElement)?.value || "",
     deepgramModel: localStorage.getItem("deepgram_model") || "nova-3",
     deepgramLang: localStorage.getItem("deepgram_lang") ?? "en",
@@ -132,6 +136,10 @@ function saveSettings() {
   localStorage.setItem("assemblyai_api_key", (document.getElementById("input-assemblyai-key") as HTMLInputElement).value);
   localStorage.setItem("assemblyai_model", (document.getElementById("select-assemblyai-model") as HTMLSelectElement).value);
   localStorage.setItem("assemblyai_lang", (document.getElementById("input-assemblyai-lang") as HTMLInputElement).value);
+  localStorage.setItem("assemblyai_trim_silence", (document.getElementById("chk-aai-trim-silence") as HTMLInputElement).checked ? "1" : "0");
+  localStorage.setItem("assemblyai_silence_db", (document.getElementById("input-aai-silence-db") as HTMLInputElement).value);
+  localStorage.setItem("assemblyai_min_silence_secs", (document.getElementById("input-aai-min-silence") as HTMLInputElement).value);
+  localStorage.setItem("assemblyai_silence_pad_secs", (document.getElementById("input-aai-silence-pad") as HTMLInputElement).value);
   localStorage.setItem("deepgram_api_key", (document.getElementById("input-deepgram-key") as HTMLInputElement).value);
   localStorage.setItem("deepgram_model", (document.getElementById("select-deepgram-model") as HTMLSelectElement).value);
   localStorage.setItem("deepgram_lang", (document.getElementById("input-deepgram-lang") as HTMLInputElement).value);
@@ -282,10 +290,10 @@ function renderQueue() {
       <div class="model-col">${item.modelUsed || "-"}</div>
       <div class="elapsed-col">${item.elapsed ? formatElapsed(item.elapsed) : "-"}</div>
       <div class="status-col">
-        <span class="status status-${item.status}">
+        <span class="status status-${item.status}${item.stageText && item.stageText.endsWith("…") ? " is-working" : ""}">
           ${item.status === "pending" ? "Pending" : ""}
-          ${item.status === "queued" ? "Queued" : ""}
-          ${item.status === "transcribing" ? (item.stageText && item.engine !== "whisper" ? `${item.stageText} ${Math.round(item.progress * 100)}%` : `${Math.round(item.progress * 100)}%`) : ""}
+          ${item.status === "queued" ? (item.stageText || "Queued") : ""}
+          ${item.status === "transcribing" ? (item.stageText && item.engine !== "whisper" ? (item.progress > 0 && item.progress < 1 ? `${item.stageText} ${Math.round(item.progress * 100)}%` : item.stageText) : `${Math.round(item.progress * 100)}%`) : ""}
           ${item.status === "detecting" ? `<span id="detect-status-${item.id}">Detecting...</span>` : ""}
           ${item.status === "complete" ? "Done" : ""}
           ${item.status === "error" ? "Error" : ""}
@@ -755,6 +763,10 @@ async function transcribeItemAssemblyAI(item: QueueItem) {
         output_dir: customOutputDir,
         language_code: langTrimmed || null,
         speech_models: assemblyaiSpeechModels(settings.assemblyaiModel),
+        trim_silence: settings.assemblyaiTrimSilence,
+        silence_threshold_db: settings.assemblyaiSilenceDb,
+        min_silence_secs: settings.assemblyaiMinSilenceSecs,
+        silence_padding_secs: settings.assemblyaiSilencePadSecs,
       },
     });
 
@@ -1378,14 +1390,14 @@ async function transcribeAll() {
       alert("AssemblyAI API key is not set. Open Settings to add it before submitting AssemblyAI jobs.");
       return;
     }
-    if (!confirmAssemblyAICost(aaiItems)) return;
+    if (!(await confirmAssemblyAICost(aaiItems))) return;
   }
   if (dgItems.length > 0) {
     if (!settings.deepgramKey) {
       alert("Deepgram API key is not set. Open Settings to add it before submitting Deepgram jobs.");
       return;
     }
-    if (!confirmDeepgramCost(dgItems)) return;
+    if (!(await confirmDeepgramCost(dgItems))) return;
   }
 
   btnTranscribeAll.disabled = true;
@@ -1416,7 +1428,7 @@ function assemblyaiRatePerHour(modelChoice: string): { rate: number; label: stri
   }
 }
 
-function confirmDeepgramCost(items: QueueItem[]): boolean {
+async function confirmDeepgramCost(items: QueueItem[]): Promise<boolean> {
   // Deepgram Nova-3 batch: $0.0043/min ≈ $0.258/hr (diarization included).
   const ratePerMin = 0.0043;
   const knownDurationSecs = items.map((i) => i.duration || 0).reduce((a, b) => a + b, 0);
@@ -1432,32 +1444,80 @@ function confirmDeepgramCost(items: QueueItem[]): boolean {
   if (unknownCount > 0) {
     msg += `${unknownCount} file(s) have unknown duration — final cost may be higher.\n`;
   }
-  msg += `\nProceed?`;
-  return confirm(msg);
+  return await ask(msg, { title: "Confirm Deepgram cost", kind: "info", okLabel: "Send to Deepgram", cancelLabel: "Cancel" });
 }
 
-function confirmAssemblyAICost(items: QueueItem[]): boolean {
+interface TrimPreviewResult {
+  original_duration: number;
+  trimmed_duration: number;
+}
+
+async function confirmAssemblyAICost(items: QueueItem[]): Promise<boolean> {
   const settings = loadSettings();
   const { rate: ratePerHour, label } = assemblyaiRatePerHour(settings.assemblyaiModel);
   const ratePerMin = ratePerHour / 60;
 
-  const knownDurationSecs = items
-    .map((i) => i.duration || 0)
-    .reduce((a, b) => a + b, 0);
+  let originalSecs = items.map((i) => i.duration || 0).reduce((a, b) => a + b, 0);
   const unknownCount = items.filter((i) => !i.duration).length;
-  const knownMinutes = knownDurationSecs / 60;
-  const cost = knownMinutes * ratePerMin;
+  let billableSecs = originalSecs;
+  let trimmedSomething = false;
+
+  if (settings.assemblyaiTrimSilence) {
+    for (let idx = 0; idx < items.length; idx++) {
+      const item = items[idx];
+      item.status = "queued";
+      item.progress = 0;
+      item.stageText = items.length > 1
+        ? `analyzing silence (${idx + 1}/${items.length})…`
+        : "analyzing silence…";
+      renderQueue();
+      try {
+        const r = await invoke<TrimPreviewResult>("preview_silence_trim", {
+          path: item.path,
+          thresholdDb: settings.assemblyaiSilenceDb,
+          minSilenceSecs: settings.assemblyaiMinSilenceSecs,
+          paddingSecs: settings.assemblyaiSilencePadSecs,
+        });
+        billableSecs = billableSecs - (r.original_duration - r.trimmed_duration);
+        trimmedSomething = true;
+        item.stageText = `trim preview: ${formatDuration(r.original_duration)} → ${formatDuration(r.trimmed_duration)}`;
+      } catch (err) {
+        item.stageText = `trim preview failed: ${err}`;
+      }
+      item.status = "queued";
+      renderQueue();
+    }
+  }
+
+  const billableMinutes = billableSecs / 60;
+  const cost = billableMinutes * ratePerMin;
 
   let msg = `${items.length} file(s) will be sent to AssemblyAI (${label}).\n\n`;
-  if (knownDurationSecs > 0) {
-    msg += `Total duration: ${formatDuration(knownDurationSecs)} (~${knownMinutes.toFixed(1)} min)\n`;
+  if (originalSecs > 0) {
+    msg += `Original duration: ${formatDuration(originalSecs)}\n`;
+    if (trimmedSomething) {
+      const savedSecs = originalSecs - billableSecs;
+      const savedPct = originalSecs > 0 ? (savedSecs / originalSecs) * 100 : 0;
+      msg += `After silence trim: ${formatDuration(billableSecs)} (~${billableMinutes.toFixed(1)} min, ${savedPct.toFixed(0)}% saved)\n`;
+    } else {
+      msg += `Total billable: ~${billableMinutes.toFixed(1)} min\n`;
+    }
     msg += `Estimated cost: $${cost.toFixed(2)} (at $${ratePerHour.toFixed(2)}/hr)\n`;
   }
   if (unknownCount > 0) {
     msg += `${unknownCount} file(s) have unknown duration — final cost may be higher.\n`;
   }
-  msg += `\nProceed?`;
-  return confirm(msg);
+
+  const proceed = await ask(msg, {
+    title: "Confirm AssemblyAI cost",
+    kind: "info",
+    okLabel: "Send to AssemblyAI",
+    cancelLabel: "Cancel",
+  });
+  if (!proceed) {
+    try { await invoke("discard_all_trim_previews"); } catch {}
+  }
+  return proceed;
 }
 
 // GPU info
@@ -1882,6 +1942,10 @@ function loadSettingsIntoForm() {
   (document.getElementById("input-assemblyai-key") as HTMLInputElement).value = s.assemblyaiKey;
   (document.getElementById("select-assemblyai-model") as HTMLSelectElement).value = s.assemblyaiModel;
   (document.getElementById("input-assemblyai-lang") as HTMLInputElement).value = s.assemblyaiLang;
+  (document.getElementById("chk-aai-trim-silence") as HTMLInputElement).checked = s.assemblyaiTrimSilence;
+  (document.getElementById("input-aai-silence-db") as HTMLInputElement).value = String(s.assemblyaiSilenceDb);
+  (document.getElementById("input-aai-min-silence") as HTMLInputElement).value = String(s.assemblyaiMinSilenceSecs);
+  (document.getElementById("input-aai-silence-pad") as HTMLInputElement).value = String(s.assemblyaiSilencePadSecs);
   (document.getElementById("input-deepgram-key") as HTMLInputElement).value = s.deepgramKey;
   (document.getElementById("select-deepgram-model") as HTMLSelectElement).value = s.deepgramModel;
   (document.getElementById("input-deepgram-lang") as HTMLInputElement).value = s.deepgramLang;

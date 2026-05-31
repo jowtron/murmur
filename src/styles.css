@@ -540,6 +540,16 @@ select, input[type="text"], input[type="password"] {
 .status-complete { color: var(--success); }
 .status-error { color: var(--accent-red); }
 
+.status-queued.is-working,
+.status-transcribing.is-indeterminate {
+  animation: pulse-fade 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse-fade {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
 .progress-bar {
   width: 100%;
   height: 4px;
