@@ -12,7 +12,9 @@ Always build the .app bundle from the project root with the deployment-target ov
 CMAKE_OSX_DEPLOYMENT_TARGET=10.15 MACOSX_DEPLOYMENT_TARGET=10.15 npx tauri build --bundles app
 ```
 
-`--bundles app` produces `src-tauri/target/release/bundle/macos/Whisper Transcriber.app`. Without that flag, Tauri tries to make a `.dmg` and fails.
+`--bundles app` produces `src-tauri/target/release/bundle/macos/Murmur.app`. Without that flag, Tauri tries to make a `.dmg` and fails.
+
+If the build fails with `failed to read plugin permissions` pointing at the old `audiobooks/whisper-transcriber/` path, stale build-script outputs from the directory rename are to blame: `rm -rf src-tauri/target/{debug,release}/build/tauri-*` and rebuild (keeps the expensive whisper.cpp/sherpa caches).
 
 `CMAKE_OSX_DEPLOYMENT_TARGET=10.15` is required because whisper.cpp's `std::filesystem` needs 10.15+. Setting only `MACOSX_DEPLOYMENT_TARGET` is not enough — the cmake crate overrides it.
 
