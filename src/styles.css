@@ -282,6 +282,17 @@ select, input[type="text"], input[type="password"] {
   opacity: 0.6;
 }
 
+/* Chapter-detection controls (LLM picker + sub-options) dim when
+   auto-detect chapters is off — nothing is sent to the LLM then. */
+.settings-bar.no-auto-chapters .chapters-only {
+  opacity: 0.35;
+  transition: opacity 0.15s ease;
+}
+
+.settings-bar.no-auto-chapters .chapters-only:hover {
+  opacity: 0.6;
+}
+
 .engine-badge {
   display: inline-block;
   font-size: 0.65rem;

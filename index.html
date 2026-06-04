@@ -86,7 +86,7 @@
             <option value="4">4 files</option>
           </select>
         </label>
-        <label class="whisper-only whisper-features" title="Which LLM to use for chapter detection via OpenRouter API. (Pure Whisper only — diarization engines skip chapter detection.)">
+        <label class="whisper-only whisper-features chapters-only" title="Which LLM to use for chapter detection via OpenRouter API. Only used when detecting chapters — plain transcription never contacts an LLM.">
           LLM:
           <select id="select-llm-model"></select>
         </label>
@@ -94,15 +94,15 @@
           <input type="checkbox" id="chk-auto-chapters" />
           Auto-detect chapters
         </label>
-        <label class="auto-chapters-label whisper-only whisper-features" title="Use YAMNet audio classification to snap chapter boundaries to the nearest music-to-speech transition.">
+        <label class="auto-chapters-label whisper-only whisper-features chapters-only" title="Use YAMNet audio classification to snap chapter boundaries to the nearest music-to-speech transition.">
           <input type="checkbox" id="chk-snap-gaps" checked />
           Snap to speech onset
         </label>
-        <label class="auto-chapters-label whisper-only whisper-features" title="Refine LLM chapter times by searching the SRT transcript for matching text near each timestamp. Improves accuracy when the LLM's times are approximate.">
+        <label class="auto-chapters-label whisper-only whisper-features chapters-only" title="Refine LLM chapter times by searching the SRT transcript for matching text near each timestamp. Improves accuracy when the LLM's times are approximate.">
           <input type="checkbox" id="chk-srt-correct" checked />
           Correct times from SRT
         </label>
-        <label class="auto-chapters-label whisper-only whisper-features" title="Force the first chapter to start at 00:00:00 instead of the LLM's detected time.">
+        <label class="auto-chapters-label whisper-only whisper-features chapters-only" title="Force the first chapter to start at 00:00:00 instead of the LLM's detected time.">
           <input type="checkbox" id="chk-first-zero" checked />
           First chapter at 0:00
         </label>

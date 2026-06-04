@@ -2532,6 +2532,7 @@ function applyEngineUI() {
   } else if (selectEngine.value === "sherpa") {
     bar.classList.add("engine-sherpa");
   }
+  bar.classList.toggle("no-auto-chapters", !chkAutoChapters.checked);
 }
 selectEngine.addEventListener("change", () => {
   savePreferences();
@@ -2542,7 +2543,10 @@ selectModel.addEventListener("change", savePreferences);
 selectFormat.addEventListener("change", savePreferences);
 selectThreads.addEventListener("change", savePreferences);
 selectConcurrent.addEventListener("change", savePreferences);
-chkAutoChapters.addEventListener("change", savePreferences);
+chkAutoChapters.addEventListener("change", () => {
+  savePreferences();
+  applyEngineUI();
+});
 chkSnapGaps.addEventListener("change", savePreferences);
 chkEmbedFlac.addEventListener("change", savePreferences);
 chkWriteCue.addEventListener("change", savePreferences);
