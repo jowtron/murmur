@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, ask } from "@tauri-apps/plugin-dialog";
 
 interface ModelInfo {
@@ -1843,6 +1844,32 @@ btnAddFiles.addEventListener("click", async () => {
   if (selected) {
     const paths = Array.isArray(selected) ? selected : [selected];
     await addFiles(paths);
+  }
+});
+
+// Drag-and-drop of files/folders anywhere on the window. The webview
+// intercepts native drags (Tauri dragDropEnabled default), so HTML5 drop
+// events never fire — Tauri's own event is the only channel.
+const DROP_EXTENSIONS = ["flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus", "mp4", "m4v", "mov"];
+
+getCurrentWebview().onDragDropEvent(async (event) => {
+  if (event.payload.type === "enter") {
+    document.body.classList.add("drag-over");
+  } else if (event.payload.type === "leave") {
+    document.body.classList.remove("drag-over");
+  } else if (event.payload.type === "drop") {
+    document.body.classList.remove("drag-over");
+    const files: string[] = [];
+    for (const p of event.payload.paths) {
+      try {
+        // Directories expand to their supported contents (recursive)
+        files.push(...await invoke<string[]>("scan_directory", { path: p }));
+      } catch {
+        const ext = p.split(".").pop()?.toLowerCase() || "";
+        if (DROP_EXTENSIONS.includes(ext)) files.push(p);
+      }
+    }
+    if (files.length > 0) await addFiles(files);
   }
 });
 
