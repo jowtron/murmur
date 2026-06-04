@@ -538,7 +538,15 @@ async function addFiles(paths: string[]) {
     }
   }
 
+  let skipped = 0;
   for (const path of paths) {
+    // Dedupe against the queue only (same path + engine). Outputs on disk
+    // are deliberately not checked here — the Force overwrite checkbox
+    // governs whether existing outputs are redone at processing time.
+    if (queue.some((q) => q.path === path && q.engine === engine)) {
+      skipped++;
+      continue;
+    }
     const name = path.split("/").pop() || path;
     const item: QueueItem = {
       id: generateId(),
@@ -557,6 +565,9 @@ async function addFiles(paths: string[]) {
       .catch(() => {});
   }
   renderQueue();
+  if (skipped > 0 && skipped === paths.length) {
+    alert(`All ${skipped} file(s) are already in the queue.`);
+  }
 }
 
 async function checkModelAndPromptDownload(modelName: string): Promise<boolean> {
