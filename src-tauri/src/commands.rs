@@ -11,7 +11,7 @@ use crate::template;
 use crate::yamnet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, State, Window};
 use tokio::sync::Semaphore;
@@ -947,6 +947,17 @@ fn parse_srt_time(s: &str) -> f64 {
     }
 }
 
+/// Video containers symphonia can demux (audio track only). Cloud engines
+/// must never be sent these raw — extract the audio first to avoid uploading
+/// the video stream.
+const VIDEO_EXTENSIONS: [&str; 3] = ["mp4", "m4v", "mov"];
+
+fn is_video_file(path: &Path) -> bool {
+    path.extension()
+        .map(|e| VIDEO_EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
 #[tauri::command]
 pub async fn scan_directory(path: String) -> Result<Vec<String>, String> {
     let dir = PathBuf::from(&path);
@@ -954,7 +965,9 @@ pub async fn scan_directory(path: String) -> Result<Vec<String>, String> {
         return Err("Not a directory".to_string());
     }
 
-    let extensions = ["flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus"];
+    let extensions = [
+        "flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus", "mp4", "m4v", "mov",
+    ];
     let mut files = Vec::new();
 
     fn walk(dir: &PathBuf, extensions: &[&str], files: &mut Vec<String>) {
@@ -1656,6 +1669,17 @@ pub async fn transcribe_assemblyai(
         trim_map = trim_result.map;
         temp_upload_path = Some(trim_result.temp_wav.clone());
         trim_result.temp_wav
+    } else if is_video_file(&audio_path) {
+        // Never upload a video container — extract the audio track to a temp WAV.
+        emit_aai(&window, &job_id, &file_name, 0.02, "extracting audio");
+        let src = audio_path.clone();
+        let wav = tokio::task::spawn_blocking(move || {
+            silence_trim::extract_audio_to_temp_wav(&src)
+        })
+        .await
+        .map_err(|e| format!("Audio-extract task error: {}", e))??;
+        temp_upload_path = Some(wav.clone());
+        wav
     } else {
         audio_path.clone()
     };
@@ -1847,18 +1871,37 @@ pub async fn transcribe_deepgram(
         .unwrap_or_default();
     let job_id = job.id.clone();
 
+    // Never upload a video container — extract the audio track to a temp WAV.
+    let temp_upload_path: Option<PathBuf> = if is_video_file(&audio_path) {
+        emit_aai(&window, &job_id, &file_name, 0.02, "extracting audio");
+        let src = audio_path.clone();
+        let wav = tokio::task::spawn_blocking(move || {
+            silence_trim::extract_audio_to_temp_wav(&src)
+        })
+        .await
+        .map_err(|e| format!("Audio-extract task error: {}", e))??;
+        Some(wav)
+    } else {
+        None
+    };
+
     emit_aai(&window, &job_id, &file_name, 0.05, "uploading");
 
     let api_key = job.api_key.clone();
     let model = job.model.clone();
     let lang = job.language_code.clone();
-    let path_clone = audio_path.clone();
+    let path_clone = temp_upload_path.clone().unwrap_or_else(|| audio_path.clone());
 
     let response = tokio::task::spawn_blocking(move || {
         deepgram::transcribe(&path_clone, &api_key, &model, lang.as_deref())
     })
     .await
-    .map_err(|e| format!("Task error: {}", e))??;
+    .map_err(|e| format!("Task error: {}", e));
+
+    if let Some(p) = &temp_upload_path {
+        let _ = std::fs::remove_file(p);
+    }
+    let response = response??;
 
     if cancel_token.is_cancelled() {
         drop(permit);

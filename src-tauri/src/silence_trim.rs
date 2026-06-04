@@ -166,6 +166,17 @@ pub fn trim_audio_to_temp_wav(
     })
 }
 
+/// Decode the input file into a 16 kHz mono 16-bit PCM WAV in the OS temp dir,
+/// with no trimming. Used for video containers so only the audio track is
+/// uploaded to cloud engines, not the (much larger) video stream.
+pub fn extract_audio_to_temp_wav(audio_path: &Path) -> Result<PathBuf, String> {
+    let samples = crate::transcriber::audio_to_pcm(audio_path)?;
+    let temp_path = std::env::temp_dir()
+        .join(format!("murmur_extract_{}.wav", uuid::Uuid::new_v4()));
+    write_wav_16bit_mono_16k(&temp_path, &samples)?;
+    Ok(temp_path)
+}
+
 /// Translate a millisecond timestamp from the trimmed audio's timeline back to
 /// the original audio's timeline using the segment map.
 pub fn map_trimmed_ms_to_original_ms(trimmed_ms: u64, map: &[SegmentMap]) -> u64 {

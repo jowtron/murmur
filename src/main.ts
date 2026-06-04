@@ -1836,7 +1836,9 @@ document.getElementById("btn-feed-download")!.addEventListener("click", async ()
 btnAddFiles.addEventListener("click", async () => {
   const selected = await open({
     multiple: true,
-    filters: [{ name: "Audio", extensions: ["flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus"] }],
+    filters: [
+      { name: "Audio & Video", extensions: ["flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus", "mp4", "m4v", "mov"] },
+    ],
   });
   if (selected) {
     const paths = Array.isArray(selected) ? selected : [selected];
