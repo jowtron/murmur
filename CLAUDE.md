@@ -18,7 +18,7 @@ CMAKE_OSX_DEPLOYMENT_TARGET=10.15 MACOSX_DEPLOYMENT_TARGET=10.15 npx tauri build
 
 For a fast dev iteration: `cd src-tauri && cargo check` (~3s). Frontend typecheck: `npx tsc --noEmit`.
 
-Note: the project directory is still `whisper-transcriber/` for path-stability reasons even though the app is named Murmur. Cargo package, lib, and binary are all `murmur` now. Bundle identifier: `com.jowtron.murmur`. Data dir: `~/Library/Application Support/murmur/{models,sherpa-models,templates}` (one-shot startup migration in `lib.rs::migrate_legacy_data_dir` moves a legacy `whisper-transcriber/` dir over).
+Project lives at `/Users/joseph/Claude_Code/murmur/`. Cargo package, lib, and binary are all `murmur`. Bundle identifier: `com.jowtron.murmur`. Data dir: `~/Library/Application Support/murmur/{models,sherpa-models,templates}` (one-shot startup migration in `lib.rs::migrate_legacy_data_dir` moves a legacy `whisper-transcriber/` dir over).
 
 ## Layout
 
@@ -65,7 +65,7 @@ All diarization output uses the same `<basename>.diarized.{srt,txt,json}` naming
 - **HuggingFace LFS downloads can stall** mid-stream (signed-URL expiry, CDN timeouts). curl args include `--retry 5 --retry-all-errors --speed-limit 10000 --speed-time 30 -C -` for resilience. Partial files are kept (not deleted) on failure so the next attempt resumes.
 - **Distil model URLs are not on the ggerganov/whisper.cpp repo** — they live on the `distil-whisper` org with quirky filenames (e.g. `ggml-medium-32-2.en.bin` for distil-medium). `WhisperModel::url()` is per-variant.
 - **Sherpa-onnx requires 16 kHz mono f32 PCM exactly**. Reuse `transcriber::audio_to_pcm` (Rubato sinc resample) rather than rolling new decode.
-- **`tauri build` will fail** with a confusing error if invoked from anywhere other than the project root. Always `cd /Users/joseph/Claude_Code/audiobooks/whisper-transcriber` first.
+- **`tauri build` will fail** with a confusing error if invoked from anywhere other than the project root. Always `cd /Users/joseph/Claude_Code/murmur` first.
 - **AssemblyAI submit body** uses the **plural** `speech_models` array for priority routing, not the deprecated `speech_model` singular.
 - **YAMNet model load** is via `libloading` FFI to `libtensorflowlite_c.dylib`, not native bindings. There used to be an `ort`/ONNX implementation; that was removed.
 
