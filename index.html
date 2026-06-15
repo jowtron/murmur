@@ -32,6 +32,7 @@
           <select id="select-engine">
             <option value="whisper" selected>Whisper (local)</option>
             <option value="sherpa">Whisper + Sherpa (local diarization)</option>
+            <option value="whisper-aai">Whisper + AssemblyAI diarization (best quality)</option>
             <option value="assemblyai">AssemblyAI (cloud diarization)</option>
             <option value="deepgram">Deepgram (cloud diarization)</option>
           </select>
@@ -85,6 +86,10 @@
             <option value="3">3 files</option>
             <option value="4">4 files</option>
           </select>
+        </label>
+        <label class="diarize-count" title="How many distinct speakers are in the recording. Helps diarization labelling when the count is known (e.g. 2 for a two-person conversation). Blank = auto-detect. Used by AssemblyAI and Whisper + Sherpa.">
+          Speakers:
+          <input type="number" id="input-speakers-expected" min="1" max="10" step="1" placeholder="auto" class="speakers-input" />
         </label>
         <label class="whisper-only whisper-features chapters-only" title="Which LLM to use for chapter detection via OpenRouter API. Only used when detecting chapters — plain transcription never contacts an LLM.">
           LLM:
@@ -219,13 +224,9 @@
               </label>
             </div>
             <div style="display:flex;gap:12px;">
-              <label class="form-label" style="flex:1;" title="If you know exactly how many distinct speakers are in the file, enter it here. 0 means auto-detect using the threshold below.">
-                Sherpa speaker count (0 = auto):
-                <input type="number" id="input-sherpa-num-speakers" class="form-input" value="0" min="0" max="20" step="1" />
-              </label>
-              <label class="form-label" style="flex:1;" title="Clustering threshold. Lower = more speakers split apart, higher = more merged into one. 0.7 is a good default for clean audio with NeMo SpeakerNet. If Sherpa is finding way too many speakers, raise this to 0.8–0.9.">
+              <label class="form-label" style="flex:1;" title="Clustering threshold. Lower = more speakers split apart, higher = more merged into one. 0.5 is a good default for the WeSpeaker CAM++ embedding. If Sherpa is finding too many speakers, raise it; if it merges distinct voices, lower it. (Speaker count is set in the top bar's Speakers field; when set, this is ignored.)">
                 Sherpa clustering threshold:
-                <input type="number" id="input-sherpa-threshold" class="form-input" value="0.7" min="0.3" max="1.0" step="0.05" />
+                <input type="number" id="input-sherpa-threshold" class="form-input" value="0.5" min="0.3" max="1.0" step="0.05" />
               </label>
             </div>
             <h3 class="settings-section-title">Chapter Detection (LLM)</h3>
@@ -330,7 +331,7 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
                   <td>Free</td>
                   <td>Offline</td>
                   <td>Yes</td>
-                  <td>Whisper for text + Sherpa-onnx (pyannote + NeMo SpeakerNet) for speakers. Pick any Whisper model in the Model dropdown. ~28 MB model download on first use.</td>
+                  <td>Whisper for text + Sherpa-onnx (pyannote segmentation + WeSpeaker CAM++ embedding) for speakers. Pick any Whisper model in the Model dropdown. ~35 MB model download on first use.</td>
                 </tr>
                 <tr>
                   <td><strong>AssemblyAI</strong></td>
@@ -390,7 +391,7 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
             <p class="about-desc">Auto-downloaded on first use of the <strong>Whisper + Sherpa</strong> engine.</p>
             <ul class="about-list">
               <li><code>sherpa-onnx-pyannote-segmentation-3-0/model.onnx</code> — speech segmentation (~6 MB)</li>
-              <li><code>nemo_en_speakerverification_speakernet.onnx</code> — speaker embedding (~22 MB)</li>
+              <li><code>wespeaker_en_voxceleb_CAM++_LM.onnx</code> — speaker embedding (~29 MB)</li>
             </ul>
           </div>
         </div>

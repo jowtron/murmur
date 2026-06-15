@@ -57,7 +57,7 @@ interface ChapterWithSnap {
   snapped: boolean;
 }
 
-type Engine = "whisper" | "assemblyai" | "deepgram" | "sherpa";
+type Engine = "whisper" | "assemblyai" | "deepgram" | "sherpa" | "whisper-aai";
 
 interface QueueItem {
   id: string;
@@ -105,9 +105,27 @@ function loadSettings() {
     deepgramKey: localStorage.getItem("deepgram_api_key") || (document.getElementById("input-deepgram-key") as HTMLInputElement)?.value || "",
     deepgramModel: localStorage.getItem("deepgram_model") || "nova-3",
     deepgramLang: localStorage.getItem("deepgram_lang") ?? "en",
-    sherpaNumSpeakers: parseInt(localStorage.getItem("sherpa_num_speakers") || "0"),
-    sherpaThreshold: parseFloat(localStorage.getItem("sherpa_threshold") || "0.7"),
+    // Shared "Speakers expected" hint (top settings bar). Blank/0 = auto.
+    // Feeds AssemblyAI's speakers_expected and Sherpa's num_speakers.
+    speakersExpected: speakersExpectedValue(),
+    sherpaNumSpeakers: speakersExpectedValue() ?? 0,
+    sherpaThreshold: parseFloat(localStorage.getItem("sherpa_threshold") || "0.5"),
   };
+}
+
+/// Read the shared "Speakers" field. Returns a clamped 1..=10 integer, or null
+/// for blank/invalid (auto-detect). Reads the LIVE input element first so a
+/// value typed but not yet committed (no blur/change event) is still honoured
+/// at Transcribe time; falls back to saved prefs only if the element is absent.
+function speakersExpectedValue(): number | null {
+  const el = document.getElementById("input-speakers-expected") as HTMLInputElement | null;
+  const raw = (el?.value?.trim())
+    || localStorage.getItem("speakers_expected")
+    || localStorage.getItem("sherpa_num_speakers")
+    || "";
+  const n = parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 1) return null;
+  return Math.min(n, 10);
 }
 
 function assemblyaiSpeechModels(choice: string): string[] {
@@ -144,7 +162,6 @@ function saveSettings() {
   localStorage.setItem("deepgram_api_key", (document.getElementById("input-deepgram-key") as HTMLInputElement).value);
   localStorage.setItem("deepgram_model", (document.getElementById("select-deepgram-model") as HTMLSelectElement).value);
   localStorage.setItem("deepgram_lang", (document.getElementById("input-deepgram-lang") as HTMLInputElement).value);
-  localStorage.setItem("sherpa_num_speakers", (document.getElementById("input-sherpa-num-speakers") as HTMLInputElement).value);
   localStorage.setItem("sherpa_threshold", (document.getElementById("input-sherpa-threshold") as HTMLInputElement).value);
   const modelsText = (document.getElementById("input-llm-models") as HTMLTextAreaElement).value;
   localStorage.setItem("llm_models", modelsText);
@@ -186,6 +203,7 @@ const selectFormat = document.getElementById("select-format")! as HTMLSelectElem
 const selectOutput = document.getElementById("select-output")! as HTMLSelectElement;
 const selectThreads = document.getElementById("select-threads")! as HTMLSelectElement;
 const selectConcurrent = document.getElementById("select-concurrent")! as HTMLSelectElement;
+const inputSpeakersExpected = document.getElementById("input-speakers-expected")! as HTMLInputElement;
 const chkAutoChapters = document.getElementById("chk-auto-chapters")! as HTMLInputElement;
 const chkForceOverwrite = document.getElementById("chk-force-overwrite")! as HTMLInputElement;
 
@@ -226,6 +244,7 @@ function engineShort(e: Engine): string {
     case "assemblyai": return "AssemblyAI";
     case "deepgram": return "Deepgram";
     case "sherpa": return "Sherpa";
+    case "whisper-aai": return "Whisper+AAI";
     case "whisper":
     default: return "Whisper";
   }
@@ -235,6 +254,7 @@ function engineLabel(e: Engine): string {
     case "assemblyai": return "AssemblyAI cloud diarization";
     case "deepgram": return "Deepgram cloud diarization";
     case "sherpa": return "Whisper + Sherpa local diarization";
+    case "whisper-aai": return "Whisper text + AssemblyAI diarization";
     case "whisper":
     default: return "Whisper local transcription";
   }
@@ -304,7 +324,7 @@ function renderQueue() {
       <div class="actions">
         ${item.status === "transcribing" || item.status === "queued" || item.status === "detecting" ? `<button class="small danger btn-cancel" data-id="${item.id}">Cancel</button>` : ""}
         ${item.status === "error" || item.status === "cancelled" ? `<button class="small btn-retry" data-id="${item.id}">Retry</button>` : ""}
-        ${item.status === "complete" && (item.engine === "assemblyai" || item.engine === "deepgram" || item.engine === "sherpa") && item.diarizedJsonPath ? `<button class="small btn-speakers" data-id="${item.id}">Identify speakers</button>` : ""}
+        ${item.status === "complete" && (item.engine === "assemblyai" || item.engine === "deepgram" || item.engine === "sherpa" || item.engine === "whisper-aai") && item.diarizedJsonPath ? `<button class="small btn-speakers" data-id="${item.id}">Identify speakers</button>` : ""}
         ${item.status === "complete" && item.engine === "whisper" ? `<button class="small btn-reprocess" data-id="${item.id}">Reprocess</button>` : ""}
         ${item.status !== "transcribing" && item.status !== "detecting" ? `<button class="small danger btn-remove" data-id="${item.id}">&times;</button>` : ""}
       </div>
@@ -775,6 +795,7 @@ async function transcribeItemAssemblyAI(item: QueueItem) {
         output_dir: customOutputDir,
         language_code: langTrimmed || null,
         speech_models: assemblyaiSpeechModels(settings.assemblyaiModel),
+        speakers_expected: settings.speakersExpected,
         trim_silence: settings.assemblyaiTrimSilence,
         silence_threshold_db: settings.assemblyaiSilenceDb,
         min_silence_secs: settings.assemblyaiMinSilenceSecs,
@@ -806,6 +827,98 @@ async function transcribeItemAssemblyAI(item: QueueItem) {
   renderQueue();
 
   if (item.status === "complete" && item.engine === "assemblyai" && item.diarizedJsonPath) {
+    const modal = document.getElementById("speakers-modal");
+    if (modal && modal.classList.contains("hidden")) {
+      openSpeakerModal(item);
+    }
+  }
+}
+
+async function transcribeItemWhisperAai(item: QueueItem) {
+  const model = selectModel.value;
+  const threads = parseInt(selectThreads.value);
+  item.modelUsed = `${model} + AssemblyAI`;
+  item.error = undefined;
+  renderQueue();
+
+  const settings = loadSettings();
+  if (!settings.assemblyaiKey) {
+    item.status = "error";
+    item.error = "AssemblyAI API key is not set. Open Settings to add it.";
+    renderQueue();
+    return;
+  }
+
+  try {
+    if (item.status === "cancelled" || !queue.includes(item)) return;
+
+    const alreadyExists = await checkOutputExists("check_diarization_exists", {
+      path: item.path,
+      engine: "whisper-aai",
+      outputDir: customOutputDir || null,
+    });
+
+    if (alreadyExists) {
+      const stem = item.path.replace(/\.[^./]+$/, "").split("/").pop() || "";
+      const dir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
+      item.diarizedSrtPath = `${dir}/${stem}.diarized.whisper-aai.srt`;
+      item.diarizedJsonPath = `${dir}/${stem}.diarized.whisper-aai.json`;
+      item.diarizedTxtPath = `${dir}/${stem}.diarized.whisper-aai.txt`;
+      item.status = "complete";
+      item.progress = 1.0;
+      renderQueue();
+      return;
+    }
+
+    item.status = "queued";
+    item.progress = 0;
+    item.startedAt = undefined;
+    item.elapsed = undefined;
+    renderQueue();
+
+    const langTrimmed = (settings.assemblyaiLang || "").trim();
+    const result = await invoke<AssemblyAIResult>("transcribe_whisper_aai", {
+      job: {
+        id: item.id,
+        path: item.path,
+        api_key: settings.assemblyaiKey,
+        output_dir: customOutputDir,
+        language_code: langTrimmed || null,
+        speech_models: assemblyaiSpeechModels(settings.assemblyaiModel),
+        speakers_expected: settings.speakersExpected,
+        trim_silence: settings.assemblyaiTrimSilence,
+        silence_threshold_db: settings.assemblyaiSilenceDb,
+        min_silence_secs: settings.assemblyaiMinSilenceSecs,
+        silence_padding_secs: settings.assemblyaiSilencePadSecs,
+        model,
+        threads,
+      },
+    });
+
+    item.speakerCount = result.speaker_count;
+    item.diarizedSrtPath = result.srt_path;
+    item.diarizedJsonPath = result.json_path;
+    item.diarizedTxtPath = result.txt_path;
+    item.elapsed = Date.now() - (item.startedAt || Date.now());
+
+    if ((item.status as string) !== "cancelled") {
+      item.status = "complete";
+      item.progress = 1.0;
+    }
+  } catch (err: any) {
+    item.elapsed = item.startedAt ? Date.now() - item.startedAt : undefined;
+    const errMsg = typeof err === "string" ? err : err?.message || "Unknown error";
+    if (errMsg === "Cancelled") {
+      item.status = "cancelled";
+      item.error = "Cancelled by user";
+    } else {
+      item.status = "error";
+      item.error = errMsg;
+    }
+  }
+  renderQueue();
+
+  if (item.status === "complete" && item.engine === "whisper-aai" && item.diarizedJsonPath) {
     const modal = document.getElementById("speakers-modal");
     if (modal && modal.classList.contains("hidden")) {
       openSpeakerModal(item);
@@ -1281,6 +1394,10 @@ async function transcribeItem(item: QueueItem) {
     await transcribeItemSherpa(item);
     return;
   }
+  if (item.engine === "whisper-aai") {
+    await transcribeItemWhisperAai(item);
+    return;
+  }
 
   const model = selectModel.value;
   const format = selectFormat.value;
@@ -1369,13 +1486,43 @@ async function transcribeAll() {
   const pendingItems = queue.filter((q) => q.status === "pending");
   if (pendingItems.length === 0) return;
 
+  // Reconcile queued engines against the current dropdown. Items are stamped
+  // with the engine selected at add-time; if the dropdown now says something
+  // else, the user almost certainly means "run these with the selected engine".
+  // Offer to re-stamp before doing anything (esp. important so a local file is
+  // never silently sent to a cloud engine, or vice-versa).
+  const selectedEngine = (selectEngine.value as Engine) || "whisper";
+  const mismatched = pendingItems.filter((i) => i.engine !== selectedEngine);
+  if (mismatched.length > 0) {
+    const fromLabel = engineShort(mismatched[0].engine);
+    const allSameFrom = mismatched.every((i) => i.engine === mismatched[0].engine);
+    const fromText = allSameFrom ? fromLabel : "a different engine";
+    const switchThem = await ask(
+      `${mismatched.length} pending file(s) were queued with ${fromText}, but ` +
+      `${engineShort(selectedEngine)} is now selected.\n\n` +
+      `Switch them to ${engineShort(selectedEngine)}?\n\n` +
+      `(Yes = run everything with ${engineShort(selectedEngine)}. ` +
+      `No = run each file with the engine it was queued with.)`,
+      { title: "Engine mismatch", kind: "warning" }
+    );
+    if (switchThem) {
+      mismatched.forEach((i) => {
+        i.engine = selectedEngine;
+        // Chapter detection is a Whisper-only feature; clear it otherwise.
+        i.autoDetectChapters = selectedEngine === "whisper" && chkAutoChapters.checked;
+      });
+      renderQueue();
+    }
+  }
+
   const whisperItems = pendingItems.filter((i) => i.engine === "whisper");
   const aaiItems = pendingItems.filter((i) => i.engine === "assemblyai");
   const dgItems = pendingItems.filter((i) => i.engine === "deepgram");
   const sherpaItems = pendingItems.filter((i) => i.engine === "sherpa");
+  const whisperAaiItems = pendingItems.filter((i) => i.engine === "whisper-aai");
 
-  // Sherpa needs the Whisper model too
-  if (whisperItems.length > 0 || sherpaItems.length > 0) {
+  // Sherpa and Whisper+AAI both run a local Whisper pass, so they need the model.
+  if (whisperItems.length > 0 || sherpaItems.length > 0 || whisperAaiItems.length > 0) {
     const modelReady = await checkModelAndPromptDownload(model);
     if (!modelReady) return;
   }
@@ -1397,12 +1544,15 @@ async function transcribeAll() {
   }
 
   const settings = loadSettings();
-  if (aaiItems.length > 0) {
+  // Whisper+AAI also bills AssemblyAI for diarization — fold it into the same
+  // key check and cost confirmation as plain AssemblyAI jobs.
+  const aaiBilledItems = [...aaiItems, ...whisperAaiItems];
+  if (aaiBilledItems.length > 0) {
     if (!settings.assemblyaiKey) {
       alert("AssemblyAI API key is not set. Open Settings to add it before submitting AssemblyAI jobs.");
       return;
     }
-    if (!(await confirmAssemblyAICost(aaiItems))) return;
+    if (!(await confirmAssemblyAICost(aaiBilledItems))) return;
   }
   if (dgItems.length > 0) {
     if (!settings.deepgramKey) {
@@ -1989,7 +2139,6 @@ function loadSettingsIntoForm() {
   (document.getElementById("input-deepgram-key") as HTMLInputElement).value = s.deepgramKey;
   (document.getElementById("select-deepgram-model") as HTMLSelectElement).value = s.deepgramModel;
   (document.getElementById("input-deepgram-lang") as HTMLInputElement).value = s.deepgramLang;
-  (document.getElementById("input-sherpa-num-speakers") as HTMLInputElement).value = String(s.sherpaNumSpeakers);
   (document.getElementById("input-sherpa-threshold") as HTMLInputElement).value = String(s.sherpaThreshold);
   (document.getElementById("input-llm-models") as HTMLTextAreaElement).value = s.llmModels;
   (document.getElementById("input-api-url") as HTMLInputElement).value = s.apiUrl;
@@ -2530,6 +2679,7 @@ function savePreferences() {
   localStorage.setItem("pref_srt_correct", chkSrtCorrect.checked ? "1" : "0");
   localStorage.setItem("pref_per_word", chkPerWord.checked ? "1" : "0");
   localStorage.setItem("pref_first_zero", chkFirstZero.checked ? "1" : "0");
+  localStorage.setItem("speakers_expected", inputSpeakersExpected.value.trim());
 }
 
 function loadPreferences() {
@@ -2557,18 +2707,33 @@ function loadPreferences() {
   if (perWord !== null) chkPerWord.checked = perWord === "1";
   const firstZero = localStorage.getItem("pref_first_zero");
   if (firstZero !== null) chkFirstZero.checked = firstZero === "1";
+  const speakers = localStorage.getItem("speakers_expected") ?? localStorage.getItem("sherpa_num_speakers");
+  if (speakers !== null && speakers !== "0") inputSpeakersExpected.value = speakers;
+
+  // One-time migration: the Sherpa embedding moved from NeMo SpeakerNet to
+  // WeSpeaker CAM++, which lives in a different distance space. Clear any saved
+  // SpeakerNet-era threshold so the new CAM++ default (0.5) takes effect. Users
+  // who deliberately tuned it afterward keep their value (flag set below).
+  if (localStorage.getItem("sherpa_embed_ver") !== "campp_lm") {
+    localStorage.removeItem("sherpa_threshold");
+    localStorage.setItem("sherpa_embed_ver", "campp_lm");
+  }
 }
 
 function applyEngineUI() {
   const bar = document.querySelector(".settings-bar");
   if (!bar) return;
-  bar.classList.remove("engine-assemblyai", "engine-deepgram", "engine-sherpa", "engine-cloud");
+  bar.classList.remove("engine-assemblyai", "engine-deepgram", "engine-sherpa", "engine-whisper-aai", "engine-cloud");
   if (selectEngine.value === "assemblyai") {
     bar.classList.add("engine-assemblyai", "engine-cloud");
   } else if (selectEngine.value === "deepgram") {
     bar.classList.add("engine-deepgram", "engine-cloud");
   } else if (selectEngine.value === "sherpa") {
     bar.classList.add("engine-sherpa");
+  } else if (selectEngine.value === "whisper-aai") {
+    // Like Sherpa: local Whisper runs (Model/Threads active), but plain-Whisper
+    // formats/chapters don't apply, and the Speakers hint feeds AAI diarization.
+    bar.classList.add("engine-whisper-aai");
   }
   bar.classList.toggle("no-auto-chapters", !chkAutoChapters.checked);
 }
@@ -2581,6 +2746,7 @@ selectModel.addEventListener("change", savePreferences);
 selectFormat.addEventListener("change", savePreferences);
 selectThreads.addEventListener("change", savePreferences);
 selectConcurrent.addEventListener("change", savePreferences);
+inputSpeakersExpected.addEventListener("change", savePreferences);
 chkAutoChapters.addEventListener("change", () => {
   savePreferences();
   applyEngineUI();

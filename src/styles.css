@@ -272,13 +272,15 @@ select, input[type="text"], input[type="password"] {
 }
 
 .settings-bar.engine-cloud .whisper-only,
-.settings-bar.engine-sherpa .whisper-features {
+.settings-bar.engine-sherpa .whisper-features,
+.settings-bar.engine-whisper-aai .whisper-features {
   opacity: 0.35;
   transition: opacity 0.15s ease;
 }
 
 .settings-bar.engine-cloud .whisper-only:hover,
-.settings-bar.engine-sherpa .whisper-features:hover {
+.settings-bar.engine-sherpa .whisper-features:hover,
+.settings-bar.engine-whisper-aai .whisper-features:hover {
   opacity: 0.6;
 }
 
@@ -291,6 +293,21 @@ select, input[type="text"], input[type="password"] {
 
 .settings-bar.no-auto-chapters .chapters-only:hover {
   opacity: 0.6;
+}
+
+/* "Speakers expected" hint only applies to diarization engines that accept a
+   count (AssemblyAI, Whisper + Sherpa). Dim it for Whisper and Deepgram. */
+.settings-bar .diarize-count {
+  opacity: 0.35;
+  transition: opacity 0.15s ease;
+}
+.settings-bar.engine-assemblyai .diarize-count,
+.settings-bar.engine-sherpa .diarize-count,
+.settings-bar.engine-whisper-aai .diarize-count {
+  opacity: 1;
+}
+.speakers-input {
+  width: 4.5em;
 }
 
 /* Highlight the queue while dragging files over the window */
@@ -332,6 +349,12 @@ body.drag-over .queue-list {
   background: rgba(168, 85, 247, 0.15);
   color: #c084fc;
   border: 1px solid rgba(168, 85, 247, 0.4);
+}
+
+.engine-badge.engine-whisper-aai {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.4);
 }
 
 .speaker-badge {

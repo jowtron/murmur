@@ -92,6 +92,7 @@ pub fn submit(
     api_key: &str,
     language_code: Option<&str>,
     speech_models: &[String],
+    speakers_expected: Option<u32>,
 ) -> Result<String, String> {
     let auth = format!("Authorization: {}", api_key);
     let url = format!("{}/transcript", API_BASE);
@@ -104,6 +105,15 @@ pub fn submit(
     });
     if let Some(lc) = language_code {
         body["language_code"] = serde_json::Value::String(lc.to_string());
+    }
+    // Hint the diarizer how many distinct speakers to expect. Known-count
+    // recordings (e.g. a 2-person walkthrough) label far more cleanly with
+    // this set. Clamped to AssemblyAI's accepted 1..=10 range; out-of-range
+    // or 0 is treated as "auto" (omit the field).
+    if let Some(n) = speakers_expected {
+        if (1..=10).contains(&n) {
+            body["speakers_expected"] = serde_json::Value::Number(n.into());
+        }
     }
     if !speech_models.is_empty() {
         body["speech_models"] = serde_json::Value::Array(
@@ -184,4 +194,60 @@ pub fn utterances_to_text(utts: &[Utterance]) -> String {
         out.push_str(&format!("Speaker {}: {}\n\n", u.speaker, u.text.trim()));
     }
     out
+}
+
+/// Hybrid "Whisper + AssemblyAI diarization": assign each Whisper segment to the
+/// AssemblyAI speaker whose utterance overlaps it most. AssemblyAI's clean,
+/// long speaker turns drive the labels; Whisper's higher-quality text is kept.
+/// AAI's speaker labels ("A", "B", ...) are preserved so the rename modal works.
+/// Whisper segment times are seconds; AAI utterance times are milliseconds.
+pub fn assign_whisper_to_utterances(
+    whisper_segments: &[(f64, f64, String)],
+    utterances: &[Utterance],
+) -> Vec<(f64, f64, String, String)> {
+    whisper_segments
+        .iter()
+        .map(|(ws, we, text)| {
+            let ws_ms = ws * 1000.0;
+            let we_ms = we * 1000.0;
+            let mut best = String::from("A");
+            let mut best_overlap = 0.0_f64;
+            for u in utterances {
+                let overlap = (we_ms.min(u.end as f64) - ws_ms.max(u.start as f64)).max(0.0);
+                if overlap > best_overlap {
+                    best_overlap = overlap;
+                    best = u.speaker.clone();
+                }
+            }
+            (*ws, *we, text.clone(), best)
+        })
+        .collect()
+}
+
+/// AssemblyAI-shape JSON for the hybrid engine, so the speaker-rename modal works
+/// uniformly. `segs` are (start_s, end_s, text, speaker_label).
+pub fn merged_to_json(
+    segs: &[(f64, f64, String, String)],
+    duration: f64,
+    whisper_model: &str,
+) -> serde_json::Value {
+    let utterances: Vec<serde_json::Value> = segs
+        .iter()
+        .map(|(start, end, text, speaker)| {
+            serde_json::json!({
+                "start": (start * 1000.0).round() as u64,
+                "end": (end * 1000.0).round() as u64,
+                "text": text.trim(),
+                "speaker": speaker,
+            })
+        })
+        .collect();
+
+    serde_json::json!({
+        // Text from local Whisper, speaker turns from AssemblyAI's diarizer.
+        "engine": "whisper-assemblyai",
+        "whisper_model": whisper_model,
+        "audio_duration": duration,
+        "utterances": utterances,
+    })
 }

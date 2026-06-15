@@ -22,6 +22,16 @@ pub fn segmentation_path() -> PathBuf {
 }
 
 pub fn embedding_path() -> PathBuf {
+    // WeSpeaker CAM++ (English VoxCeleb, large-margin finetuned) — current
+    // state-of-the-art open speaker embedding. Replaced the older, weaker
+    // NeMo SpeakerNet. CAM++ lives in a different embedding space, so the
+    // clustering threshold default was re-tuned (~0.5, see `diarize`).
+    models_dir().join("wespeaker_en_voxceleb_CAM++_LM.onnx")
+}
+
+/// Legacy SpeakerNet embedding path — kept only so a one-time cleanup can
+/// remove the orphaned 23 MB file after the upgrade to CAM++.
+pub fn legacy_embedding_path() -> PathBuf {
     models_dir().join("nemo_en_speakerverification_speakernet.onnx")
 }
 
@@ -34,9 +44,9 @@ pub fn models_ready() -> bool {
 ///
 /// `num_speakers` — if > 0, force clustering to this exact count (use when you know
 ///   how many speakers are in the file). If 0, the threshold is used to auto-cluster.
-/// `threshold` — distance threshold for the FastClustering algorithm. With the NeMo
-///   SpeakerNet embedding, ~0.7 works well for clean two-speaker conversations;
-///   lower values (0.5) over-split, higher values (0.9+) over-merge.
+/// `threshold` — distance threshold for the FastClustering algorithm. With the
+///   WeSpeaker CAM++ embedding, ~0.5 works well for clean conversations; lower
+///   values over-split, higher values over-merge. (Ignored when num_speakers > 0.)
 pub fn diarize(
     samples_16k_mono: &[f32],
     num_speakers: i32,
@@ -205,11 +215,22 @@ pub fn segments_to_text(segs: &[(f64, f64, String, String)]) -> String {
     out
 }
 
+/// Human-readable identity of the speaker-embedding model currently in use,
+/// derived from the on-disk filename so it can never drift from reality.
+pub fn embedding_model_id() -> String {
+    embedding_path()
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 /// Output JSON in AssemblyAI-style utterance shape so the speaker rename modal works as-is.
 pub fn segments_to_aai_json(
     segs: &[(f64, f64, String, String)],
     duration: f64,
     whisper_model: &str,
+    num_speakers: i32,
+    threshold: f32,
 ) -> serde_json::Value {
     let utterances: Vec<serde_json::Value> = segs
         .iter()
@@ -226,6 +247,11 @@ pub fn segments_to_aai_json(
     serde_json::json!({
         "engine": "sherpa-onnx",
         "whisper_model": whisper_model,
+        // Diarization provenance — so an output file self-documents exactly how
+        // it was produced and you can tell which embedding/settings were used.
+        "embedding_model": embedding_model_id(),
+        "diarization_num_speakers": if num_speakers > 0 { serde_json::json!(num_speakers) } else { serde_json::json!("auto") },
+        "diarization_threshold": threshold,
         "audio_duration": duration,
         "utterances": utterances,
     })
