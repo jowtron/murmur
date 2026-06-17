@@ -272,15 +272,13 @@ select, input[type="text"], input[type="password"] {
 }
 
 .settings-bar.engine-cloud .whisper-only,
-.settings-bar.engine-sherpa .whisper-features,
-.settings-bar.engine-whisper-aai .whisper-features {
+.settings-bar.engine-sherpa .whisper-features {
   opacity: 0.35;
   transition: opacity 0.15s ease;
 }
 
 .settings-bar.engine-cloud .whisper-only:hover,
-.settings-bar.engine-sherpa .whisper-features:hover,
-.settings-bar.engine-whisper-aai .whisper-features:hover {
+.settings-bar.engine-sherpa .whisper-features:hover {
   opacity: 0.6;
 }
 
@@ -302,12 +300,22 @@ select, input[type="text"], input[type="password"] {
   transition: opacity 0.15s ease;
 }
 .settings-bar.engine-assemblyai .diarize-count,
-.settings-bar.engine-sherpa .diarize-count,
-.settings-bar.engine-whisper-aai .diarize-count {
+.settings-bar.engine-sherpa .diarize-count {
   opacity: 1;
 }
 .speakers-input {
   width: 4.5em;
+}
+
+/* Build identifier in the header — small and muted, just for "which build". */
+.build-info {
+  margin-left: auto;
+  align-self: center;
+  font-size: 0.7rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-muted, #888);
+  opacity: 0.7;
+  user-select: text;
 }
 
 /* Highlight the queue while dragging files over the window */
@@ -349,12 +357,6 @@ body.drag-over .queue-list {
   background: rgba(168, 85, 247, 0.15);
   color: #c084fc;
   border: 1px solid rgba(168, 85, 247, 0.4);
-}
-
-.engine-badge.engine-whisper-aai {
-  background: rgba(245, 158, 11, 0.15);
-  color: #fbbf24;
-  border: 1px solid rgba(245, 158, 11, 0.4);
 }
 
 .speaker-badge {

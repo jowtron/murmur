@@ -21,6 +21,7 @@
           <button id="btn-settings" title="Configure API key, LLM models, prompts, and chapter detection settings">Settings</button>
           <button id="btn-models" title="Download and manage Whisper transcription models">Models</button>
           <button id="btn-about" class="btn-about" title="About engines and models">?</button>
+          <span id="build-info" class="build-info" title="Running build (git hash · build time)"></span>
         </div>
       </header>
 
@@ -32,7 +33,6 @@
           <select id="select-engine">
             <option value="whisper" selected>Whisper (local)</option>
             <option value="sherpa">Whisper + Sherpa (local diarization)</option>
-            <option value="whisper-aai">Whisper + AssemblyAI diarization (best quality)</option>
             <option value="assemblyai">AssemblyAI (cloud diarization)</option>
             <option value="deepgram">Deepgram (cloud diarization)</option>
           </select>

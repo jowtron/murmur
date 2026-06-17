@@ -85,7 +85,6 @@ pub fn run() {
             commands::check_diarization_exists,
             commands::transcribe_deepgram,
             commands::transcribe_sherpa,
-            commands::transcribe_whisper_aai,
             commands::sherpa_models_ready,
             commands::sherpa_models_dir,
             commands::download_sherpa_models,

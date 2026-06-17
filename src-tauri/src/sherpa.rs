@@ -141,6 +141,33 @@ pub fn assign_speakers_to_segments(
         .collect()
 }
 
+/// Merge consecutive segments that share a speaker into a single turn, so output
+/// reads as one paragraph per speaker turn instead of one line per tiny Whisper
+/// segment. Mirrors how AssemblyAI groups consecutive same-speaker words into an
+/// utterance — without this, word-level Whisper segments produce a wall of
+/// one-line "Speaker: 3 words" fragments. Applies to every diarization engine.
+pub fn coalesce_by_speaker(
+    segs: &[(f64, f64, String, String)],
+) -> Vec<(f64, f64, String, String)> {
+    let mut out: Vec<(f64, f64, String, String)> = Vec::new();
+    for (start, end, text, speaker) in segs {
+        let t = text.trim();
+        match out.last_mut() {
+            Some(last) if &last.3 == speaker => {
+                last.1 = *end;
+                if !t.is_empty() {
+                    if !last.2.is_empty() {
+                        last.2.push(' ');
+                    }
+                    last.2.push_str(t);
+                }
+            }
+            _ => out.push((*start, *end, t.to_string(), speaker.clone())),
+        }
+    }
+    out
+}
+
 pub fn speaker_letter(n: i32) -> String {
     let n = if n < 0 { 0 } else { n };
     let c = (b'A' + (n as u8 % 26)) as char;

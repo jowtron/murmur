@@ -3,6 +3,13 @@ import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open, ask } from "@tauri-apps/plugin-dialog";
 
+// Injected by Vite at build time (vite.config.ts): "<git-hash>[-dirty] · MM-DD HH:MM".
+declare const __BUILD_ID__: string;
+{
+  const el = document.getElementById("build-info");
+  if (el) el.textContent = __BUILD_ID__;
+}
+
 interface ModelInfo {
   name: string;
   display_name: string;
@@ -57,7 +64,7 @@ interface ChapterWithSnap {
   snapped: boolean;
 }
 
-type Engine = "whisper" | "assemblyai" | "deepgram" | "sherpa" | "whisper-aai";
+type Engine = "whisper" | "assemblyai" | "deepgram" | "sherpa";
 
 interface QueueItem {
   id: string;
@@ -244,7 +251,6 @@ function engineShort(e: Engine): string {
     case "assemblyai": return "AssemblyAI";
     case "deepgram": return "Deepgram";
     case "sherpa": return "Sherpa";
-    case "whisper-aai": return "Whisper+AAI";
     case "whisper":
     default: return "Whisper";
   }
@@ -254,7 +260,6 @@ function engineLabel(e: Engine): string {
     case "assemblyai": return "AssemblyAI cloud diarization";
     case "deepgram": return "Deepgram cloud diarization";
     case "sherpa": return "Whisper + Sherpa local diarization";
-    case "whisper-aai": return "Whisper text + AssemblyAI diarization";
     case "whisper":
     default: return "Whisper local transcription";
   }
@@ -324,7 +329,7 @@ function renderQueue() {
       <div class="actions">
         ${item.status === "transcribing" || item.status === "queued" || item.status === "detecting" ? `<button class="small danger btn-cancel" data-id="${item.id}">Cancel</button>` : ""}
         ${item.status === "error" || item.status === "cancelled" ? `<button class="small btn-retry" data-id="${item.id}">Retry</button>` : ""}
-        ${item.status === "complete" && (item.engine === "assemblyai" || item.engine === "deepgram" || item.engine === "sherpa" || item.engine === "whisper-aai") && item.diarizedJsonPath ? `<button class="small btn-speakers" data-id="${item.id}">Identify speakers</button>` : ""}
+        ${item.status === "complete" && (item.engine === "assemblyai" || item.engine === "deepgram" || item.engine === "sherpa") && item.diarizedJsonPath ? `<button class="small btn-speakers" data-id="${item.id}">Identify speakers</button>` : ""}
         ${item.status === "complete" && item.engine === "whisper" ? `<button class="small btn-reprocess" data-id="${item.id}">Reprocess</button>` : ""}
         ${item.status !== "transcribing" && item.status !== "detecting" ? `<button class="small danger btn-remove" data-id="${item.id}">&times;</button>` : ""}
       </div>
@@ -834,98 +839,6 @@ async function transcribeItemAssemblyAI(item: QueueItem) {
   }
 }
 
-async function transcribeItemWhisperAai(item: QueueItem) {
-  const model = selectModel.value;
-  const threads = parseInt(selectThreads.value);
-  item.modelUsed = `${model} + AssemblyAI`;
-  item.error = undefined;
-  renderQueue();
-
-  const settings = loadSettings();
-  if (!settings.assemblyaiKey) {
-    item.status = "error";
-    item.error = "AssemblyAI API key is not set. Open Settings to add it.";
-    renderQueue();
-    return;
-  }
-
-  try {
-    if (item.status === "cancelled" || !queue.includes(item)) return;
-
-    const alreadyExists = await checkOutputExists("check_diarization_exists", {
-      path: item.path,
-      engine: "whisper-aai",
-      outputDir: customOutputDir || null,
-    });
-
-    if (alreadyExists) {
-      const stem = item.path.replace(/\.[^./]+$/, "").split("/").pop() || "";
-      const dir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
-      item.diarizedSrtPath = `${dir}/${stem}.diarized.whisper-aai.srt`;
-      item.diarizedJsonPath = `${dir}/${stem}.diarized.whisper-aai.json`;
-      item.diarizedTxtPath = `${dir}/${stem}.diarized.whisper-aai.txt`;
-      item.status = "complete";
-      item.progress = 1.0;
-      renderQueue();
-      return;
-    }
-
-    item.status = "queued";
-    item.progress = 0;
-    item.startedAt = undefined;
-    item.elapsed = undefined;
-    renderQueue();
-
-    const langTrimmed = (settings.assemblyaiLang || "").trim();
-    const result = await invoke<AssemblyAIResult>("transcribe_whisper_aai", {
-      job: {
-        id: item.id,
-        path: item.path,
-        api_key: settings.assemblyaiKey,
-        output_dir: customOutputDir,
-        language_code: langTrimmed || null,
-        speech_models: assemblyaiSpeechModels(settings.assemblyaiModel),
-        speakers_expected: settings.speakersExpected,
-        trim_silence: settings.assemblyaiTrimSilence,
-        silence_threshold_db: settings.assemblyaiSilenceDb,
-        min_silence_secs: settings.assemblyaiMinSilenceSecs,
-        silence_padding_secs: settings.assemblyaiSilencePadSecs,
-        model,
-        threads,
-      },
-    });
-
-    item.speakerCount = result.speaker_count;
-    item.diarizedSrtPath = result.srt_path;
-    item.diarizedJsonPath = result.json_path;
-    item.diarizedTxtPath = result.txt_path;
-    item.elapsed = Date.now() - (item.startedAt || Date.now());
-
-    if ((item.status as string) !== "cancelled") {
-      item.status = "complete";
-      item.progress = 1.0;
-    }
-  } catch (err: any) {
-    item.elapsed = item.startedAt ? Date.now() - item.startedAt : undefined;
-    const errMsg = typeof err === "string" ? err : err?.message || "Unknown error";
-    if (errMsg === "Cancelled") {
-      item.status = "cancelled";
-      item.error = "Cancelled by user";
-    } else {
-      item.status = "error";
-      item.error = errMsg;
-    }
-  }
-  renderQueue();
-
-  if (item.status === "complete" && item.engine === "whisper-aai" && item.diarizedJsonPath) {
-    const modal = document.getElementById("speakers-modal");
-    if (modal && modal.classList.contains("hidden")) {
-      openSpeakerModal(item);
-    }
-  }
-}
-
 interface AAIUtterance {
   start: number;
   end: number;
@@ -1394,10 +1307,6 @@ async function transcribeItem(item: QueueItem) {
     await transcribeItemSherpa(item);
     return;
   }
-  if (item.engine === "whisper-aai") {
-    await transcribeItemWhisperAai(item);
-    return;
-  }
 
   const model = selectModel.value;
   const format = selectFormat.value;
@@ -1519,10 +1428,9 @@ async function transcribeAll() {
   const aaiItems = pendingItems.filter((i) => i.engine === "assemblyai");
   const dgItems = pendingItems.filter((i) => i.engine === "deepgram");
   const sherpaItems = pendingItems.filter((i) => i.engine === "sherpa");
-  const whisperAaiItems = pendingItems.filter((i) => i.engine === "whisper-aai");
 
-  // Sherpa and Whisper+AAI both run a local Whisper pass, so they need the model.
-  if (whisperItems.length > 0 || sherpaItems.length > 0 || whisperAaiItems.length > 0) {
+  // Sherpa needs the Whisper model too
+  if (whisperItems.length > 0 || sherpaItems.length > 0) {
     const modelReady = await checkModelAndPromptDownload(model);
     if (!modelReady) return;
   }
@@ -1544,15 +1452,12 @@ async function transcribeAll() {
   }
 
   const settings = loadSettings();
-  // Whisper+AAI also bills AssemblyAI for diarization — fold it into the same
-  // key check and cost confirmation as plain AssemblyAI jobs.
-  const aaiBilledItems = [...aaiItems, ...whisperAaiItems];
-  if (aaiBilledItems.length > 0) {
+  if (aaiItems.length > 0) {
     if (!settings.assemblyaiKey) {
       alert("AssemblyAI API key is not set. Open Settings to add it before submitting AssemblyAI jobs.");
       return;
     }
-    if (!(await confirmAssemblyAICost(aaiBilledItems))) return;
+    if (!(await confirmAssemblyAICost(aaiItems))) return;
   }
   if (dgItems.length > 0) {
     if (!settings.deepgramKey) {
@@ -2723,17 +2628,13 @@ function loadPreferences() {
 function applyEngineUI() {
   const bar = document.querySelector(".settings-bar");
   if (!bar) return;
-  bar.classList.remove("engine-assemblyai", "engine-deepgram", "engine-sherpa", "engine-whisper-aai", "engine-cloud");
+  bar.classList.remove("engine-assemblyai", "engine-deepgram", "engine-sherpa", "engine-cloud");
   if (selectEngine.value === "assemblyai") {
     bar.classList.add("engine-assemblyai", "engine-cloud");
   } else if (selectEngine.value === "deepgram") {
     bar.classList.add("engine-deepgram", "engine-cloud");
   } else if (selectEngine.value === "sherpa") {
     bar.classList.add("engine-sherpa");
-  } else if (selectEngine.value === "whisper-aai") {
-    // Like Sherpa: local Whisper runs (Model/Threads active), but plain-Whisper
-    // formats/chapters don't apply, and the Speakers hint feeds AAI diarization.
-    bar.classList.add("engine-whisper-aai");
   }
   bar.classList.toggle("no-auto-chapters", !chkAutoChapters.checked);
 }
