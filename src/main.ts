@@ -18,6 +18,14 @@ interface ModelInfo {
   size_bytes: number;
 }
 
+// Shape returned by transcribe_file / transcribe_parakeet (Rust TranscriptionResult).
+interface TranscriptionResult {
+  file: string;
+  segments: { start: number; end: number; text: string }[];
+  text: string;
+  duration_secs: number;
+}
+
 interface TranscriptionProgress {
   job_id: string;
   file: string;
@@ -64,7 +72,7 @@ interface ChapterWithSnap {
   snapped: boolean;
 }
 
-type Engine = "whisper" | "assemblyai" | "deepgram" | "sherpa";
+type Engine = "whisper" | "assemblyai" | "deepgram" | "sherpa" | "parakeet" | "parakeet-sherpa" | "compare-local";
 
 interface QueueItem {
   id: string;
@@ -251,6 +259,9 @@ function engineShort(e: Engine): string {
     case "assemblyai": return "AssemblyAI";
     case "deepgram": return "Deepgram";
     case "sherpa": return "Sherpa";
+    case "parakeet": return "Parakeet";
+    case "parakeet-sherpa": return "Parakeet+Sherpa";
+    case "compare-local": return "Compare";
     case "whisper":
     default: return "Whisper";
   }
@@ -260,6 +271,9 @@ function engineLabel(e: Engine): string {
     case "assemblyai": return "AssemblyAI cloud diarization";
     case "deepgram": return "Deepgram cloud diarization";
     case "sherpa": return "Whisper + Sherpa local diarization";
+    case "parakeet": return "Parakeet local transcription";
+    case "parakeet-sherpa": return "Parakeet + Sherpa local diarization";
+    case "compare-local": return "Compare all downloaded local transcription models";
     case "whisper":
     default: return "Whisper local transcription";
   }
@@ -329,8 +343,9 @@ function renderQueue() {
       <div class="actions">
         ${item.status === "transcribing" || item.status === "queued" || item.status === "detecting" ? `<button class="small danger btn-cancel" data-id="${item.id}">Cancel</button>` : ""}
         ${item.status === "error" || item.status === "cancelled" ? `<button class="small btn-retry" data-id="${item.id}">Retry</button>` : ""}
-        ${item.status === "complete" && (item.engine === "assemblyai" || item.engine === "deepgram" || item.engine === "sherpa") && item.diarizedJsonPath ? `<button class="small btn-speakers" data-id="${item.id}">Identify speakers</button>` : ""}
-        ${item.status === "complete" && item.engine === "whisper" ? `<button class="small btn-reprocess" data-id="${item.id}">Reprocess</button>` : ""}
+        ${item.status === "complete" && (item.engine === "assemblyai" || item.engine === "deepgram" || item.engine === "sherpa" || item.engine === "parakeet-sherpa") && item.diarizedJsonPath ? `<button class="small btn-speakers" data-id="${item.id}">Identify speakers</button>` : ""}
+        ${item.status === "complete" && (item.engine === "whisper" || item.engine === "parakeet") ? `<button class="small btn-retranscribe" data-id="${item.id}" title="Re-run transcription with the model currently selected in the dropdown">Re-transcribe</button>` : ""}
+        ${item.status === "complete" && item.engine === "whisper" ? `<button class="small btn-redo-chapters" data-id="${item.id}" title="Re-run LLM chapter detection (needs an OpenRouter API key in Settings)">Redo chapters</button>` : ""}
         ${item.status !== "transcribing" && item.status !== "detecting" ? `<button class="small danger btn-remove" data-id="${item.id}">&times;</button>` : ""}
       </div>
     </div>
@@ -398,8 +413,32 @@ function renderQueue() {
     });
   });
 
-  // Reprocess button — re-run chapter detection with current settings
-  queueList.querySelectorAll(".btn-reprocess").forEach((btn) => {
+  // Re-transcribe button — re-run transcription with the currently selected
+  // model (and current settings). Does NOT touch chapter detection; that's the
+  // "Redo chapters" button. Useful for comparing models on the same file.
+  queueList.querySelectorAll(".btn-retranscribe").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const id = (btn as HTMLElement).dataset.id!;
+      const item = queue.find((q) => q.id === id);
+      if (!item) return;
+
+      // Re-stamp the engine to whatever the dropdown says now, so switching the
+      // engine (e.g. Whisper → Parakeet) and re-transcribing works too.
+      item.engine = (selectEngine.value as Engine) || item.engine;
+      item.chapters = undefined;
+      item.snappedChapters = undefined;
+      item.modelUsed = undefined;
+      item.error = undefined;
+      // Transcription only — leave chapters to the dedicated button.
+      item.autoDetectChapters = false;
+      item.status = "pending";
+      renderQueue();
+      await transcribeItem(item);
+    });
+  });
+
+  // Redo chapters button — re-run LLM chapter detection with current settings.
+  queueList.querySelectorAll(".btn-redo-chapters").forEach((btn) => {
     btn.addEventListener("click", async () => {
       const id = (btn as HTMLElement).dataset.id!;
       const item = queue.find((q) => q.id === id);
@@ -646,7 +685,7 @@ async function checkModelAndPromptDownload(modelName: string): Promise<boolean> 
 async function runChapterDetection(item: QueueItem, skipCueEmbed = false): Promise<void> {
   const settings = loadSettings();
   if (!settings.apiKey) {
-    item.error = (item.error || "") + " (No API key for chapter detection)";
+    item.error = (item.error || "") + " (Set an OpenRouter API key in Settings to detect chapters)";
     return;
   }
 
@@ -1294,7 +1333,338 @@ async function transcribeItemDeepgram(item: QueueItem) {
   }
 }
 
+async function transcribeItemParakeet(item: QueueItem) {
+  const format = selectFormat.value;
+  const threads = parseInt(selectThreads.value);
+  item.modelUsed = "Parakeet";
+  item.error = undefined;
+  renderQueue();
+
+  try {
+    if (item.status === "cancelled" || !queue.includes(item)) return;
+
+    // Parakeet writes the same {stem}_transcription_parakeet.{ext} files Whisper
+    // does, so the standard transcription-exists check works with model "parakeet".
+    const alreadyExists = await checkOutputExists("check_transcription_exists", {
+      path: item.path,
+      model: "parakeet",
+      outputDir: customOutputDir || null,
+    });
+
+    if (alreadyExists) {
+      item.status = "complete";
+      item.progress = 1.0;
+      renderQueue();
+      return;
+    }
+
+    item.status = "queued";
+    item.progress = 0;
+    item.startedAt = undefined;
+    item.elapsed = undefined;
+    renderQueue();
+
+    await invoke("transcribe_parakeet", {
+      job: {
+        id: item.id,
+        path: item.path,
+        output_format: format,
+        output_dir: customOutputDir,
+        threads,
+      },
+    });
+
+    item.elapsed = Date.now() - (item.startedAt || Date.now());
+
+    if ((item.status as string) !== "cancelled") {
+      item.status = "complete";
+      item.progress = 1.0;
+    }
+  } catch (err: any) {
+    item.elapsed = item.startedAt ? Date.now() - item.startedAt : undefined;
+    const errMsg = typeof err === "string" ? err : err?.message || "Unknown error";
+    if (errMsg === "Cancelled") {
+      item.status = "cancelled";
+      item.error = "Cancelled by user";
+    } else {
+      item.status = "error";
+      item.error = errMsg;
+    }
+  }
+  renderQueue();
+}
+
+async function transcribeItemParakeetSherpa(item: QueueItem) {
+  const threads = parseInt(selectThreads.value);
+  item.modelUsed = "Parakeet + Sherpa";
+  item.error = undefined;
+  renderQueue();
+
+  try {
+    if (item.status === "cancelled" || !queue.includes(item)) return;
+
+    const alreadyExists = await checkOutputExists("check_diarization_exists", {
+      path: item.path,
+      engine: "parakeet-sherpa",
+      outputDir: customOutputDir || null,
+    });
+
+    if (alreadyExists) {
+      const stem = item.path.replace(/\.[^./]+$/, "").split("/").pop() || "";
+      const dir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
+      item.diarizedSrtPath = `${dir}/${stem}.diarized.parakeet-sherpa.srt`;
+      item.diarizedJsonPath = `${dir}/${stem}.diarized.parakeet-sherpa.json`;
+      item.diarizedTxtPath = `${dir}/${stem}.diarized.parakeet-sherpa.txt`;
+      item.status = "complete";
+      item.progress = 1.0;
+      renderQueue();
+      return;
+    }
+
+    item.status = "queued";
+    item.progress = 0;
+    item.startedAt = undefined;
+    item.elapsed = undefined;
+    renderQueue();
+
+    const settings = loadSettings();
+    const result = await invoke<AssemblyAIResult>("transcribe_parakeet_sherpa", {
+      job: {
+        id: item.id,
+        path: item.path,
+        output_dir: customOutputDir,
+        threads,
+        num_speakers: settings.sherpaNumSpeakers,
+        threshold: settings.sherpaThreshold,
+      },
+    });
+
+    item.speakerCount = result.speaker_count;
+    item.diarizedSrtPath = result.srt_path;
+    item.diarizedJsonPath = result.json_path;
+    item.diarizedTxtPath = result.txt_path;
+    item.elapsed = Date.now() - (item.startedAt || Date.now());
+
+    if ((item.status as string) !== "cancelled") {
+      item.status = "complete";
+      item.progress = 1.0;
+    }
+  } catch (err: any) {
+    item.elapsed = item.startedAt ? Date.now() - item.startedAt : undefined;
+    const errMsg = typeof err === "string" ? err : err?.message || "Unknown error";
+    if (errMsg === "Cancelled") {
+      item.status = "cancelled";
+      item.error = "Cancelled by user";
+    } else {
+      item.status = "error";
+      item.error = errMsg;
+    }
+  }
+  renderQueue();
+
+  if (item.status === "complete" && item.diarizedJsonPath) {
+    const modal = document.getElementById("speakers-modal");
+    if (modal && modal.classList.contains("hidden")) {
+      openSpeakerModal(item);
+    }
+  }
+}
+
+// Run a file through every downloaded local transcription model (each Whisper
+// size on disk + Parakeet if ready), sequentially, for manual side-by-side
+// comparison. Each model writes its own {stem}_transcription_{model}.{ext}, so
+// nothing collides. Honours the Format dropdown and Force-overwrite.
+// Build the Markdown comparison summary for "Compare all local models".
+function buildCompareMarkdown(
+  fileName: string,
+  audioDuration: number | null,
+  format: string,
+  rows: { label: string; model: string; seconds: number | null; words: number | null; chars: number | null; preview: string }[],
+): string {
+  const clock = (s: number) => {
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    return h > 0
+      ? `${h}:${m.toString().padStart(2, "0")}:${sec.toString().padStart(2, "0")}`
+      : `${m}:${sec.toString().padStart(2, "0")}`;
+  };
+  const dur = (s: number) => (s >= 60 ? `${Math.floor(s / 60)}m ${Math.round(s % 60)}s` : `${s.toFixed(1)}s`);
+
+  let md = `# Local model comparison\n\n`;
+  md += `**File:** ${fileName}  \n`;
+  if (audioDuration) md += `**Audio length:** ${clock(audioDuration)} (${audioDuration.toFixed(0)}s)  \n`;
+  md += `**Generated:** ${new Date().toLocaleString()}\n\n`;
+
+  md += `| Model | Time | Speed | Words | Chars |\n`;
+  md += `|---|---|---|---|---|\n`;
+  for (const r of rows) {
+    if (r.seconds == null) {
+      md += `| ${r.label} | — (already on disk) | — | — | — |\n`;
+      continue;
+    }
+    const speed = audioDuration && r.seconds > 0 ? `${(audioDuration / r.seconds).toFixed(1)}× realtime` : "—";
+    md += `| ${r.label} | ${dur(r.seconds)} | ${speed} | ${r.words?.toLocaleString() ?? "—"} | ${r.chars?.toLocaleString() ?? "—"} |\n`;
+  }
+
+  const skipped = rows.filter((r) => r.seconds == null).length;
+  if (skipped > 0) {
+    md += `\n> ${skipped} model(s) were already transcribed on disk and were not re-run, so they have no timing. Tick **Force overwrite** and run again for a clean head-to-head timing comparison.\n`;
+  }
+
+  const withText = rows.filter((r) => r.preview);
+  if (withText.length > 0) {
+    md += `\n## Transcript previews (first ~280 chars)\n`;
+    for (const r of withText) {
+      md += `\n### ${r.label}\n\n> ${r.preview.replace(/\s+/g, " ").trim()}…\n`;
+    }
+  }
+
+  md += `\n---\nFull transcripts: \`<file>_transcription_<model>.${format === "all" ? "{txt,srt,vtt,json}" : format}\` in this folder.\n`;
+  return md;
+}
+
+async function transcribeItemCompare(item: QueueItem) {
+  const format = selectFormat.value;
+  const threads = parseInt(selectThreads.value);
+  item.error = undefined;
+  renderQueue();
+
+  // Discover what's available locally.
+  const allModels = await invoke<ModelInfo[]>("list_models");
+  const parakeetReady = await invoke<boolean>("parakeet_model_ready");
+
+  type Run = { kind: "whisper" | "parakeet"; model: string; label: string };
+  const runs: Run[] = allModels
+    .filter((m) => m.downloaded)
+    .map((m) => ({ kind: "whisper" as const, model: m.name, label: m.name }));
+  if (parakeetReady) runs.push({ kind: "parakeet", model: "parakeet", label: "Parakeet" });
+
+  if (runs.length === 0) {
+    item.status = "error";
+    item.error =
+      "No local transcription models are downloaded. Download Whisper sizes and/or Parakeet from the Models manager first.";
+    renderQueue();
+    return;
+  }
+
+  // Per-model timing/quality, collected for the comparison summary.
+  type CompareRow = {
+    label: string;
+    model: string;
+    seconds: number | null; // null = skipped (already on disk)
+    words: number | null;
+    chars: number | null;
+    preview: string;
+  };
+  const rows: CompareRow[] = [];
+
+  try {
+    if (item.status === "cancelled" || !queue.includes(item)) return;
+
+    item.status = "queued";
+    item.progress = 0;
+    item.startedAt = undefined;
+    item.elapsed = undefined;
+    renderQueue();
+
+    const startAll = Date.now();
+    let audioDuration = item.duration || null;
+    let done = 0;
+    for (const run of runs) {
+      if ((item.status as string) === "cancelled" || !queue.includes(item)) break;
+      // Surface the current model in the model column (the progress listener
+      // overwrites stageText, but never touches modelUsed).
+      item.modelUsed = `${run.label} (${done + 1}/${runs.length})`;
+      renderQueue();
+
+      const exists = await checkOutputExists("check_transcription_exists", {
+        path: item.path,
+        model: run.model,
+        outputDir: customOutputDir || null,
+      });
+      if (exists) {
+        rows.push({ label: run.label, model: run.model, seconds: null, words: null, chars: null, preview: "" });
+        done++;
+        continue;
+      }
+
+      const t0 = Date.now();
+      const result =
+        run.kind === "whisper"
+          ? await invoke<TranscriptionResult>("transcribe_file", {
+              job: {
+                id: item.id,
+                path: item.path,
+                model: run.model,
+                output_format: format,
+                output_dir: customOutputDir,
+                threads,
+                per_word: false,
+              },
+            })
+          : await invoke<TranscriptionResult>("transcribe_parakeet", {
+              job: {
+                id: item.id,
+                path: item.path,
+                output_format: format,
+                output_dir: customOutputDir,
+                threads,
+              },
+            });
+      const seconds = (Date.now() - t0) / 1000;
+      if (!audioDuration && result?.duration_secs) audioDuration = result.duration_secs;
+      const text = (result?.text || "").trim();
+      const words = text ? text.split(/\s+/).length : 0;
+      rows.push({
+        label: run.label,
+        model: run.model,
+        seconds,
+        words,
+        chars: text.length,
+        preview: text.slice(0, 280),
+      });
+      console.log(`[compare] ${run.label}: ${seconds.toFixed(1)}s, ${words} words`);
+      done++;
+    }
+
+    // Write the comparison summary (overwrites on each run).
+    if ((item.status as string) !== "cancelled" && rows.length > 0) {
+      const outputDir = customOutputDir || item.path.substring(0, item.path.lastIndexOf("/"));
+      const stem = item.name.replace(/\.[^.]+$/, "");
+      const md = buildCompareMarkdown(item.name, audioDuration, format, rows);
+      try {
+        await invoke("write_text_file", { path: `${outputDir}/${stem}_compare.md`, content: md });
+      } catch (e) {
+        console.warn("Failed to write comparison summary:", e);
+      }
+    }
+
+    item.elapsed = Date.now() - startAll;
+    if ((item.status as string) !== "cancelled") {
+      item.modelUsed = `${runs.length} models compared`;
+      item.status = "complete";
+      item.progress = 1.0;
+    }
+  } catch (err: any) {
+    item.elapsed = item.startedAt ? Date.now() - item.startedAt : undefined;
+    const errMsg = typeof err === "string" ? err : err?.message || "Unknown error";
+    if (errMsg === "Cancelled") {
+      item.status = "cancelled";
+      item.error = "Cancelled by user";
+    } else {
+      item.status = "error";
+      item.error = errMsg;
+    }
+  }
+  renderQueue();
+}
+
 async function transcribeItem(item: QueueItem) {
+  if (item.engine === "compare-local") {
+    await transcribeItemCompare(item);
+    return;
+  }
   if (item.engine === "assemblyai") {
     await transcribeItemAssemblyAI(item);
     return;
@@ -1305,6 +1675,14 @@ async function transcribeItem(item: QueueItem) {
   }
   if (item.engine === "sherpa") {
     await transcribeItemSherpa(item);
+    return;
+  }
+  if (item.engine === "parakeet") {
+    await transcribeItemParakeet(item);
+    return;
+  }
+  if (item.engine === "parakeet-sherpa") {
+    await transcribeItemParakeetSherpa(item);
     return;
   }
 
@@ -1428,6 +1806,8 @@ async function transcribeAll() {
   const aaiItems = pendingItems.filter((i) => i.engine === "assemblyai");
   const dgItems = pendingItems.filter((i) => i.engine === "deepgram");
   const sherpaItems = pendingItems.filter((i) => i.engine === "sherpa");
+  const parakeetItems = pendingItems.filter((i) => i.engine === "parakeet");
+  const parakeetSherpaItems = pendingItems.filter((i) => i.engine === "parakeet-sherpa");
 
   // Sherpa needs the Whisper model too
   if (whisperItems.length > 0 || sherpaItems.length > 0) {
@@ -1435,7 +1815,25 @@ async function transcribeAll() {
     if (!modelReady) return;
   }
 
-  if (sherpaItems.length > 0) {
+  // Parakeet (alone or paired with Sherpa) uses its own model — no Whisper dep.
+  if (parakeetItems.length > 0 || parakeetSherpaItems.length > 0) {
+    const ready = await invoke<boolean>("parakeet_model_ready");
+    if (!ready) {
+      const doDownload = confirm(
+        "The Parakeet model is not downloaded yet (~482 MB, plus a small Silero VAD model).\n\nDownload it now?"
+      );
+      if (!doDownload) return;
+      try {
+        await invoke("download_parakeet_model");
+      } catch (err) {
+        alert(`Failed to download the Parakeet model: ${err}`);
+        return;
+      }
+    }
+  }
+
+  // Parakeet+Sherpa also needs the Sherpa diarization models.
+  if (parakeetSherpaItems.length > 0 || sherpaItems.length > 0) {
     const ready = await invoke<boolean>("sherpa_models_ready");
     if (!ready) {
       const doDownload = confirm(
@@ -1613,6 +2011,7 @@ async function refreshModelList() {
   const models = await invoke<ModelInfo[]>("list_models");
   const dir = await invoke<string>("get_models_dir");
   const sherpaModels = await invoke<SherpaModelInfo[]>("list_sherpa_models");
+  const parakeetModels = await invoke<SherpaModelInfo[]>("list_parakeet_models");
   modelsDir.textContent = dir;
 
   const whisperRow = (m: ModelInfo) => `
@@ -1635,9 +2034,21 @@ async function refreshModelList() {
       }
     </div>`;
 
+  const parakeetRow = (m: SherpaModelInfo) => `
+    <div class="model-item" data-model="${m.name}">
+      <span class="model-name">${escapeHtml(m.display_name)}</span>
+      ${
+        m.downloaded
+          ? `<span class="model-status downloaded">Downloaded</span>`
+          : `<button class="small btn-download-model" data-name="${m.name}" data-kind="parakeet">Download</button>`
+      }
+    </div>`;
+
   modelList.innerHTML = `
     <div class="model-section-title">Whisper Transcription Models</div>
     ${models.map(whisperRow).join("")}
+    <div class="model-section-title">Parakeet (local) Transcription Model</div>
+    ${parakeetModels.map(parakeetRow).join("")}
     <div class="model-section-title">Sherpa-onnx Diarization Models</div>
     ${sherpaModels.map(sherpaRow).join("")}
   `;
@@ -1650,7 +2061,12 @@ async function refreshModelList() {
       (btn as HTMLElement).outerHTML = `<div class="download-progress"><div class="progress-bar"><div class="fill model-dl-fill" data-model="${name}" style="width: 0%"></div></div><span class="model-dl-text" data-model="${name}">Starting...</span></div>`;
 
       try {
-        const cmd = kind === "sherpa" ? "download_sherpa_model" : "download_model";
+        const cmd =
+          kind === "sherpa"
+            ? "download_sherpa_model"
+            : kind === "parakeet"
+              ? "download_parakeet_model"
+              : "download_model";
         await invoke(cmd, { name });
         const statusEl = item.querySelector(".download-progress");
         if (statusEl) statusEl.outerHTML = `<span class="model-status downloaded">Downloaded</span>`;
@@ -2628,13 +3044,19 @@ function loadPreferences() {
 function applyEngineUI() {
   const bar = document.querySelector(".settings-bar");
   if (!bar) return;
-  bar.classList.remove("engine-assemblyai", "engine-deepgram", "engine-sherpa", "engine-cloud");
+  bar.classList.remove("engine-assemblyai", "engine-deepgram", "engine-sherpa", "engine-parakeet", "engine-parakeet-sherpa", "engine-compare-local", "engine-cloud");
   if (selectEngine.value === "assemblyai") {
     bar.classList.add("engine-assemblyai", "engine-cloud");
   } else if (selectEngine.value === "deepgram") {
     bar.classList.add("engine-deepgram", "engine-cloud");
   } else if (selectEngine.value === "sherpa") {
     bar.classList.add("engine-sherpa");
+  } else if (selectEngine.value === "parakeet") {
+    bar.classList.add("engine-parakeet");
+  } else if (selectEngine.value === "parakeet-sherpa") {
+    bar.classList.add("engine-parakeet-sherpa");
+  } else if (selectEngine.value === "compare-local") {
+    bar.classList.add("engine-compare-local");
   }
   bar.classList.toggle("no-auto-chapters", !chkAutoChapters.checked);
 }

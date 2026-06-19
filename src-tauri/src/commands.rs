@@ -1,6 +1,7 @@
 use crate::assemblyai;
 use crate::deepgram;
 use crate::flac_utils;
+use crate::parakeet;
 use crate::sherpa;
 use crate::silence_trim;
 use crate::transcriber::{
@@ -93,6 +94,8 @@ fn parse_model(name: &str) -> WhisperModel {
         "tiny" => WhisperModel::Tiny,
         "base" => WhisperModel::Base,
         "small" => WhisperModel::Small,
+        "small-q5_1" => WhisperModel::SmallQ5_1,
+        "small-q8_0" => WhisperModel::SmallQ8_0,
         "medium" => WhisperModel::Medium,
         "large-v3" => WhisperModel::LargeV3,
         "distil-small-en" => WhisperModel::DistilSmallEn,
@@ -108,6 +111,8 @@ pub fn list_models() -> Vec<ModelInfo> {
         WhisperModel::Tiny,
         WhisperModel::Base,
         WhisperModel::Small,
+        WhisperModel::SmallQ5_1,
+        WhisperModel::SmallQ8_0,
         WhisperModel::Medium,
         WhisperModel::LargeV3,
         WhisperModel::LargeV3Turbo,
@@ -124,6 +129,8 @@ pub fn list_models() -> Vec<ModelInfo> {
             ModelInfo {
                 name: format!("{:?}", m)
                     .to_lowercase()
+                    .replace("smallq5_1", "small-q5_1")
+                    .replace("smallq8_0", "small-q8_0")
                     .replace("distilmediumen", "distil-medium-en")
                     .replace("distilsmallen", "distil-small-en")
                     .replace("distillargev3", "distil-large-v3")
@@ -194,6 +201,8 @@ pub async fn download_model(name: String, window: Window) -> Result<String, Stri
         ("tiny", 77_700_000),
         ("base", 147_900_000),
         ("small", 487_600_000),
+        ("small-q5_1", 190_085_487),
+        ("small-q8_0", 264_464_607),
         ("medium", 1_533_700_000),
         ("large-v3", 3_094_400_000),
         ("large-v3-turbo", 1_627_800_000),
@@ -2386,5 +2395,438 @@ pub async fn transcribe_sherpa(
         txt_path: txt_path.to_string_lossy().to_string(),
         speaker_count: speakers.len(),
         duration_secs: Some(whisper_duration),
+    })
+}
+
+// ----- Parakeet (local) transcription engine -----
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParakeetJob {
+    pub id: String,
+    pub path: String,
+    pub output_format: String,
+    pub output_dir: Option<String>,
+    pub threads: Option<i32>,
+}
+
+#[tauri::command]
+pub fn parakeet_model_ready() -> bool {
+    parakeet::model_ready()
+}
+
+#[tauri::command]
+pub fn list_parakeet_models() -> Vec<SherpaModelInfo> {
+    // Reuse SherpaModelInfo shape — the Models manager renders both the same way.
+    let dir = parakeet::model_dir();
+    let files = [
+        parakeet::encoder_path(),
+        parakeet::decoder_path(),
+        parakeet::joiner_path(),
+        parakeet::tokens_path(),
+    ];
+    let downloaded = files.iter().all(|p| p.exists()) && parakeet::silero_vad_path().exists();
+    let size_bytes: u64 = files
+        .iter()
+        .chain(std::iter::once(&parakeet::silero_vad_path()))
+        .map(|p| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+        .sum();
+    let _ = dir;
+    vec![SherpaModelInfo {
+        name: "parakeet".to_string(),
+        display_name: "Parakeet TDT 0.6b v2 (~482 MB, English)".to_string(),
+        downloaded,
+        size_bytes,
+        expected_bytes: 482_000_000,
+    }]
+}
+
+#[tauri::command]
+pub async fn download_parakeet_model(window: Window) -> Result<(), String> {
+    let name = "parakeet".to_string();
+
+    // 1. Silero VAD (shared, lives in the Whisper models dir). Small; fetch only
+    //    if missing so existing installs don't re-download it.
+    let vad_path = parakeet::silero_vad_path();
+    if !vad_path.exists() {
+        let vad_url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad_v5.onnx";
+        download_with_progress(
+            "parakeet-vad".to_string(),
+            vad_url.to_string(),
+            vad_path,
+            2_327_524,
+            window.clone(),
+        )
+        .await?;
+    }
+
+    // 2. Parakeet ASR tarball — download + extract (mirrors download_sherpa_model).
+    if parakeet::encoder_path().exists()
+        && parakeet::decoder_path().exists()
+        && parakeet::joiner_path().exists()
+        && parakeet::tokens_path().exists()
+    {
+        window
+            .emit(
+                "model-download-progress",
+                serde_json::json!({"model": &name, "progress": 1.0, "status": "complete"}),
+            )
+            .ok();
+        return Ok(());
+    }
+
+    let dir = parakeet::models_dir();
+    let archive_url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2";
+    let archive_path = dir.join("sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8.tar.bz2");
+    download_with_progress(
+        name.clone(),
+        archive_url.to_string(),
+        archive_path.clone(),
+        482_000_000,
+        window.clone(),
+    )
+    .await?;
+
+    let status = tokio::process::Command::new("tar")
+        .args([
+            "-xjf",
+            archive_path.to_str().unwrap(),
+            "-C",
+            dir.to_str().unwrap(),
+        ])
+        .status()
+        .await
+        .map_err(|e| format!("tar failed: {}", e))?;
+    if !status.success() {
+        return Err("Failed to extract Parakeet archive".to_string());
+    }
+    let _ = std::fs::remove_file(&archive_path);
+
+    window
+        .emit(
+            "model-download-progress",
+            serde_json::json!({"model": &name, "progress": 1.0, "status": "complete"}),
+        )
+        .ok();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn transcribe_parakeet(
+    job: ParakeetJob,
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<TranscriptionResult, String> {
+    if !parakeet::model_ready() {
+        return Err("Parakeet model is not downloaded. Use the Models manager first.".to_string());
+    }
+
+    let cancel_token = CancellationToken::new();
+    {
+        let mut tokens = state.cancel_tokens.lock().unwrap();
+        tokens.insert(job.id.clone(), cancel_token.clone());
+    }
+
+    let sem = state.semaphore.lock().unwrap().clone();
+    let permit = sem
+        .acquire_owned()
+        .await
+        .map_err(|e| format!("Queue error: {}", e))?;
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        return Err("Cancelled".to_string());
+    }
+
+    let audio_path = PathBuf::from(&job.path);
+    let job_id = job.id.clone();
+    let file_name = audio_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let threads = job.threads.unwrap_or(8);
+
+    window
+        .emit(
+            "transcription-progress",
+            TranscriptionProgress {
+                job_id: job_id.clone(),
+                file: file_name.clone(),
+                progress: 0.0,
+                status: "loading_model".to_string(),
+            },
+        )
+        .ok();
+
+    let win = window.clone();
+    let jid = job_id.clone();
+    let fname = file_name.clone();
+    let ct = cancel_token.clone();
+    let path_for_parakeet = audio_path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let progress_cb: Arc<Mutex<dyn FnMut(f32) + Send>> = Arc::new(Mutex::new({
+            let win = win.clone();
+            let jid = jid.clone();
+            let fname = fname.clone();
+            let ct = ct.clone();
+            move |progress: f32| {
+                if ct.is_cancelled() {
+                    return;
+                }
+                win.emit(
+                    "transcription-progress",
+                    TranscriptionProgress {
+                        job_id: jid.clone(),
+                        file: fname.clone(),
+                        progress,
+                        status: "transcribing".to_string(),
+                    },
+                )
+                .ok();
+            }
+        }));
+        parakeet::transcribe(&path_for_parakeet, threads, &ct, Some(progress_cb))
+    })
+    .await
+    .map_err(|e| format!("Task error: {}", e))??;
+
+    if cancel_token.is_cancelled() {
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        drop(permit);
+        return Err("Cancelled".to_string());
+    }
+
+    // Save output, reusing the Whisper writers and naming convention.
+    let output_dir = job
+        .output_dir
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(&job.path).parent().unwrap().to_path_buf());
+    let stem = PathBuf::from(&job.path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let formats: Vec<&str> = if job.output_format == "all" {
+        vec!["txt", "srt", "vtt", "json"]
+    } else {
+        job.output_format.split(',').map(|s| s.trim()).collect()
+    };
+
+    for fmt in &formats {
+        let ext = *fmt;
+        let out_path = output_dir.join(format!("{}_transcription_parakeet.{}", stem, ext));
+        let content = match ext {
+            "srt" => transcriber::to_srt(&result),
+            "vtt" => transcriber::to_vtt(&result),
+            "json" => serde_json::to_string_pretty(&result).unwrap_or_default(),
+            _ => result.text.clone(),
+        };
+        std::fs::write(&out_path, content)
+            .map_err(|e| format!("Failed to write {}: {}", out_path.display(), e))?;
+    }
+
+    window
+        .emit(
+            "transcription-progress",
+            TranscriptionProgress {
+                job_id: job_id.clone(),
+                file: file_name,
+                progress: 1.0,
+                status: "complete".to_string(),
+            },
+        )
+        .ok();
+
+    state.cancel_tokens.lock().unwrap().remove(&job.id);
+    drop(permit);
+    Ok(result)
+}
+
+// ----- Parakeet + Sherpa (local diarization) -----
+//
+// Same shape as transcribe_sherpa, but the transcript comes from Parakeet
+// instead of Whisper. Parakeet beats Whisper on conversational audio — exactly
+// the kind of audio you diarize — so this gives better diarized transcripts.
+// Sherpa still provides the speaker labels; the merge/coalesce logic is shared.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParakeetSherpaJob {
+    pub id: String,
+    pub path: String,
+    pub output_dir: Option<String>,
+    pub threads: Option<i32>,
+    #[serde(default)]
+    pub num_speakers: i32,
+    #[serde(default = "default_sherpa_threshold")]
+    pub threshold: f32,
+}
+
+#[tauri::command]
+pub async fn transcribe_parakeet_sherpa(
+    job: ParakeetSherpaJob,
+    window: Window,
+    state: State<'_, AppState>,
+) -> Result<AssemblyAIResult, String> {
+    if !parakeet::model_ready() {
+        return Err("Parakeet model is not downloaded. Use the Models manager first.".to_string());
+    }
+    if !sherpa::models_ready() {
+        return Err("Sherpa-onnx diarization models are not downloaded.".to_string());
+    }
+
+    let cancel_token = CancellationToken::new();
+    {
+        let mut tokens = state.cancel_tokens.lock().unwrap();
+        tokens.insert(job.id.clone(), cancel_token.clone());
+    }
+
+    let sem = state.semaphore.lock().unwrap().clone();
+    let permit = sem
+        .acquire_owned()
+        .await
+        .map_err(|e| format!("Queue error: {}", e))?;
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        return Err("Cancelled".to_string());
+    }
+
+    let audio_path = PathBuf::from(&job.path);
+    let file_name = audio_path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let job_id = job.id.clone();
+    let threads = job.threads.unwrap_or(8);
+    let num_speakers = job.num_speakers;
+    let threshold = job.threshold;
+
+    emit_aai(&window, &job_id, &file_name, 0.02, "loading_model");
+
+    let stem = audio_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let output_dir = job
+        .output_dir
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| audio_path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+
+    // If a previous Parakeet transcription SRT is on disk, reuse it and skip the
+    // (slow) ASR pass — only the diarization needs to run. Mirrors how the
+    // Whisper+Sherpa engine reuses an existing Whisper SRT.
+    let existing_srt = output_dir.join(format!("{}_transcription_parakeet.srt", stem));
+
+    let win = window.clone();
+    let jid = job_id.clone();
+    let fname = file_name.clone();
+    let ct = cancel_token.clone();
+    let path_for_job = audio_path.clone();
+    let reuse_srt = existing_srt.exists();
+
+    // Decode once, then run Parakeet (unless reusing an SRT) and Sherpa on the
+    // same PCM — avoids decoding the file twice.
+    let (transcript_segments, audio_duration, sherpa_segs) =
+        tokio::task::spawn_blocking(move || -> Result<_, String> {
+            let pcm = transcriber::audio_to_pcm(&path_for_job)?;
+            let duration = pcm.len() as f64 / 16000.0;
+
+            let segments: Vec<(f64, f64, String)>;
+            if reuse_srt {
+                let content = std::fs::read_to_string(&existing_srt)
+                    .map_err(|e| format!("Failed to read existing SRT: {}", e))?;
+                segments = sherpa::parse_srt(&content);
+                if segments.is_empty() {
+                    return Err(format!(
+                        "Existing SRT at {} contained no parseable segments.",
+                        existing_srt.display()
+                    ));
+                }
+            } else {
+                let progress_cb: Arc<Mutex<dyn FnMut(f32) + Send>> = Arc::new(Mutex::new({
+                    let win = win.clone();
+                    let jid = jid.clone();
+                    let fname = fname.clone();
+                    let ct = ct.clone();
+                    move |progress: f32| {
+                        if ct.is_cancelled() {
+                            return;
+                        }
+                        let scaled = 0.05 + progress * 0.65;
+                        win.emit(
+                            "transcription-progress",
+                            TranscriptionProgress {
+                                job_id: jid.clone(),
+                                file: fname.clone(),
+                                progress: scaled,
+                                status: "transcribing".to_string(),
+                            },
+                        )
+                        .ok();
+                    }
+                }));
+                let result =
+                    parakeet::transcribe_pcm(&pcm, fname.clone(), threads, &ct, Some(progress_cb))?;
+                segments = result
+                    .segments
+                    .iter()
+                    .map(|s| (s.start, s.end, s.text.clone()))
+                    .collect();
+            }
+
+            if ct.is_cancelled() {
+                return Err("Cancelled".to_string());
+            }
+
+            let segs = sherpa::diarize(&pcm, num_speakers, threshold)?;
+            Ok((segments, duration, segs))
+        })
+        .await
+        .map_err(|e| format!("Task error: {}", e))??;
+
+    if cancel_token.is_cancelled() {
+        drop(permit);
+        state.cancel_tokens.lock().unwrap().remove(&job.id);
+        return Err("Cancelled".to_string());
+    }
+
+    emit_aai(&window, &job_id, &file_name, 0.92, "merging");
+
+    let merged = sherpa::assign_speakers_to_segments(&transcript_segments, &sherpa_segs);
+    let merged = sherpa::coalesce_by_speaker(&merged);
+
+    let srt_path = output_dir.join(format!("{}.diarized.parakeet-sherpa.srt", stem));
+    let txt_path = output_dir.join(format!("{}.diarized.parakeet-sherpa.txt", stem));
+    let json_path = output_dir.join(format!("{}.diarized.parakeet-sherpa.json", stem));
+
+    std::fs::write(&srt_path, sherpa::segments_to_srt(&merged))
+        .map_err(|e| format!("Failed to write SRT: {}", e))?;
+    std::fs::write(&txt_path, sherpa::segments_to_text(&merged))
+        .map_err(|e| format!("Failed to write TXT: {}", e))?;
+    let json_value =
+        sherpa::segments_to_aai_json(&merged, audio_duration, "parakeet", num_speakers, threshold);
+    std::fs::write(
+        &json_path,
+        serde_json::to_string_pretty(&json_value).unwrap_or_default(),
+    )
+    .map_err(|e| format!("Failed to write JSON: {}", e))?;
+
+    let speakers: std::collections::HashSet<String> =
+        merged.iter().map(|(_, _, _, sp)| sp.clone()).collect();
+
+    emit_aai(&window, &job_id, &file_name, 1.0, "complete");
+    state.cancel_tokens.lock().unwrap().remove(&job.id);
+    drop(permit);
+
+    Ok(AssemblyAIResult {
+        transcript_id: String::new(),
+        srt_path: srt_path.to_string_lossy().to_string(),
+        json_path: json_path.to_string_lossy().to_string(),
+        txt_path: txt_path.to_string_lossy().to_string(),
+        speaker_count: speakers.len(),
+        duration_secs: Some(audio_duration),
     })
 }

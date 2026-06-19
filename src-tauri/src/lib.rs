@@ -2,6 +2,7 @@ mod assemblyai;
 mod commands;
 mod deepgram;
 mod flac_utils;
+mod parakeet;
 mod sherpa;
 mod silence_trim;
 mod transcriber;
@@ -90,6 +91,11 @@ pub fn run() {
             commands::download_sherpa_models,
             commands::download_sherpa_model,
             commands::list_sherpa_models,
+            commands::parakeet_model_ready,
+            commands::download_parakeet_model,
+            commands::list_parakeet_models,
+            commands::transcribe_parakeet,
+            commands::transcribe_parakeet_sherpa,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -282,6 +282,37 @@ select, input[type="text"], input[type="password"] {
   opacity: 0.6;
 }
 
+/* Parakeet is local transcription with its own model + own timestamps: the
+   Whisper Model picker, per-word, and chapter controls don't apply. Threads and
+   Format DO apply (Parakeet honours num_threads and the format dropdown). */
+.settings-bar.engine-parakeet .model-control,
+.settings-bar.engine-parakeet .whisper-features:not(.format-control),
+.settings-bar.engine-compare-local .model-control,
+.settings-bar.engine-compare-local .whisper-features:not(.format-control) {
+  opacity: 0.35;
+  transition: opacity 0.15s ease;
+}
+.settings-bar.engine-parakeet .model-control:hover,
+.settings-bar.engine-parakeet .whisper-features:not(.format-control):hover,
+.settings-bar.engine-compare-local .model-control:hover,
+.settings-bar.engine-compare-local .whisper-features:not(.format-control):hover {
+  opacity: 0.6;
+}
+
+/* Parakeet + Sherpa: Parakeet writes the transcript (own model → dim the Whisper
+   Model picker), Sherpa labels speakers. Like the other diarization engines it
+   always writes SRT/TXT/JSON, so Format + chapter/per-word controls don't apply.
+   Threads applies (both models honour it); Speakers count applies. */
+.settings-bar.engine-parakeet-sherpa .model-control,
+.settings-bar.engine-parakeet-sherpa .whisper-features {
+  opacity: 0.35;
+  transition: opacity 0.15s ease;
+}
+.settings-bar.engine-parakeet-sherpa .model-control:hover,
+.settings-bar.engine-parakeet-sherpa .whisper-features:hover {
+  opacity: 0.6;
+}
+
 /* Chapter-detection controls (LLM picker + sub-options) dim when
    auto-detect chapters is off — nothing is sent to the LLM then. */
 .settings-bar.no-auto-chapters .chapters-only {
@@ -300,7 +331,8 @@ select, input[type="text"], input[type="password"] {
   transition: opacity 0.15s ease;
 }
 .settings-bar.engine-assemblyai .diarize-count,
-.settings-bar.engine-sherpa .diarize-count {
+.settings-bar.engine-sherpa .diarize-count,
+.settings-bar.engine-parakeet-sherpa .diarize-count {
   opacity: 1;
 }
 .speakers-input {
@@ -357,6 +389,24 @@ body.drag-over .queue-list {
   background: rgba(168, 85, 247, 0.15);
   color: #c084fc;
   border: 1px solid rgba(168, 85, 247, 0.4);
+}
+
+.engine-badge.engine-parakeet {
+  background: rgba(245, 158, 11, 0.15);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.4);
+}
+
+.engine-badge.engine-parakeet-sherpa {
+  background: rgba(217, 119, 6, 0.15);
+  color: #f59e0b;
+  border: 1px solid rgba(217, 119, 6, 0.4);
+}
+
+.engine-badge.engine-compare-local {
+  background: rgba(20, 184, 166, 0.15);
+  color: #2dd4bf;
+  border: 1px solid rgba(20, 184, 166, 0.4);
 }
 
 .speaker-badge {
@@ -627,7 +677,11 @@ body.drag-over .queue-list {
 .modal {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.6);
+  /* Lighter scrim than before since the blur now carries the separation. */
+  background: rgba(0, 0, 0, 0.45);
+  /* Blur the app behind the modal, like the Claude desktop app. */
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
   display: flex;
   justify-content: center;
   align-items: center;

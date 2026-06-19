@@ -32,18 +32,23 @@
           Engine:
           <select id="select-engine">
             <option value="whisper" selected>Whisper (local)</option>
+            <option value="parakeet">Parakeet (local)</option>
             <option value="sherpa">Whisper + Sherpa (local diarization)</option>
+            <option value="parakeet-sherpa">Parakeet + Sherpa (local diarization)</option>
             <option value="assemblyai">AssemblyAI (cloud diarization)</option>
             <option value="deepgram">Deepgram (cloud diarization)</option>
+            <option value="compare-local">Compare all local models</option>
           </select>
         </label>
-        <label class="whisper-only" title="Whisper model for transcription. Larger = more accurate but slower. (Whisper only.)">
+        <label class="whisper-only model-control" title="Whisper model for transcription. Larger = more accurate but slower. (Whisper only; Parakeet uses its own model.)">
           Model:
           <select id="select-model">
             <option value="large-v3-turbo" selected>Large V3 Turbo</option>
             <option value="large-v3">Large V3</option>
             <option value="medium">Medium</option>
             <option value="small">Small</option>
+            <option value="small-q8_0">Small Q8_0 (quantized, ~252 MB)</option>
+            <option value="small-q5_1">Small Q5_1 (quantized, ~181 MB)</option>
             <option value="base">Base</option>
             <option value="tiny">Tiny</option>
             <option value="distil-large-v3">Distil Large V3 (English-only)</option>
@@ -51,7 +56,7 @@
             <option value="distil-small-en">Distil Small.en (English-only)</option>
           </select>
         </label>
-        <label class="whisper-only whisper-features" title="Output format for transcriptions. SRT is required for chapter detection. (Pure Whisper only — diarization engines always write SRT/TXT/JSON.)">
+        <label class="whisper-only whisper-features format-control" title="Output format for transcriptions. SRT is required for chapter detection. (Whisper and Parakeet — diarization engines always write SRT/TXT/JSON.)">
           Format:
           <select id="select-format">
             <option value="all">All Formats</option>
@@ -115,11 +120,11 @@
           <input type="checkbox" id="chk-per-word" />
           Per-word timestamps
         </label>
-        <label class="auto-chapters-label whisper-only whisper-features" title="Embed chapter markers as FLAC metadata tags. Only applies to FLAC files.">
+        <label class="auto-chapters-label whisper-only whisper-features chapters-only" title="Embed chapter markers as FLAC metadata tags. Only applies to FLAC files, and only when chapters are detected.">
           <input type="checkbox" id="chk-embed-flac" checked />
           Embed in FLAC
         </label>
-        <label class="auto-chapters-label whisper-only whisper-features" title="Write a .cue sheet file alongside the audio. Reprocessing will not overwrite an existing .cue — use Align + Save for that.">
+        <label class="auto-chapters-label whisper-only whisper-features chapters-only" title="Write a .cue sheet file alongside the audio (only when chapters are detected). Reprocessing will not overwrite an existing .cue — use Align + Save for that.">
           <input type="checkbox" id="chk-write-cue" checked />
           Write .cue
         </label>
@@ -315,7 +320,7 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
           </div>
           <div class="about-form">
             <h3 class="settings-section-title">Transcription Engines</h3>
-            <p class="about-desc">Pick an engine for each file via the <strong>Engine</strong> dropdown. All four produce the same <code>.diarized.{srt,txt,json}</code> outputs (except plain Whisper, which writes <code>_transcription_&lt;model&gt;.{srt,vtt,txt,json}</code> without speaker labels).</p>
+            <p class="about-desc">Pick an engine for each file via the <strong>Engine</strong> dropdown. Transcription-only engines (Whisper, Parakeet) write <code>_transcription_&lt;model&gt;.{srt,vtt,txt,json}</code>. Diarization engines (Whisper + Sherpa, Parakeet + Sherpa, AssemblyAI, Deepgram) write <code>.diarized.&lt;engine&gt;.{srt,txt,json}</code> with speaker labels.</p>
             <table class="about-table">
               <thead><tr><th>Engine</th><th>Cost</th><th>Network</th><th>Diarization</th><th>Notes</th></tr></thead>
               <tbody>
@@ -324,7 +329,14 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
                   <td>Free</td>
                   <td>Offline</td>
                   <td>—</td>
-                  <td>Local Whisper transcription only. Pair with the LLM chapter-detection pipeline.</td>
+                  <td>Local Whisper transcription only. Pair with the LLM chapter-detection pipeline. Strong on clean/produced audio (audiobooks).</td>
+                </tr>
+                <tr>
+                  <td><strong>Parakeet</strong></td>
+                  <td>Free</td>
+                  <td>Offline</td>
+                  <td>—</td>
+                  <td>NVIDIA Parakeet-tdt-0.6b-v2 via sherpa-onnx. Beats Whisper on conversational audio (idioms, fewer dropped words, no hallucinated noise). VAD-chunked for long files. ~482 MB on first use. English.</td>
                 </tr>
                 <tr>
                   <td><strong>Whisper + Sherpa</strong></td>
@@ -334,11 +346,18 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
                   <td>Whisper for text + Sherpa-onnx (pyannote segmentation + WeSpeaker CAM++ embedding) for speakers. Pick any Whisper model in the Model dropdown. ~35 MB model download on first use.</td>
                 </tr>
                 <tr>
+                  <td><strong>Parakeet + Sherpa</strong></td>
+                  <td>Free</td>
+                  <td>Offline</td>
+                  <td>Yes</td>
+                  <td>Parakeet for text + Sherpa for speakers — better diarized transcripts than Whisper + Sherpa on conversation. Set the <strong>Speakers</strong> count (e.g. 2) for clean results; auto can over-split. Reuses an existing Parakeet transcript if present.</td>
+                </tr>
+                <tr>
                   <td><strong>AssemblyAI</strong></td>
                   <td>$0.17–$0.23/hr</td>
                   <td>Cloud</td>
                   <td>Yes</td>
-                  <td>Universal-2 ($0.17/hr) or Universal-3 Pro ($0.23/hr) + diarization add-on. Auto-fallback default. Configurable in Settings.</td>
+                  <td>Universal-2 ($0.17/hr) or Universal-3 Pro ($0.23/hr) + diarization add-on. Auto-fallback default. Configurable in Settings. Word-level diarization.</td>
                 </tr>
                 <tr>
                   <td><strong>Deepgram</strong></td>
@@ -347,17 +366,26 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
                   <td>Yes</td>
                   <td>Nova-3 model ($0.0043/min, diarization included). Faster than AssemblyAI on long files (single sync POST instead of upload+poll).</td>
                 </tr>
+                <tr>
+                  <td><strong>Compare all local models</strong></td>
+                  <td>Free</td>
+                  <td>Offline</td>
+                  <td>—</td>
+                  <td>Runs each <em>downloaded</em> local model (every Whisper size on disk + Parakeet) over the file, writing one transcript per model plus a <code>&lt;file&gt;_compare.md</code> summary (time, ×realtime speed, word counts, previews). For fair timing, use Concurrent = 1.</td>
+                </tr>
               </tbody>
             </table>
 
             <h3 class="settings-section-title">Whisper Models</h3>
-            <p class="about-desc">Larger models are more accurate but slower. <code>turbo</code> and <code>distil</code> variants are speed-optimized derivatives of Large V3.</p>
+            <p class="about-desc">Larger models are more accurate but slower. <code>turbo</code> and <code>distil</code> variants are speed-optimized derivatives of Large V3. <strong>Quantized</strong> (<code>q5_1</code>, <code>q8_0</code>) variants shrink the weights to use less memory/disk and run a bit faster, with a small accuracy cost — <code>q8_0</code> is near-lossless, <code>q5_1</code> is smaller/faster with slightly more degradation.</p>
             <table class="about-table">
               <thead><tr><th>Model</th><th>Size</th><th>Languages</th><th>Speed (rel. to Large V3)</th><th>Notes</th></tr></thead>
               <tbody>
                 <tr><td>Tiny</td><td>~75 MB</td><td>Multilingual</td><td>~32×</td><td>Fast but rough; useful for quick previews.</td></tr>
                 <tr><td>Base</td><td>~142 MB</td><td>Multilingual</td><td>~16×</td><td>Step up from Tiny.</td></tr>
                 <tr><td>Small</td><td>~466 MB</td><td>Multilingual</td><td>~6×</td><td>Decent accuracy on clean audio.</td></tr>
+                <tr><td><strong>Small Q8_0</strong></td><td>~252 MB</td><td>Multilingual</td><td>~6×+</td><td>8-bit quantized Small. Near-identical accuracy to Small at ~half the size and slightly faster.</td></tr>
+                <tr><td><strong>Small Q5_1</strong></td><td>~181 MB</td><td>Multilingual</td><td>~6×+</td><td>5-bit quantized Small. Smallest/fastest Small variant; minor accuracy trade-off vs Q8_0.</td></tr>
                 <tr><td>Medium</td><td>~1.5 GB</td><td>Multilingual</td><td>~2×</td><td>Solid all-purpose model.</td></tr>
                 <tr><td>Large V3</td><td>~3 GB</td><td>Multilingual</td><td>1× (baseline)</td><td>Highest multilingual accuracy. Slowest.</td></tr>
                 <tr><td><strong>Large V3 Turbo</strong></td><td>~1.6 GB</td><td>Multilingual</td><td>~6×</td><td>OpenAI's pruned variant (32→4 decoder layers). Small accuracy loss; recommended general default.</td></tr>

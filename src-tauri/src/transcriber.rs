@@ -37,6 +37,8 @@ pub enum WhisperModel {
     Tiny,
     Base,
     Small,
+    SmallQ5_1,
+    SmallQ8_0,
     Medium,
     LargeV3,
     LargeV3Turbo,
@@ -51,6 +53,8 @@ impl WhisperModel {
             WhisperModel::Tiny => "ggml-tiny.bin",
             WhisperModel::Base => "ggml-base.bin",
             WhisperModel::Small => "ggml-small.bin",
+            WhisperModel::SmallQ5_1 => "ggml-small-q5_1.bin",
+            WhisperModel::SmallQ8_0 => "ggml-small-q8_0.bin",
             WhisperModel::Medium => "ggml-medium.bin",
             WhisperModel::LargeV3 => "ggml-large-v3.bin",
             WhisperModel::LargeV3Turbo => "ggml-large-v3-turbo.bin",
@@ -65,6 +69,8 @@ impl WhisperModel {
             WhisperModel::Tiny => "Tiny (~75 MB)",
             WhisperModel::Base => "Base (~142 MB)",
             WhisperModel::Small => "Small (~466 MB)",
+            WhisperModel::SmallQ5_1 => "Small Q5_1 (~181 MB, quantized)",
+            WhisperModel::SmallQ8_0 => "Small Q8_0 (~252 MB, quantized)",
             WhisperModel::Medium => "Medium (~1.5 GB)",
             WhisperModel::LargeV3 => "Large V3 (~3 GB)",
             WhisperModel::LargeV3Turbo => "Large V3 Turbo (~1.6 GB)",
@@ -80,6 +86,8 @@ impl WhisperModel {
             WhisperModel::Tiny
             | WhisperModel::Base
             | WhisperModel::Small
+            | WhisperModel::SmallQ5_1
+            | WhisperModel::SmallQ8_0
             | WhisperModel::Medium
             | WhisperModel::LargeV3
             | WhisperModel::LargeV3Turbo => format!(
