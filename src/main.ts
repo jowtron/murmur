@@ -44,6 +44,7 @@ interface ModelDownloadProgress {
 interface GpuInfo {
   name: string;
   gpu_cores: number | null;
+  cpu_cores: number;
   metal_supported: boolean;
   using_metal: boolean;
 }
@@ -1474,6 +1475,21 @@ async function transcribeItemParakeetSherpa(item: QueueItem) {
 // size on disk + Parakeet if ready), sequentially, for manual side-by-side
 // comparison. Each model writes its own {stem}_transcription_{model}.{ext}, so
 // nothing collides. Honours the Format dropdown and Force-overwrite.
+// Cooldown between models in "Compare all local models", to limit thermal
+// throttling skewing later timings. Cancellable; shows a live countdown.
+const COMPARE_COOLDOWN_MS = 15000;
+
+async function compareCooldown(item: QueueItem, ms = COMPARE_COOLDOWN_MS): Promise<void> {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if ((item.status as string) === "cancelled" || !queue.includes(item)) return;
+    const remaining = Math.ceil((end - Date.now()) / 1000);
+    item.modelUsed = `Cooling down ${remaining}s…`;
+    renderQueue();
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
 // Build the Markdown comparison summary for "Compare all local models".
 function buildCompareMarkdown(
   fileName: string,
@@ -1494,7 +1510,8 @@ function buildCompareMarkdown(
   let md = `# Local model comparison\n\n`;
   md += `**File:** ${fileName}  \n`;
   if (audioDuration) md += `**Audio length:** ${clock(audioDuration)} (${audioDuration.toFixed(0)}s)  \n`;
-  md += `**Generated:** ${new Date().toLocaleString()}\n\n`;
+  md += `**Generated:** ${new Date().toLocaleString()}  \n`;
+  md += `_A ${COMPARE_COOLDOWN_MS / 1000}s cooldown ran between models to limit thermal-throttling bias. Timings are still sequential — treat them as indicative, and note Whisper runs on the Metal GPU while Parakeet is CPU-only._\n\n`;
 
   md += `| Model | Time | Speed | Words | Chars |\n`;
   md += `|---|---|---|---|---|\n`;
@@ -1570,12 +1587,12 @@ async function transcribeItemCompare(item: QueueItem) {
 
     const startAll = Date.now();
     let audioDuration = item.duration || null;
-    let done = 0;
-    for (const run of runs) {
+    for (let i = 0; i < runs.length; i++) {
+      const run = runs[i];
       if ((item.status as string) === "cancelled" || !queue.includes(item)) break;
       // Surface the current model in the model column (the progress listener
       // overwrites stageText, but never touches modelUsed).
-      item.modelUsed = `${run.label} (${done + 1}/${runs.length})`;
+      item.modelUsed = `${run.label} (${i + 1}/${runs.length})`;
       renderQueue();
 
       const exists = await checkOutputExists("check_transcription_exists", {
@@ -1585,8 +1602,7 @@ async function transcribeItemCompare(item: QueueItem) {
       });
       if (exists) {
         rows.push({ label: run.label, model: run.model, seconds: null, words: null, chars: null, preview: "" });
-        done++;
-        continue;
+        continue; // cached — nothing ran, no heat generated, so no cooldown needed
       }
 
       const t0 = Date.now();
@@ -1625,7 +1641,10 @@ async function transcribeItemCompare(item: QueueItem) {
         preview: text.slice(0, 280),
       });
       console.log(`[compare] ${run.label}: ${seconds.toFixed(1)}s, ${words} words`);
-      done++;
+
+      // Brief cooldown before the next model so back-to-back runs don't bias
+      // later timings via thermal throttling. Skipped after the last model.
+      if (i < runs.length - 1) await compareCooldown(item);
     }
 
     // Write the comparison summary (overwrites on each run).
@@ -1990,12 +2009,35 @@ async function loadGpuInfo() {
   try {
     const gpu = await invoke<GpuInfo>("get_gpu_info");
     const dot = gpu.using_metal ? "active" : "inactive";
-    const coresText = gpu.gpu_cores ? ` (${gpu.gpu_cores} cores)` : "";
+    const coresText = gpu.gpu_cores ? ` (${gpu.gpu_cores} GPU cores)` : "";
+    const cpuText = gpu.cpu_cores ? ` · ${gpu.cpu_cores} CPU cores` : "";
     const metalText = gpu.using_metal ? "Metal GPU acceleration active" : "GPU not available";
-    gpuBar.innerHTML = `<span class="gpu-dot ${dot}"></span> ${gpu.name}${coresText} &mdash; ${metalText}`;
+    gpuBar.innerHTML = `<span class="gpu-dot ${dot}"></span> ${gpu.name}${coresText}${cpuText} &mdash; ${metalText}`;
+    if (gpu.cpu_cores) populateThreadsDropdown(gpu.cpu_cores);
   } catch {
     gpuBar.innerHTML = `<span class="gpu-dot inactive"></span> GPU detection failed`;
   }
+}
+
+// Size the Threads dropdown to the machine's CPU core count. Threads matter most
+// for the CPU-bound local engines (Parakeet, Parakeet+Sherpa); Whisper leans on
+// the Metal GPU so high counts help it little. Preserves the saved preference.
+function populateThreadsDropdown(cpuCores: number) {
+  const max = Math.max(2, cpuCores);
+  const candidates = [2, 4, 6, 8, 10, 12, 16, 20, 24, 28, 32, 40, 48, 64];
+  const values = candidates.filter((v) => v < max);
+  if (!values.includes(max)) values.push(max);
+
+  const current = selectThreads.value;
+  const saved = localStorage.getItem("pref_threads");
+  selectThreads.innerHTML = values
+    .map((v) => `<option value="${v}">${v}${v === cpuCores ? " (all cores)" : ""}</option>`)
+    .join("");
+
+  // Restore selection priority: saved pref → prior value → 8 → max.
+  const ok = (s: string | null) => s != null && values.includes(parseInt(s));
+  const def = values.includes(8) ? "8" : String(max);
+  selectThreads.value = ok(saved) ? saved! : ok(current) ? current : def;
 }
 
 // Model manager

@@ -66,6 +66,9 @@ pub struct JobRequest {
 pub struct GpuInfo {
     pub name: String,
     pub gpu_cores: Option<u32>,
+    /// Logical CPU cores (Apple Silicon has no SMT, so this is the physical
+    /// P+E core count). Used to size the Threads dropdown for CPU-bound engines.
+    pub cpu_cores: u32,
     pub metal_supported: bool,
     pub using_metal: bool,
 }
@@ -421,9 +424,14 @@ pub fn get_gpu_info() -> GpuInfo {
         }
     }
 
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get() as u32)
+        .unwrap_or(8);
+
     GpuInfo {
         name,
         gpu_cores,
+        cpu_cores,
         metal_supported: true,
         using_metal: true,
     }

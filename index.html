@@ -73,7 +73,7 @@
             <option value="custom">Custom folder...</option>
           </select>
         </label>
-        <label class="whisper-only" title="Number of CPU threads for Whisper. More threads = faster but uses more CPU. (Whisper only.)">
+        <label class="whisper-only" title="Number of CPU threads. Biggest impact on the CPU-bound local engines (Parakeet, Parakeet + Sherpa); Whisper leans on the Metal GPU so high counts help it little. Maxes at your CPU core count.">
           Threads:
           <select id="select-threads">
             <option value="2">2</option>
@@ -392,6 +392,15 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
                 <tr><td><strong>Distil Large V3</strong></td><td>~1.5 GB</td><td><strong>English-only</strong></td><td>~6–7×</td><td>Distilled (32→2 decoder layers). On par with Large V3 on long-form English; faster than Turbo. Great for English audiobooks.</td></tr>
                 <tr><td>Distil Medium.en</td><td>~794 MB</td><td>English-only</td><td>~10×</td><td>Faster, slightly less accurate than Distil Large V3.</td></tr>
                 <tr><td>Distil Small.en</td><td>~336 MB</td><td>English-only</td><td>~15×</td><td>Smallest English-optimized variant. Good for quick drafts.</td></tr>
+              </tbody>
+            </table>
+
+            <h3 class="settings-section-title">Parakeet (local) Model</h3>
+            <p class="about-desc">NVIDIA Parakeet-tdt-0.6b-v2 via sherpa-onnx. Auto-downloaded on first use of the <strong>Parakeet</strong> or <strong>Parakeet + Sherpa</strong> engine. Runs on the <strong>CPU</strong> (Metal/CoreML doesn't help — it benchmarks ~2–3× slower), VAD-chunked for long files.</p>
+            <table class="about-table">
+              <thead><tr><th>Model</th><th>Size</th><th>Languages</th><th>Speed</th><th>Notes</th></tr></thead>
+              <tbody>
+                <tr><td><strong>Parakeet TDT 0.6b v2 (int8)</strong></td><td>~482 MB</td><td><strong>English-only</strong></td><td>~8× realtime (CPU, cool)</td><td>Matches AssemblyAI quality on conversation; beats Whisper (idioms, fewer dropped words, no hallucinated noise). Plus a small Silero VAD (~2 MB) for chunking.</td></tr>
               </tbody>
             </table>
 
