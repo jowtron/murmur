@@ -1,7 +1,8 @@
+use crate::curl_util::{auth_header_config, run_curl};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
-use tokio::process::Command;
+use tokio_util::sync::CancellationToken;
 
 const API_BASE: &str = "https://api.assemblyai.com/v2";
 
@@ -43,41 +44,40 @@ struct UploadResponse {
     upload_url: String,
 }
 
-fn run_curl(args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = std::process::Command::new("curl")
-        .args(args)
-        .output()
-        .map_err(|e| format!("curl failed to start: {}", e))?;
-    if !output.status.success() {
-        return Err(format!(
-            "curl exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    Ok(output.stdout)
-}
-
 /// Upload a local file to AssemblyAI's /v2/upload endpoint.
 /// Returns the temporary upload URL to pass to /v2/transcript.
-pub fn upload_file(path: &Path, api_key: &str) -> Result<String, String> {
-    let auth = format!("Authorization: {}", api_key);
-    let content_type = "Content-Type: application/octet-stream";
+/// Retries transient failures and aborts if the transfer stalls below
+/// 10 KB/s for 60s (matches the model-download curl resilience). Killed
+/// promptly if `cancel` fires — no point finishing a multi-GB upload for
+/// a cancelled job.
+pub async fn upload_file(
+    path: &Path,
+    api_key: &str,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
     let url = format!("{}/upload", API_BASE);
     let path_str = path
         .to_str()
         .ok_or_else(|| "Path is not valid UTF-8".to_string())?;
     let data_arg = format!("@{}", path_str);
 
-    let stdout = run_curl(&[
-        "-sS",
-        "--fail-with-body",
-        "-X", "POST",
-        "-H", &auth,
-        "-H", content_type,
-        "--data-binary", &data_arg,
-        &url,
-    ])?;
+    let stdout = run_curl(
+        &[
+            "--fail-with-body",
+            "-X", "POST",
+            "-H", "Content-Type: application/octet-stream",
+            "--data-binary", &data_arg,
+            "--connect-timeout", "30",
+            "--retry", "5",
+            "--retry-all-errors",
+            "--speed-limit", "10000",
+            "--speed-time", "60",
+            &url,
+        ],
+        &auth_header_config(api_key),
+        Some(cancel),
+    )
+    .await?;
 
     let parsed: UploadResponse = serde_json::from_slice(&stdout)
         .map_err(|e| format!("Failed to parse upload response: {} | body: {}", e, String::from_utf8_lossy(&stdout)))?;
@@ -87,14 +87,14 @@ pub fn upload_file(path: &Path, api_key: &str) -> Result<String, String> {
 /// Submit a transcription request with speaker diarization enabled.
 /// `speech_models` is the priority-routing array (e.g. ["universal-3-pro", "universal-2"]).
 /// Returns the transcript ID for polling.
-pub fn submit(
+pub async fn submit(
     audio_url: &str,
     api_key: &str,
     language_code: Option<&str>,
     speech_models: &[String],
     speakers_expected: Option<u32>,
+    cancel: &CancellationToken,
 ) -> Result<String, String> {
-    let auth = format!("Authorization: {}", api_key);
     let url = format!("{}/transcript", API_BASE);
 
     let mut body = serde_json::json!({
@@ -125,15 +125,20 @@ pub fn submit(
     }
     let body_str = serde_json::to_string(&body).unwrap();
 
-    let stdout = run_curl(&[
-        "-sS",
-        "--fail-with-body",
-        "-X", "POST",
-        "-H", &auth,
-        "-H", "Content-Type: application/json",
-        "-d", &body_str,
-        &url,
-    ])?;
+    let stdout = run_curl(
+        &[
+            "--fail-with-body",
+            "-X", "POST",
+            "-H", "Content-Type: application/json",
+            "-d", &body_str,
+            "--connect-timeout", "30",
+            "--retry", "3",
+            &url,
+        ],
+        &auth_header_config(api_key),
+        Some(cancel),
+    )
+    .await?;
 
     let parsed: Transcript = serde_json::from_slice(&stdout)
         .map_err(|e| format!("Failed to parse submit response: {} | body: {}", e, String::from_utf8_lossy(&stdout)))?;
@@ -142,25 +147,17 @@ pub fn submit(
 
 /// Fetch current transcript state. Status values: "queued", "processing", "completed", "error".
 pub async fn poll(transcript_id: &str, api_key: &str) -> Result<Transcript, String> {
-    let auth = format!("Authorization: {}", api_key);
     let url = format!("{}/transcript/{}", API_BASE, transcript_id);
 
-    let output = Command::new("curl")
-        .args(["-sS", "--fail-with-body", "-H", &auth, &url])
-        .output()
-        .await
-        .map_err(|e| format!("curl failed to start: {}", e))?;
+    let stdout = run_curl(
+        &["--fail-with-body", "--connect-timeout", "30", "--max-time", "120", &url],
+        &auth_header_config(api_key),
+        None,
+    )
+    .await?;
 
-    if !output.status.success() {
-        return Err(format!(
-            "curl exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    serde_json::from_slice(&output.stdout)
-        .map_err(|e| format!("Failed to parse poll response: {} | body: {}", e, String::from_utf8_lossy(&output.stdout)))
+    serde_json::from_slice(&stdout)
+        .map_err(|e| format!("Failed to parse poll response: {} | body: {}", e, String::from_utf8_lossy(&stdout)))
 }
 
 pub fn poll_interval() -> Duration {

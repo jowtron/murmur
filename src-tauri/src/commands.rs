@@ -41,6 +41,54 @@ impl AppState {
     }
 }
 
+/// Removes a job's entry from `cancel_tokens` on drop, so every exit path —
+/// including `?` early returns — cleans up without a manual `.remove()`.
+struct CancelTokenGuard {
+    id: String,
+    tokens: Arc<Mutex<HashMap<String, CancellationToken>>>,
+}
+
+impl CancelTokenGuard {
+    fn register(state: &AppState, id: &str) -> (CancellationToken, Self) {
+        let token = CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .insert(id.to_string(), token.clone());
+        (
+            token,
+            Self {
+                id: id.to_string(),
+                tokens: state.cancel_tokens.clone(),
+            },
+        )
+    }
+}
+
+impl Drop for CancelTokenGuard {
+    fn drop(&mut self) {
+        self.tokens.lock().unwrap().remove(&self.id);
+    }
+}
+
+/// Deletes the wrapped temp file on drop, covering error paths too.
+struct TempFileGuard(Option<PathBuf>);
+
+impl TempFileGuard {
+    fn remove_now(&mut self) {
+        if let Some(p) = self.0.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        self.remove_now();
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub name: String,
@@ -467,22 +515,16 @@ pub async fn transcribe_file(
         ));
     }
 
-    // Create cancellation token for this job
-    let cancel_token = CancellationToken::new();
-    {
-        let mut tokens = state.cancel_tokens.lock().unwrap();
-        tokens.insert(job.id.clone(), cancel_token.clone());
-    }
+    let (cancel_token, _token_guard) = CancelTokenGuard::register(&state, &job.id);
 
     let sem = state.semaphore.lock().unwrap().clone();
-    let permit = sem
+    let _permit = sem
         .acquire_owned()
         .await
         .map_err(|e| format!("Queue error: {}", e))?;
 
     // Check if cancelled while waiting
     if cancel_token.is_cancelled() {
-        drop(permit);
         return Err("Cancelled".to_string());
     }
 
@@ -547,9 +589,6 @@ pub async fn transcribe_file(
 
     // Check if cancelled during transcription
     if cancel_token.is_cancelled() {
-        // Clean up cancel token
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
-        drop(permit);
         return Err("Cancelled".to_string());
     }
 
@@ -595,9 +634,6 @@ pub async fn transcribe_file(
         )
         .ok();
 
-    // Clean up cancel token
-    state.cancel_tokens.lock().unwrap().remove(&job.id);
-    drop(permit);
     Ok(result)
 }
 
@@ -709,32 +745,24 @@ pub async fn detect_chapters(req: ChapterRequest) -> Result<Vec<Chapter>, String
         }
     });
 
-    let output = tokio::process::Command::new("curl")
-        .args([
-            "-s",
-            "-X",
-            "POST",
+    // No --fail-with-body: HTTP error bodies are JSON we parse below for a
+    // friendlier message via response["error"]["message"].
+    let stdout = crate::curl_util::run_curl(
+        &[
+            "-X", "POST",
             &req.base_url,
-            "-H",
-            "Content-Type: application/json",
-            "-H",
-            &format!("Authorization: Bearer {}", req.api_key),
-            "-H",
-            "HTTP-Referer: https://github.com/jowtron/murmur",
-            "-H",
-            "X-Title: Murmur",
-            "-d",
-            &body.to_string(),
-        ])
-        .output()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+            "-H", "Content-Type: application/json",
+            "-H", "HTTP-Referer: https://github.com/jowtron/murmur",
+            "-H", "X-Title: Murmur",
+            "-d", &body.to_string(),
+        ],
+        &crate::curl_util::auth_header_config(&format!("Bearer {}", req.api_key)),
+        None,
+    )
+    .await
+    .map_err(|e| format!("Request failed: {}", e))?;
 
-    if !output.status.success() {
-        return Err("API request failed".to_string());
-    }
-
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)
+    let response: serde_json::Value = serde_json::from_slice(&stdout)
         .map_err(|e| format!("Failed to parse response: {}", e))?;
 
     let content = response["choices"][0]["message"]["content"]
@@ -1487,6 +1515,10 @@ pub struct AssemblyAIJob {
     pub min_silence_secs: f32,
     #[serde(default = "default_silence_padding_secs")]
     pub silence_padding_secs: f32,
+    /// Audio duration in seconds, if the frontend knows it. Used only to
+    /// estimate processing progress; None falls back to a slow fake ramp.
+    #[serde(default)]
+    pub duration_secs: Option<f64>,
 }
 
 fn default_silence_threshold_db() -> f32 { -35.0 }
@@ -1620,21 +1652,15 @@ pub async fn transcribe_assemblyai(
         return Err("AssemblyAI API key is not set. Add it in Settings.".to_string());
     }
 
-    let cancel_token = CancellationToken::new();
-    {
-        let mut tokens = state.cancel_tokens.lock().unwrap();
-        tokens.insert(job.id.clone(), cancel_token.clone());
-    }
+    let (cancel_token, _token_guard) = CancelTokenGuard::register(&state, &job.id);
 
     let sem = state.semaphore.lock().unwrap().clone();
-    let permit = sem
+    let _permit = sem
         .acquire_owned()
         .await
         .map_err(|e| format!("Queue error: {}", e))?;
 
     if cancel_token.is_cancelled() {
-        drop(permit);
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
         return Err("Cancelled".to_string());
     }
 
@@ -1646,7 +1672,9 @@ pub async fn transcribe_assemblyai(
     let job_id = job.id.clone();
 
     let mut trim_map: Vec<silence_trim::SegmentMap> = Vec::new();
-    let mut temp_upload_path: Option<PathBuf> = None;
+    // Duration of the audio actually uploaded, for the progress estimate.
+    let mut uploaded_secs: Option<f64> = job.duration_secs.filter(|d| *d > 0.0);
+    let mut temp_upload = TempFileGuard(None);
     let path_for_upload = if job.trim_silence {
         let cached = state.trim_cache.lock().unwrap().remove(&job.path);
         let trim_result = if let Some(c) = cached {
@@ -1686,7 +1714,8 @@ pub async fn transcribe_assemblyai(
         );
 
         trim_map = trim_result.map;
-        temp_upload_path = Some(trim_result.temp_wav.clone());
+        uploaded_secs = Some(trim_result.trimmed_duration).filter(|d| *d > 0.0);
+        temp_upload = TempFileGuard(Some(trim_result.temp_wav.clone()));
         trim_result.temp_wav
     } else if is_video_file(&audio_path) {
         // Never upload a video container — extract the audio track to a temp WAV.
@@ -1697,74 +1726,81 @@ pub async fn transcribe_assemblyai(
         })
         .await
         .map_err(|e| format!("Audio-extract task error: {}", e))??;
-        temp_upload_path = Some(wav.clone());
+        temp_upload = TempFileGuard(Some(wav.clone()));
         wav
     } else {
         audio_path.clone()
     };
 
     if cancel_token.is_cancelled() {
-        if let Some(p) = &temp_upload_path {
-            let _ = std::fs::remove_file(p);
-        }
-        drop(permit);
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
         return Err("Cancelled".to_string());
     }
 
     emit_aai(&window, &job_id, &file_name, 0.05, "uploading");
 
-    let api_key = job.api_key.clone();
-    let path_for_upload_clone = path_for_upload.clone();
-    let upload_url = tokio::task::spawn_blocking(move || {
-        assemblyai::upload_file(&path_for_upload_clone, &api_key)
-    })
-    .await
-    .map_err(|e| format!("Upload task error: {}", e))??;
-
-    if let Some(p) = &temp_upload_path {
-        let _ = std::fs::remove_file(p);
-    }
-
-    if cancel_token.is_cancelled() {
-        drop(permit);
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
-        return Err("Cancelled".to_string());
-    }
+    let upload_url = assemblyai::upload_file(&path_for_upload, &job.api_key, &cancel_token).await?;
+    temp_upload.remove_now();
 
     emit_aai(&window, &job_id, &file_name, 0.10, "submitting");
 
-    let api_key_2 = job.api_key.clone();
-    let lang = job.language_code.clone();
-    let models = job.speech_models.clone();
-    let speakers_expected = job.speakers_expected;
-    let transcript_id = tokio::task::spawn_blocking(move || {
-        assemblyai::submit(&upload_url, &api_key_2, lang.as_deref(), &models, speakers_expected)
-    })
-    .await
-    .map_err(|e| format!("Submit task error: {}", e))??;
+    let transcript_id = assemblyai::submit(
+        &upload_url,
+        &job.api_key,
+        job.language_code.as_deref(),
+        &job.speech_models,
+        job.speakers_expected,
+        &cancel_token,
+    )
+    .await?;
 
     emit_aai(&window, &job_id, &file_name, 0.15, "processing");
 
-    let mut last_status = String::new();
+    // AssemblyAI only reports queued/processing while working, so estimate
+    // progress from wall time vs an expected ~25% of the uploaded duration.
+    // Unknown duration falls back to a slow ramp. Either way, cap at 95%.
+    let poll_started = std::time::Instant::now();
     let mut elapsed_polls: u32 = 0;
+    let mut consecutive_poll_errors: u32 = 0;
     let mut final_transcript = loop {
         if cancel_token.is_cancelled() {
-            drop(permit);
-            state.cancel_tokens.lock().unwrap().remove(&job.id);
             return Err("Cancelled".to_string());
         }
 
-        let t = assemblyai::poll(&transcript_id, &job.api_key).await?;
-        if t.status != last_status {
-            last_status = t.status.clone();
-        }
+        let t = match assemblyai::poll(&transcript_id, &job.api_key).await {
+            Ok(t) => {
+                consecutive_poll_errors = 0;
+                t
+            }
+            Err(e) => {
+                // A transient network hiccup after upload+processing are paid
+                // for shouldn't kill the job. Back off and retry; give up only
+                // after several consecutive failures.
+                consecutive_poll_errors += 1;
+                if consecutive_poll_errors >= 5 {
+                    return Err(format!(
+                        "AssemblyAI polling failed {} times in a row: {} (transcript id {} may still complete server-side)",
+                        consecutive_poll_errors, e, transcript_id
+                    ));
+                }
+                let backoff = std::time::Duration::from_secs(3 << consecutive_poll_errors.min(3));
+                emit_aai(
+                    &window,
+                    &job_id,
+                    &file_name,
+                    0.15,
+                    &format!("processing (poll retry {}/5)", consecutive_poll_errors),
+                );
+                tokio::select! {
+                    _ = cancel_token.cancelled() => return Err("Cancelled".to_string()),
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+                continue;
+            }
+        };
 
         match t.status.as_str() {
             "completed" => break t,
             "error" => {
-                state.cancel_tokens.lock().unwrap().remove(&job.id);
-                drop(permit);
                 return Err(format!(
                     "AssemblyAI error: {}",
                     t.error.unwrap_or_else(|| "unknown".to_string())
@@ -1772,9 +1808,19 @@ pub async fn transcribe_assemblyai(
             }
             _ => {
                 elapsed_polls += 1;
-                let est = (0.15 + (elapsed_polls as f32 * 0.01)).min(0.95);
+                let est = match uploaded_secs {
+                    Some(d) => {
+                        let expected = (d * 0.25).max(30.0);
+                        0.15 + 0.80 * (poll_started.elapsed().as_secs_f64() / expected).min(1.0) as f32
+                    }
+                    None => 0.15 + elapsed_polls as f32 * 0.01,
+                }
+                .min(0.95);
                 emit_aai(&window, &job_id, &file_name, est, &format!("processing ({})", t.status));
-                tokio::time::sleep(assemblyai::poll_interval()).await;
+                tokio::select! {
+                    _ = cancel_token.cancelled() => return Err("Cancelled".to_string()),
+                    _ = tokio::time::sleep(assemblyai::poll_interval()) => {}
+                }
             }
         }
     };
@@ -1833,8 +1879,6 @@ pub async fn transcribe_assemblyai(
         utterances.iter().map(|u| u.speaker.as_str()).collect();
 
     emit_aai(&window, &job_id, &file_name, 1.0, "complete");
-    state.cancel_tokens.lock().unwrap().remove(&job.id);
-    drop(permit);
 
     Ok(AssemblyAIResult {
         transcript_id,
@@ -1866,21 +1910,15 @@ pub async fn transcribe_deepgram(
         return Err("Deepgram API key is not set. Add it in Settings.".to_string());
     }
 
-    let cancel_token = CancellationToken::new();
-    {
-        let mut tokens = state.cancel_tokens.lock().unwrap();
-        tokens.insert(job.id.clone(), cancel_token.clone());
-    }
+    let (cancel_token, _token_guard) = CancelTokenGuard::register(&state, &job.id);
 
     let sem = state.semaphore.lock().unwrap().clone();
-    let permit = sem
+    let _permit = sem
         .acquire_owned()
         .await
         .map_err(|e| format!("Queue error: {}", e))?;
 
     if cancel_token.is_cancelled() {
-        drop(permit);
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
         return Err("Cancelled".to_string());
     }
 
@@ -1892,7 +1930,8 @@ pub async fn transcribe_deepgram(
     let job_id = job.id.clone();
 
     // Never upload a video container — extract the audio track to a temp WAV.
-    let temp_upload_path: Option<PathBuf> = if is_video_file(&audio_path) {
+    let mut temp_upload = TempFileGuard(None);
+    let path_for_upload = if is_video_file(&audio_path) {
         emit_aai(&window, &job_id, &file_name, 0.02, "extracting audio");
         let src = audio_path.clone();
         let wav = tokio::task::spawn_blocking(move || {
@@ -1900,34 +1939,23 @@ pub async fn transcribe_deepgram(
         })
         .await
         .map_err(|e| format!("Audio-extract task error: {}", e))??;
-        Some(wav)
+        temp_upload = TempFileGuard(Some(wav.clone()));
+        wav
     } else {
-        None
+        audio_path.clone()
     };
 
     emit_aai(&window, &job_id, &file_name, 0.05, "uploading");
 
-    let api_key = job.api_key.clone();
-    let model = job.model.clone();
-    let lang = job.language_code.clone();
-    let path_clone = temp_upload_path.clone().unwrap_or_else(|| audio_path.clone());
-
-    let response = tokio::task::spawn_blocking(move || {
-        deepgram::transcribe(&path_clone, &api_key, &model, lang.as_deref())
-    })
-    .await
-    .map_err(|e| format!("Task error: {}", e));
-
-    if let Some(p) = &temp_upload_path {
-        let _ = std::fs::remove_file(p);
-    }
-    let response = response??;
-
-    if cancel_token.is_cancelled() {
-        drop(permit);
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
-        return Err("Cancelled".to_string());
-    }
+    let response = deepgram::transcribe(
+        &path_for_upload,
+        &job.api_key,
+        &job.model,
+        job.language_code.as_deref(),
+        &cancel_token,
+    )
+    .await?;
+    temp_upload.remove_now();
 
     let utterances = response
         .results
@@ -1977,8 +2005,6 @@ pub async fn transcribe_deepgram(
         utterances.iter().map(|u| u.speaker).collect();
 
     emit_aai(&window, &job_id, &file_name, 1.0, "complete");
-    state.cancel_tokens.lock().unwrap().remove(&job.id);
-    drop(permit);
 
     Ok(AssemblyAIResult {
         transcript_id: String::new(),
@@ -2237,21 +2263,15 @@ pub async fn transcribe_sherpa(
         ));
     }
 
-    let cancel_token = CancellationToken::new();
-    {
-        let mut tokens = state.cancel_tokens.lock().unwrap();
-        tokens.insert(job.id.clone(), cancel_token.clone());
-    }
+    let (cancel_token, _token_guard) = CancelTokenGuard::register(&state, &job.id);
 
     let sem = state.semaphore.lock().unwrap().clone();
-    let permit = sem
+    let _permit = sem
         .acquire_owned()
         .await
         .map_err(|e| format!("Queue error: {}", e))?;
 
     if cancel_token.is_cancelled() {
-        drop(permit);
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
         return Err("Cancelled".to_string());
     }
 
@@ -2343,8 +2363,6 @@ pub async fn transcribe_sherpa(
     }
 
     if cancel_token.is_cancelled() {
-        drop(permit);
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
         return Err("Cancelled".to_string());
     }
 
@@ -2362,8 +2380,6 @@ pub async fn transcribe_sherpa(
     .map_err(|e| format!("Sherpa task error: {}", e))??;
 
     if cancel_token.is_cancelled() {
-        drop(permit);
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
         return Err("Cancelled".to_string());
     }
 
@@ -2393,8 +2409,6 @@ pub async fn transcribe_sherpa(
         merged.iter().map(|(_, _, _, sp)| sp.clone()).collect();
 
     emit_aai(&window, &job_id, &file_name, 1.0, "complete");
-    state.cancel_tokens.lock().unwrap().remove(&job.id);
-    drop(permit);
 
     Ok(AssemblyAIResult {
         transcript_id: String::new(),
@@ -2528,21 +2542,15 @@ pub async fn transcribe_parakeet(
         return Err("Parakeet model is not downloaded. Use the Models manager first.".to_string());
     }
 
-    let cancel_token = CancellationToken::new();
-    {
-        let mut tokens = state.cancel_tokens.lock().unwrap();
-        tokens.insert(job.id.clone(), cancel_token.clone());
-    }
+    let (cancel_token, _token_guard) = CancelTokenGuard::register(&state, &job.id);
 
     let sem = state.semaphore.lock().unwrap().clone();
-    let permit = sem
+    let _permit = sem
         .acquire_owned()
         .await
         .map_err(|e| format!("Queue error: {}", e))?;
 
     if cancel_token.is_cancelled() {
-        drop(permit);
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
         return Err("Cancelled".to_string());
     }
 
@@ -2600,8 +2608,6 @@ pub async fn transcribe_parakeet(
     .map_err(|e| format!("Task error: {}", e))??;
 
     if cancel_token.is_cancelled() {
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
-        drop(permit);
         return Err("Cancelled".to_string());
     }
 
@@ -2646,8 +2652,6 @@ pub async fn transcribe_parakeet(
         )
         .ok();
 
-    state.cancel_tokens.lock().unwrap().remove(&job.id);
-    drop(permit);
     Ok(result)
 }
 
@@ -2683,21 +2687,15 @@ pub async fn transcribe_parakeet_sherpa(
         return Err("Sherpa-onnx diarization models are not downloaded.".to_string());
     }
 
-    let cancel_token = CancellationToken::new();
-    {
-        let mut tokens = state.cancel_tokens.lock().unwrap();
-        tokens.insert(job.id.clone(), cancel_token.clone());
-    }
+    let (cancel_token, _token_guard) = CancelTokenGuard::register(&state, &job.id);
 
     let sem = state.semaphore.lock().unwrap().clone();
-    let permit = sem
+    let _permit = sem
         .acquire_owned()
         .await
         .map_err(|e| format!("Queue error: {}", e))?;
 
     if cancel_token.is_cancelled() {
-        drop(permit);
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
         return Err("Cancelled".to_string());
     }
 
@@ -2796,8 +2794,6 @@ pub async fn transcribe_parakeet_sherpa(
         .map_err(|e| format!("Task error: {}", e))??;
 
     if cancel_token.is_cancelled() {
-        drop(permit);
-        state.cancel_tokens.lock().unwrap().remove(&job.id);
         return Err("Cancelled".to_string());
     }
 
@@ -2826,8 +2822,6 @@ pub async fn transcribe_parakeet_sherpa(
         merged.iter().map(|(_, _, _, sp)| sp.clone()).collect();
 
     emit_aai(&window, &job_id, &file_name, 1.0, "complete");
-    state.cancel_tokens.lock().unwrap().remove(&job.id);
-    drop(permit);
 
     Ok(AssemblyAIResult {
         transcript_id: String::new(),

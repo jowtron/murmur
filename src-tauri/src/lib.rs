@@ -1,5 +1,6 @@
 mod assemblyai;
 mod commands;
+mod curl_util;
 mod deepgram;
 mod flac_utils;
 mod parakeet;

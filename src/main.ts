@@ -130,15 +130,17 @@ function loadSettings() {
 }
 
 /// Read the shared "Speakers" field. Returns a clamped 1..=10 integer, or null
-/// for blank/invalid (auto-detect). Reads the LIVE input element first so a
-/// value typed but not yet committed (no blur/change event) is still honoured
-/// at Transcribe time; falls back to saved prefs only if the element is absent.
+/// for blank/invalid (auto-detect). The LIVE input element is authoritative —
+/// including when blank, so clearing the field means auto-detect even if an
+/// old count is still in localStorage. Saved prefs are only consulted if the
+/// element is absent.
 function speakersExpectedValue(): number | null {
   const el = document.getElementById("input-speakers-expected") as HTMLInputElement | null;
-  const raw = (el?.value?.trim())
-    || localStorage.getItem("speakers_expected")
-    || localStorage.getItem("sherpa_num_speakers")
-    || "";
+  const raw = el
+    ? el.value.trim()
+    : (localStorage.getItem("speakers_expected")
+      || localStorage.getItem("sherpa_num_speakers")
+      || "");
   const n = parseInt(raw, 10);
   if (!Number.isFinite(n) || n < 1) return null;
   return Math.min(n, 10);
@@ -146,10 +148,11 @@ function speakersExpectedValue(): number | null {
 
 function assemblyaiSpeechModels(choice: string): string[] {
   switch (choice) {
+    case "universal-3-5-pro": return ["universal-3-5-pro"];
     case "universal-3-pro": return ["universal-3-pro"];
     case "universal-2": return ["universal-2"];
     case "auto":
-    default: return ["universal-3-pro", "universal-2"];
+    default: return ["universal-3-5-pro", "universal-2"];
   }
 }
 
@@ -845,6 +848,7 @@ async function transcribeItemAssemblyAI(item: QueueItem) {
         silence_threshold_db: settings.assemblyaiSilenceDb,
         min_silence_secs: settings.assemblyaiMinSilenceSecs,
         silence_padding_secs: settings.assemblyaiSilencePadSecs,
+        duration_secs: item.duration,
       },
     });
 
@@ -1905,6 +1909,8 @@ function assemblyaiRatePerHour(modelChoice: string): { rate: number; label: stri
   switch (modelChoice) {
     case "universal-2":
       return { rate: 0.17, label: "Universal-2 + diarization" };
+    case "universal-3-5-pro":
+      return { rate: 0.23, label: "Universal-3.5 Pro + diarization" };
     case "universal-3-pro":
     case "auto":
     default:
@@ -3043,6 +3049,9 @@ function savePreferences() {
   localStorage.setItem("pref_per_word", chkPerWord.checked ? "1" : "0");
   localStorage.setItem("pref_first_zero", chkFirstZero.checked ? "1" : "0");
   localStorage.setItem("speakers_expected", inputSpeakersExpected.value.trim());
+  // Legacy key from the old per-engine field; if left around it can resurrect
+  // a stale speaker count after the current field is cleared.
+  localStorage.removeItem("sherpa_num_speakers");
 }
 
 function loadPreferences() {

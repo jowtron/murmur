@@ -52,6 +52,8 @@ All diarization output uses the same `<basename>.diarized.{srt,txt,json}` naming
 ## Conventions
 
 - HTTP calls use **`curl`** subprocess, not `reqwest`. Keeps the dep tree small and matches the pre-existing podcast download pattern.
+- Any curl call carrying an API key goes through `curl_util::run_curl` — the Authorization header is piped via `curl -K -` stdin (never on argv, where `ps` exposes it), and an optional `CancellationToken` kills the curl child mid-transfer. Callers pass `--fail-with-body` themselves; the LLM chapter-correction call deliberately omits it to parse error-JSON bodies.
+- Engine commands manage cancel tokens via `CancelTokenGuard::register` (drop-guard removes the map entry on every exit path) and temp uploads via `TempFileGuard`. Don't insert/remove `state.cancel_tokens` manually.
 - Tauri events are the channel for backend → frontend progress: `transcription-progress`, `model-download-progress`, `podcast-download-progress`, `gap-progress`, `template-match-progress`, `sherpa-model-progress`. Reuse the existing channels rather than inventing new ones.
 - Queue items have an `engine` field (`whisper` | `assemblyai` | `deepgram` | `sherpa`); `transcribeItem` dispatches on that.
 - For prompts that need a return value (confirm dialogs), use `await ask(...)` from `@tauri-apps/plugin-dialog` — **not** `window.confirm()`. The native one doesn't reliably block under WKWebView.

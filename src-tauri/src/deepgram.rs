@@ -1,5 +1,7 @@
+use crate::curl_util::{auth_header_config, run_curl};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use tokio_util::sync::CancellationToken;
 
 const API_BASE: &str = "https://api.deepgram.com/v1/listen";
 
@@ -59,16 +61,19 @@ fn content_type_for(path: &Path) -> &'static str {
 }
 
 /// Submit a local file synchronously to Deepgram. Returns the parsed response.
-pub fn transcribe(
+/// Killed promptly if `cancel` fires. No stall-abort (`--speed-limit`) here:
+/// Deepgram's synchronous API transfers zero bytes while the server processes,
+/// which a stall detector would misread as a dead connection.
+pub async fn transcribe(
     path: &Path,
     api_key: &str,
     model: &str,
     language_code: Option<&str>,
+    cancel: &CancellationToken,
 ) -> Result<DeepgramResponse, String> {
     let path_str = path
         .to_str()
         .ok_or_else(|| "Path is not valid UTF-8".to_string())?;
-    let auth = format!("Authorization: Token {}", api_key);
     let ct = format!("Content-Type: {}", content_type_for(path));
     let data_arg = format!("@{}", path_str);
 
@@ -85,27 +90,25 @@ pub fn transcribe(
     }
     let url = format!("{}?{}", API_BASE, params.join("&"));
 
-    let output = std::process::Command::new("curl")
-        .args([
-            "-sS",
+    // --retry (without --retry-all-errors) only re-sends on transient errors,
+    // so a completed-but-dropped response can't silently double-bill more than
+    // those narrow cases.
+    let body = run_curl(
+        &[
             "--fail-with-body",
             "-X", "POST",
-            "-H", &auth,
             "-H", &ct,
             "--data-binary", &data_arg,
+            "--connect-timeout", "30",
+            "--retry", "3",
             &url,
-        ])
-        .output()
-        .map_err(|e| format!("curl failed to start: {}", e))?;
+        ],
+        &auth_header_config(&format!("Token {}", api_key)),
+        Some(cancel),
+    )
+    .await
+    .map_err(|e| format!("Deepgram request failed: {}", e))?;
 
-    if !output.status.success() {
-        return Err(format!(
-            "Deepgram request failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    let body = output.stdout;
     serde_json::from_slice(&body)
         .map_err(|e| format!("Failed to parse Deepgram response: {} | body: {}", e, String::from_utf8_lossy(&body)))
 }

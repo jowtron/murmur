@@ -182,7 +182,8 @@
               <label class="form-label" style="flex:1;">
                 AssemblyAI Model:
                 <select id="select-assemblyai-model" class="form-input">
-                  <option value="auto" selected>Universal-3 Pro &rarr; Universal-2 fallback</option>
+                  <option value="auto" selected>Universal-3.5 Pro &rarr; Universal-2 fallback</option>
+                  <option value="universal-3-5-pro">Universal-3.5 Pro only ($0.23/hr)</option>
                   <option value="universal-3-pro">Universal-3 Pro only ($0.23/hr)</option>
                   <option value="universal-2">Universal-2 only ($0.17/hr)</option>
                 </select>
@@ -409,8 +410,9 @@ Return the chapters as JSON with title, start_time (as HH:MM:SS), and start_secs
               <thead><tr><th>Model</th><th>Cost (with diarization)</th><th>Languages</th><th>Notes</th></tr></thead>
               <tbody>
                 <tr><td>Universal-2</td><td>$0.17/hr</td><td>99 languages</td><td>Fast, broad coverage. Long the default.</td></tr>
+                <tr><td><strong>Universal-3.5 Pro</strong></td><td>$0.23/hr</td><td>18 languages</td><td>Newest, highest accuracy. Native code-switching; AssemblyAI falls back to U2 for unsupported languages.</td></tr>
                 <tr><td><strong>Universal-3 Pro</strong></td><td>$0.23/hr</td><td>~6 languages</td><td>Highest accuracy. Supports fine-tuning &amp; prompting. English coverage strong.</td></tr>
-                <tr><td>Auto-fallback (default)</td><td>U3-Pro where supported, U2 elsewhere</td><td>—</td><td>Sends <code>speech_models: ["universal-3-pro", "universal-2"]</code>. Best of both.</td></tr>
+                <tr><td>Auto-fallback (default)</td><td>U3.5-Pro where supported, U2 elsewhere</td><td>—</td><td>Sends <code>speech_models: ["universal-3-5-pro", "universal-2"]</code>. Best of both.</td></tr>
               </tbody>
             </table>
 

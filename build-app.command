@@ -6,10 +6,10 @@ cd "$(dirname "$0")"
 export CMAKE_OSX_DEPLOYMENT_TARGET=10.15
 export MACOSX_DEPLOYMENT_TARGET=10.15
 
-echo "=== Building Whisper Transcriber ==="
+echo "=== Building Murmur ==="
 npm run tauri build -- --bundles app
 
-APP="src-tauri/target/release/bundle/macos/Whisper Transcriber.app"
+APP="src-tauri/target/release/bundle/macos/Murmur.app"
 if [ -d "$APP" ]; then
   echo ""
   echo "Ad-hoc signing bundle..."
