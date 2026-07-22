@@ -271,6 +271,28 @@ select, input[type="text"], input[type="password"] {
   margin-top: 2px;
 }
 
+/* Estimated cost / "Free" pill shown next to a completed job's "Done" status.
+   cursor: help signals the hover tooltip carries the full breakdown. */
+.cost-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 10px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  line-height: 1.4;
+  vertical-align: middle;
+  cursor: help;
+  background: rgba(255, 152, 0, 0.16);
+  color: var(--warning);
+  border: 1px solid rgba(255, 152, 0, 0.35);
+}
+.cost-badge.cost-free {
+  background: rgba(76, 175, 80, 0.14);
+  color: var(--success);
+  border-color: rgba(76, 175, 80, 0.32);
+}
+
 .settings-bar.engine-cloud .whisper-only,
 .settings-bar.engine-sherpa .whisper-features {
   opacity: 0.35;

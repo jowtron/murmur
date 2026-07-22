@@ -97,6 +97,10 @@ interface QueueItem {
   diarizedSrtPath?: string;
   diarizedTxtPath?: string;
   speakerNames?: Record<string, string>;
+  // Estimated API cost of the completed run, in USD. 0 for local engines or a
+  // reused cached result; undefined until known. `costNote` is the hover breakdown.
+  costUsd?: number;
+  costNote?: string;
 }
 
 const queue: QueueItem[] = [];
@@ -154,6 +158,50 @@ function assemblyaiSpeechModels(choice: string): string[] {
     case "auto":
     default: return ["universal-3-5-pro", "universal-2"];
   }
+}
+
+// ---- Cost estimation for cloud engines --------------------------------------
+// All-in per-hour USD rates. This app always requests speaker diarization, so
+// the AssemblyAI rates fold in the standard +$0.02/hr diarization add-on on top
+// of the base transcription price (Universal-3.5/3 Pro $0.21, Universal-2 $0.15).
+// Deepgram Nova-3 is $0.0043/min with diarization included. Local engines are free.
+const CLOUD_RATES = {
+  assemblyaiPro: 0.23,
+  assemblyaiU2: 0.17,
+  deepgram: 0.0043 * 60, // $0.258/hr
+};
+
+// models[0] is the model AssemblyAI attempts first — for "auto" that's the Pro
+// tier, which is also the worst-case rate, so the estimate never undercharges.
+function aaiRate(models: string[]): number {
+  return models[0] === "universal-2" ? CLOUD_RATES.assemblyaiU2 : CLOUD_RATES.assemblyaiPro;
+}
+
+function aaiModelLabel(models: string[]): string {
+  switch (models[0]) {
+    case "universal-2": return "Universal-2";
+    case "universal-3-pro": return "Universal-3 Pro";
+    default: return "Universal-3.5 Pro";
+  }
+}
+
+function formatCost(usd: number): string {
+  if (usd <= 0) return "$0";
+  if (usd < 0.005) return "<$0.01";
+  return `~$${usd.toFixed(2)}`;
+}
+
+// Small badge shown next to "Done": estimated API cost for cloud jobs, "Free"
+// for local engines. The `title` carries the breakdown as a hover tooltip.
+function costBadgeHtml(item: QueueItem): string {
+  if (item.status !== "complete") return "";
+  const isCloud = item.engine === "assemblyai" || item.engine === "deepgram";
+  if (!isCloud) {
+    return ` <span class="cost-badge cost-free" title="Local engine — runs on your Mac, no API charge">Free</span>`;
+  }
+  if (item.costUsd == null) return ""; // unknown (e.g. reused cached output without a duration)
+  const cls = item.costUsd === 0 ? "cost-badge cost-free" : "cost-badge";
+  return ` <span class="${cls}" title="${item.costNote ? escapeHtml(item.costNote) : ""}">${formatCost(item.costUsd)}</span>`;
 }
 
 function llmModelShort(fullModel: string): string {
@@ -339,7 +387,7 @@ function renderQueue() {
           ${item.status === "queued" ? (item.stageText || "Queued") : ""}
           ${item.status === "transcribing" ? (item.stageText && item.engine !== "whisper" ? (item.progress > 0 && item.progress < 1 ? `${item.stageText} ${Math.round(item.progress * 100)}%` : item.stageText) : `${Math.round(item.progress * 100)}%`) : ""}
           ${item.status === "detecting" ? `<span id="detect-status-${item.id}">Detecting...</span>` : ""}
-          ${item.status === "complete" ? "Done" : ""}
+          ${item.status === "complete" ? `Done${costBadgeHtml(item)}` : ""}
           ${item.status === "error" ? "Error" : ""}
           ${item.status === "cancelled" ? "Cancelled" : ""}
         </span>
@@ -381,6 +429,8 @@ function renderQueue() {
         item.progress = 0;
         item.error = undefined;
         item.elapsed = undefined;
+        item.costUsd = undefined;
+        item.costNote = undefined;
         renderQueue();
         transcribeItem(item);
       }
@@ -433,6 +483,8 @@ function renderQueue() {
       item.snappedChapters = undefined;
       item.modelUsed = undefined;
       item.error = undefined;
+      item.costUsd = undefined;
+      item.costNote = undefined;
       // Transcription only — leave chapters to the dedicated button.
       item.autoDetectChapters = false;
       item.status = "pending";
@@ -822,6 +874,8 @@ async function transcribeItemAssemblyAI(item: QueueItem) {
       item.diarizedSrtPath = `${dir}/${stem}.diarized.assemblyai.srt`;
       item.diarizedJsonPath = `${dir}/${stem}.diarized.assemblyai.json`;
       item.diarizedTxtPath = `${dir}/${stem}.diarized.assemblyai.txt`;
+      item.costUsd = 0;
+      item.costNote = "Reused existing output — no new API charge";
       item.status = "complete";
       item.progress = 1.0;
       renderQueue();
@@ -857,6 +911,15 @@ async function transcribeItemAssemblyAI(item: QueueItem) {
     item.diarizedJsonPath = result.json_path;
     item.diarizedTxtPath = result.txt_path;
     item.elapsed = Date.now() - (item.startedAt || Date.now());
+
+    // Estimated cost. AssemblyAI bills on the audio it actually processed, which
+    // is the trimmed duration when silence-trimming is on — that's what
+    // result.duration_secs reports (falls back to the file duration).
+    const billedSecs = result.duration_secs ?? item.duration ?? 0;
+    const models = assemblyaiSpeechModels(settings.assemblyaiModel);
+    item.costUsd = (billedSecs / 3600) * aaiRate(models);
+    const trimmed = settings.assemblyaiTrimSilence && item.duration != null && billedSecs < item.duration - 1;
+    item.costNote = `AssemblyAI ${aaiModelLabel(models)} — ${(billedSecs / 3600).toFixed(2)} hr billed × $${aaiRate(models).toFixed(2)}/hr (incl. diarization${trimmed ? ", silence-trimmed" : ""})`;
 
     if ((item.status as string) !== "cancelled") {
       item.status = "complete";
@@ -1283,6 +1346,8 @@ async function transcribeItemDeepgram(item: QueueItem) {
       item.diarizedSrtPath = `${dir}/${stem}.diarized.deepgram.srt`;
       item.diarizedJsonPath = `${dir}/${stem}.diarized.deepgram.json`;
       item.diarizedTxtPath = `${dir}/${stem}.diarized.deepgram.txt`;
+      item.costUsd = 0;
+      item.costNote = "Reused existing output — no new API charge";
       item.status = "complete";
       item.progress = 1.0;
       renderQueue();
@@ -1312,6 +1377,10 @@ async function transcribeItemDeepgram(item: QueueItem) {
     item.diarizedJsonPath = result.json_path;
     item.diarizedTxtPath = result.txt_path;
     item.elapsed = Date.now() - (item.startedAt || Date.now());
+
+    const billedSecs = result.duration_secs ?? item.duration ?? 0;
+    item.costUsd = (billedSecs / 3600) * CLOUD_RATES.deepgram;
+    item.costNote = `Deepgram Nova-3 — ${(billedSecs / 3600).toFixed(2)} hr × $0.26/hr (incl. diarization)`;
 
     if ((item.status as string) !== "cancelled") {
       item.status = "complete";
