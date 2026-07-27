@@ -71,6 +71,7 @@ All diarization output uses the same `<basename>.diarized.{srt,txt,json}` naming
 - **Sherpa-onnx requires 16 kHz mono f32 PCM exactly**. Reuse `transcriber::audio_to_pcm` (Rubato sinc resample) rather than rolling new decode.
 - **`tauri build` will fail** with a confusing error if invoked from anywhere other than the project root. Always `cd /Users/joseph/Claude_Code/murmur` first.
 - **AssemblyAI submit body** uses the **plural** `speech_models` array for priority routing, not the deprecated `speech_model` singular.
+- **Cloud cost rates are hardcoded in two places** — the `CLOUD_RATES` table in `src/main.ts` (drives the per-job "Done" cost badge) and the dropdown labels + About-modal pricing table in `index.html`. A pricing change must update both. All-in rates fold in the always-on diarization add-on: AAI Pro $0.23/hr, AAI U2 $0.17/hr, Deepgram Nova-3 ~$0.26/hr. The badge estimates from the API-billed `duration_secs` (the trimmed length when AAI silence-trim is on); AAI "auto" is priced at the Pro rate so it never understates.
 - **YAMNet model load** is via `libloading` FFI to `libtensorflowlite_c.dylib`, not native bindings. There used to be an `ort`/ONNX implementation; that was removed.
 
 ## Test files
