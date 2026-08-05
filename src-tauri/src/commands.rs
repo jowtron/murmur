@@ -345,6 +345,63 @@ fn has_date_tag(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Sniff a downloaded file's container and return a corrected extension when
+/// the feed lied about it. Supercast and friends will happily serve a 1080p
+/// MP4 as `audio/mpeg` with a `.mp3` URL; keeping the wrong extension confuses
+/// both Finder and our own decode path.
+fn sniff_extension(path: &std::path::Path) -> Option<&'static str> {
+    use std::io::Read;
+    let mut head = [0u8; 12];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+
+    // ISO-BMFF: 4-byte box size, then "ftyp", then the major brand.
+    if &head[4..8] == b"ftyp" {
+        return Some(match &head[8..12] {
+            b"M4A " | b"M4B " => ".m4a",
+            b"qt  " => ".mov",
+            _ => ".mp4",
+        });
+    }
+    if &head[0..4] == b"fLaC" {
+        return Some(".flac");
+    }
+    if &head[0..4] == b"OggS" {
+        return Some(".ogg");
+    }
+    if &head[0..4] == b"RIFF" {
+        return Some(".wav");
+    }
+    None
+}
+
+/// If the bytes on disk disagree with the extension we were told to use, move
+/// the file to the correct extension and return the new path.
+fn fix_extension(path: PathBuf) -> PathBuf {
+    let Some(sniffed) = sniff_extension(&path) else { return path };
+    let current = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()));
+    // mp3/aac/opus have no reliable magic we check for, so `sniff_extension`
+    // returning None leaves those alone. Only act on a definite mismatch.
+    if current.as_deref() == Some(sniffed) {
+        return path;
+    }
+    // .m4a and .mp4 are the same container; don't churn an already-sensible name.
+    if matches!(current.as_deref(), Some(".m4a") | Some(".m4b") | Some(".mp4") | Some(".mov"))
+        && matches!(sniffed, ".mp4" | ".m4a" | ".mov")
+    {
+        return path;
+    }
+    let corrected = path.with_extension(sniffed.trim_start_matches('.'));
+    if corrected.exists() {
+        return path;
+    }
+    match std::fs::rename(&path, &corrected) {
+        Ok(()) => corrected,
+        Err(_) => path,
+    }
+}
+
 #[tauri::command]
 pub async fn download_podcast_episode(
     url: String,
@@ -429,6 +486,9 @@ pub async fn download_podcast_episode(
         .await
         .map_err(|e| format!("Failed to finalize download: {}", e))?;
 
+    // The feed's MIME type and URL extension can both be wrong — trust the bytes.
+    let path = fix_extension(path);
+
     // Tag with comment after download
     if let Some(ref c) = comment {
         if !c.is_empty() {
@@ -440,7 +500,7 @@ pub async fn download_podcast_episode(
         "episode_id": episode_id, "progress": 1.0, "status": "complete"
     })).ok();
 
-    Ok(output_path)
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[tauri::command]

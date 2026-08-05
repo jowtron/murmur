@@ -2201,6 +2201,7 @@ interface FeedEpisode {
   title: string;
   date: string;
   rawDate: string;
+  episodeNum?: number;
   audioUrl: string;
   status: "pending" | "downloading" | "complete" | "error";
   progress: number;
@@ -2211,6 +2212,50 @@ interface FeedEpisode {
 
 let feedEpisodesList: FeedEpisode[] = [];
 let feedSaveDir = "";
+
+/** Strip characters that are awkward in filenames. */
+function feedSafeName(title: string): string {
+  return title
+    .trim()
+    .replace(/[^a-zA-Z0-9\s\-_.()]/g, "")
+    .replace(/\s+/g, "_")
+    .substring(0, 100)
+    .replace(/^_+|_+$/g, "");
+}
+
+/** pubDate as YYYY-MM-DD, or "" if the feed gave us nothing parseable. */
+function feedDatePrefix(rawDate: string): string {
+  if (!rawDate) return "";
+  const d = new Date(rawDate);
+  if (isNaN(d.getTime())) return "";
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+/**
+ * Filename for an episode: `YYYY-MM-DD_E042_Title.ext`. The date leads so the
+ * folder sorts chronologically in Finder; the episode number is only included
+ * when the feed actually publishes one (<itunes:episode>).
+ */
+function feedFilename(ep: FeedEpisode): string {
+  const parts = [feedDatePrefix(ep.rawDate)];
+  if (ep.episodeNum !== undefined) parts.push(`E${String(ep.episodeNum).padStart(3, "0")}`);
+  parts.push(feedSafeName(ep.title));
+  const stem = parts.filter(Boolean).join("_");
+  // Extension from the enclosure URL. Feeds sometimes mislabel the MIME type
+  // (a video episode served as audio/mpeg), so the backend re-checks the
+  // downloaded bytes and corrects the extension if the URL lied too.
+  const urlPath = new URL(ep.audioUrl).pathname;
+  const ext = urlPath.match(/\.(mp3|m4a|ogg|wav|flac|aac|opus|mp4|m4v|mov)$/i)?.[0] || ".mp3";
+  return stem + ext;
+}
+
+/** Pre-date-prefix naming, kept so existing libraries aren't re-downloaded. */
+function feedLegacyFilename(ep: FeedEpisode): string {
+  const stem = ep.title.replace(/[^a-zA-Z0-9\s\-_.()]/g, "").replace(/\s+/g, "_").substring(0, 100);
+  const urlPath = new URL(ep.audioUrl).pathname;
+  const ext = urlPath.match(/\.(mp3|m4a|ogg|wav|flac|aac|opus)$/i)?.[0] || ".mp3";
+  return stem + ext;
+}
 
 function feedUpdateSelectedCount() {
   const feedEpisodes = document.getElementById("feed-episodes")!;
@@ -2280,12 +2325,17 @@ async function loadFeed(url: string) {
       const date = item.querySelector("pubDate")?.textContent || "";
       const enclosure = item.querySelector("enclosure");
       const audioUrl = enclosure?.getAttribute("url") || "";
+      const epNumText = item.getElementsByTagNameNS(
+        "http://www.itunes.com/dtds/podcast-1.0/", "episode")[0]?.textContent;
+      const epNum = epNumText && /^\d+$/.test(epNumText.trim())
+        ? parseInt(epNumText.trim(), 10) : undefined;
       if (audioUrl) {
         feedEpisodesList.push({
           id: `ep-${i}`,
           title,
           date: date ? new Date(date).toLocaleDateString() : "",
           rawDate: date,
+          episodeNum: epNum,
           audioUrl,
           status: "pending",
           progress: 0,
@@ -2341,18 +2391,25 @@ document.getElementById("btn-feed-download")!.addEventListener("click", async ()
   let alreadyTagged = 0;
   for (const idx of selectedIndices) {
     const ep = feedEpisodesList[idx];
-    const safeName = ep.title.replace(/[^a-zA-Z0-9\s\-_.()]/g, "").replace(/\s+/g, "_").substring(0, 100);
-    const urlPath = new URL(ep.audioUrl).pathname;
-    const ext = urlPath.match(/\.(mp3|m4a|ogg|wav|flac|aac|opus)$/i)?.[0] || ".mp3";
-    const outputPath = `${feedSaveDir}/${safeName}${ext}`;
+    // Check the current naming first, then the pre-date-prefix name so a
+    // library downloaded by an older build isn't fetched all over again.
+    let outputPath = `${feedSaveDir}/${feedFilename(ep)}`;
+    let exists = await invoke<boolean>("file_exists", { path: outputPath }).catch(() => false);
+    if (!exists) {
+      const legacyPath = `${feedSaveDir}/${feedLegacyFilename(ep)}`;
+      if (await invoke<boolean>("file_exists", { path: legacyPath }).catch(() => false)) {
+        outputPath = legacyPath;
+        exists = true;
+      }
+    }
     try {
-      if (await invoke<boolean>("file_exists", { path: outputPath })) {
-        const dateStr = ep.rawDate ? (() => { const d = new Date(ep.rawDate); return isNaN(d.getTime()) ? "" : `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; })() : "";
+      if (exists) {
+        const dateStr = feedDatePrefix(ep.rawDate);
         const result = await invoke<string>("download_podcast_episode", {
           url: ep.audioUrl, outputPath, episodeId: ep.id, comment: dateStr,
         });
         ep.status = "complete";
-        ep.localPath = outputPath;
+        ep.localPath = result.replace(/^exists(_tagged)?:/, "") || outputPath;
         ep.progress = 1;
         skipped++;
         if (result.startsWith("exists_tagged:")) newlyTagged++;
@@ -2393,28 +2450,26 @@ document.getElementById("btn-feed-download")!.addEventListener("click", async ()
       ep.status = "downloading";
       feedRenderList();
 
-      // Derive filename from title
-      const safeName = ep.title.replace(/[^a-zA-Z0-9\s\-_.()]/g, "").replace(/\s+/g, "_").substring(0, 100);
-      // Get extension from URL
-      const urlPath = new URL(ep.audioUrl).pathname;
-      const ext = urlPath.match(/\.(mp3|m4a|ogg|wav|flac|aac|opus)$/i)?.[0] || ".mp3";
-      const outputPath = `${feedSaveDir}/${safeName}${ext}`;
+      // `YYYY-MM-DD_[E###_]Title.ext` so the folder sorts chronologically
+      const outputPath = `${feedSaveDir}/${feedFilename(ep)}`;
 
       try {
-        const comment = ep.rawDate ? (() => { const d = new Date(ep.rawDate); return isNaN(d.getTime()) ? "" : `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}-${String(d.getDate()).padStart(2,"0")}`; })() : "";
-        await invoke("download_podcast_episode", {
+        const comment = feedDatePrefix(ep.rawDate);
+        // The backend may correct the extension if the bytes don't match what
+        // the feed claimed, so trust the returned path over the one we asked for.
+        const savedPath = await invoke<string>("download_podcast_episode", {
           url: ep.audioUrl,
           outputPath,
           episodeId: ep.id,
           comment,
         });
         ep.status = "complete";
-        ep.localPath = outputPath;
+        ep.localPath = savedPath || outputPath;
         ep.progress = 1;
         completed++;
 
         // Add to transcription queue
-        addFiles([outputPath]);
+        addFiles([ep.localPath]);
       } catch (err) {
         ep.status = "error";
         errors++;
