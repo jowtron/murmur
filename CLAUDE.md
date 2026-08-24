@@ -25,10 +25,10 @@ Project lives at `/Users/joseph/Claude_Code/murmur/`. Cargo package, lib, and bi
 ## Layout
 
 - `index.html` — single-page UI markup. Top settings bar, queue, modals.
-- `src/main.ts` — all frontend logic. Vanilla TS, no framework. Long file (~3K lines).
+- `src/main.ts` — all frontend logic. Vanilla TS, no framework. Long file (~4.4K lines).
 - `src/styles.css` — vanilla CSS.
 - `src-tauri/src/lib.rs` — Tauri command registration.
-- `src-tauri/src/commands.rs` — all Tauri commands. Long (~1.7K lines).
+- `src-tauri/src/commands.rs` — all Tauri commands. Long (~3.2K lines).
 - `src-tauri/src/transcriber.rs` — Whisper bindings, model enum, audio decode/resample.
 - `src-tauri/src/assemblyai.rs` / `deepgram.rs` / `sherpa.rs` — per-engine modules.
 - `src-tauri/src/yamnet.rs` — TFLite-based speech/music classifier.
@@ -67,6 +67,8 @@ All diarization output uses the same `<basename>.diarized.{srt,txt,json}` naming
 
 ## Gotchas
 
+- **Accepted input extensions are duplicated in seven places.** `scan_directory` in `commands.rs`, and in `main.ts` the file-picker filter, `DROP_EXTENSIONS`, the podcast enclosure regex in `feedFilename()`, the template-browse picker, and the four "find the sibling audio file for this stem" lists (CUE convert, CUE→audio resolve, chapter snap, chapter embed). Adding a format means touching all of them. `feedLegacyFilename()`'s regex is deliberately *not* one of them — see the podcast-feed note below.
+
 - **Whisper model download progress** depends on a hardcoded `expected_sizes` HashMap in `download_model`. If you add a new model, also add its byte count there or progress goes wonky (e.g. "940 / 477 MB").
 - **HuggingFace LFS downloads can stall** mid-stream (signed-URL expiry, CDN timeouts). curl args include `--retry 5 --retry-all-errors --speed-limit 10000 --speed-time 30 -C -` for resilience. Partial files are kept (not deleted) on failure so the next attempt resumes.
 - **Distil model URLs are not on the ggerganov/whisper.cpp repo** — they live on the `distil-whisper` org with quirky filenames (e.g. `ggml-medium-32-2.en.bin` for distil-medium). `WhisperModel::url()` is per-variant.
@@ -77,7 +79,7 @@ All diarization output uses the same `<basename>.diarized.{srt,txt,json}` naming
 - **Podcast feeds lie about content type.** Supercast served a 1080p H.264 MP4 as `type="audio/mpeg"` with a `.mp3` URL, so neither the enclosure MIME type nor the URL extension is trustworthy. `sniff_extension`/`fix_extension` in `commands.rs` read the first 12 bytes after download and correct the extension (`ftyp` → mp4/m4a/mov by brand, plus `fLaC`/`OggS`/`RIFF`); mp3/aac/opus have no checked magic so they're left alone. This means `download_podcast_episode` can return a **different path than it was given** — callers must use the return value, not the requested path.
 - **YAMNet model load** is via `libloading` FFI to `libtensorflowlite_c.dylib`, not native bindings. There used to be an `ort`/ONNX implementation; that was removed.
 - **m4b files carry their own chapters, and they beat anything we can detect.** `mp4_chapters.rs` reads them; symphonia's isomp4 demuxer ignores chapters entirely, so it is a hand-rolled box walk. Two schemes exist and both are handled: the **QuickTime chapter track** (the audio trak's `tref/chap` names a text track whose samples are the titles, timed by that track's `stts`) and the Nero **`chpl`** box in `moov/udta`. Audible/Libation `.m4b` files use the chapter track; ffmpeg writes both. The chapter track wins when both are present. Parse failures return an empty list, never an error — a file without chapters is normal.
-- **Embedded chapters bypass LLM chapter detection.** `runChapterDetection` in `main.ts` calls `read_embedded_chapters` first; if the file has any, it writes `<stem>_chapters_embedded.{txt,json}` plus the usual .cue/FLAC-embed and returns without touching OpenRouter. The API-key check now sits *after* that probe, so chaptered m4b files need no key at all.
+- **Embedded chapters bypass LLM chapter detection.** `runChapterDetection` in `main.ts` calls `read_embedded_chapters` first; if the file has any, it writes `<stem>_chapters_embedded.{txt,json}` plus the usual .cue/FLAC-embed and returns without touching OpenRouter. The API-key check now sits *after* that probe, so chaptered m4b files need no key at all. Note `embed_chapters_in_flac` is still FLAC-only, so for an .m4b the sidecar and .cue are written but nothing is embedded back into the audio — writing MP4 `chpl`/`chap` is not implemented.
 - **The plain-text transcript is chaptered when the source has chapters.** `transcriber::to_chaptered_text` interleaves `=== Title [HH:MM:SS] ===` headings into the `.txt` output for the Whisper and Parakeet jobs. Chapters starting past `duration_secs` are dropped — a trimmed file whose chapter list was copied wholesale would otherwise end in a run of empty headings. The `.srt`/`.vtt`/`.json` outputs and the cloud engines' `.diarized.txt` are untouched.
 - **Decoding resamples as it goes.** `audio_to_pcm_with_progress` feeds each decoded packet straight into a chunked rubato resampler (`RESAMPLE_CHUNK` input frames) instead of buffering the whole file at its source rate. The old one-shot call held ~4.8 GB for a 7.6-hour book, reported no progress, and couldn't be interrupted. Reusing one resampler across chunks preserves its sinc delay line, so output is continuous; the final `process_partial` emits a whole padded chunk, so the result is truncated back to `decoded_frames * ratio` or the file reads ~0.25 s long. Verified sample-equivalent to the one-shot version (104 dB error SNR; bit-identical on the 16 kHz passthrough path).
 - **Decode progress is a real stage.** It reports through `transcriber::StageProgress` (`FnMut(f32, &str)`), because a multi-hour audiobook spends minutes decoding before the ASR emits anything and the UI used to sit at 0% looking hung. `audio_to_pcm` is still there as a no-progress wrapper for the callers that don't need it.
