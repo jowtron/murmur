@@ -357,7 +357,8 @@ fn sniff_extension(path: &std::path::Path) -> Option<&'static str> {
     // ISO-BMFF: 4-byte box size, then "ftyp", then the major brand.
     if &head[4..8] == b"ftyp" {
         return Some(match &head[8..12] {
-            b"M4A " | b"M4B " => ".m4a",
+            b"M4A " => ".m4a",
+            b"M4B " => ".m4b",
             b"qt  " => ".mov",
             _ => ".mp4",
         });
@@ -388,7 +389,7 @@ fn fix_extension(path: PathBuf) -> PathBuf {
     }
     // .m4a and .mp4 are the same container; don't churn an already-sensible name.
     if matches!(current.as_deref(), Some(".m4a") | Some(".m4b") | Some(".mp4") | Some(".mov"))
-        && matches!(sniffed, ".mp4" | ".m4a" | ".mov")
+        && matches!(sniffed, ".mp4" | ".m4a" | ".m4b" | ".mov")
     {
         return path;
     }
@@ -1071,7 +1072,7 @@ pub async fn scan_directory(path: String) -> Result<Vec<String>, String> {
     }
 
     let extensions = [
-        "flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus", "mp4", "m4v", "mov",
+        "flac", "mp3", "wav", "ogg", "m4a", "m4b", "aac", "wma", "opus", "mp4", "m4v", "mov",
     ];
     let mut files = Vec::new();
 

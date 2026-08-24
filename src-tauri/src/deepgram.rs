@@ -51,7 +51,7 @@ fn content_type_for(path: &Path) -> &'static str {
         .map(|s| s.to_ascii_lowercase());
     match ext.as_deref() {
         Some("mp3") => "audio/mpeg",
-        Some("m4a") | Some("aac") => "audio/mp4",
+        Some("m4a") | Some("m4b") | Some("aac") => "audio/mp4",
         Some("flac") => "audio/flac",
         Some("ogg") | Some("opus") => "audio/ogg",
         Some("wav") => "audio/wav",

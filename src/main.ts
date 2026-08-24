@@ -2245,7 +2245,7 @@ function feedFilename(ep: FeedEpisode): string {
   // (a video episode served as audio/mpeg), so the backend re-checks the
   // downloaded bytes and corrects the extension if the URL lied too.
   const urlPath = new URL(ep.audioUrl).pathname;
-  const ext = urlPath.match(/\.(mp3|m4a|ogg|wav|flac|aac|opus|mp4|m4v|mov)$/i)?.[0] || ".mp3";
+  const ext = urlPath.match(/\.(mp3|m4a|m4b|ogg|wav|flac|aac|opus|mp4|m4v|mov)$/i)?.[0] || ".mp3";
   return stem + ext;
 }
 
@@ -2492,7 +2492,7 @@ btnAddFiles.addEventListener("click", async () => {
   const selected = await open({
     multiple: true,
     filters: [
-      { name: "Audio & Video", extensions: ["flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus", "mp4", "m4v", "mov"] },
+      { name: "Audio & Video", extensions: ["flac", "mp3", "wav", "ogg", "m4a", "m4b", "aac", "wma", "opus", "mp4", "m4v", "mov"] },
     ],
   });
   if (selected) {
@@ -2504,7 +2504,7 @@ btnAddFiles.addEventListener("click", async () => {
 // Drag-and-drop of files/folders anywhere on the window. The webview
 // intercepts native drags (Tauri dragDropEnabled default), so HTML5 drop
 // events never fire — Tauri's own event is the only channel.
-const DROP_EXTENSIONS = ["flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus", "mp4", "m4v", "mov"];
+const DROP_EXTENSIONS = ["flac", "mp3", "wav", "ogg", "m4a", "m4b", "aac", "wma", "opus", "mp4", "m4v", "mov"];
 
 getCurrentWebview().onDragDropEvent(async (event) => {
   if (event.payload.type === "enter") {
@@ -2698,7 +2698,7 @@ document.getElementById("btn-convert-cue")!.addEventListener("click", async () =
       // Find matching audio file (same stem, audio extension)
       const dir = path.substring(0, path.lastIndexOf("/"));
       const stem = path.split("/").pop()!.replace(/[._](chapters|llm_chapters|llm_raw|gemini[^.]*|gpt[^.]*|claude[^.]*)\..+$/, "").replace(/\.[^.]+$/, "");
-      const exts = ["flac", "mp3", "wav", "m4a", "ogg", "aac"];
+      const exts = ["flac", "mp3", "wav", "m4a", "m4b", "ogg", "aac"];
       let audioPath = "";
       for (const ext of exts) {
         const candidate = `${dir}/${stem}.${ext}`;
@@ -2746,7 +2746,7 @@ async function findAudioForCue(cuePath: string, cueText: string): Promise<string
     if (await invoke<boolean>("file_exists", { path: candidate })) return candidate;
   }
   const stem = cuePath.split("/").pop()!.replace(/\.cue$/, "");
-  for (const ext of ["flac", "mp3", "wav", "m4a", "ogg", "aac"]) {
+  for (const ext of ["flac", "mp3", "wav", "m4a", "m4b", "ogg", "aac"]) {
     const candidate = `${dir}/${stem}.${ext}`;
     if (await invoke<boolean>("file_exists", { path: candidate })) return candidate;
   }
@@ -2965,7 +2965,7 @@ btnRunDetect.addEventListener("click", async () => {
         // Strip _transcription_<model> suffix to get the audio stem
         const rawStem = fileName.replace(/\.[^.]+$/, "");
         const stem = rawStem.replace(/_transcription_[^_]+$/, "") || rawStem;
-        const audioExts = ["flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus"];
+        const audioExts = ["flac", "mp3", "wav", "ogg", "m4a", "m4b", "aac", "wma", "opus"];
         let audioPath = "";
         for (const ext of audioExts) {
           const candidate = `${dir}/${stem}.${ext}`;
@@ -3037,7 +3037,7 @@ btnRunDetect.addEventListener("click", async () => {
       const chkModalEmbed = document.getElementById("chk-modal-embed") as HTMLInputElement;
       const chkModalCue = document.getElementById("chk-modal-cue") as HTMLInputElement;
       if (chkModalEmbed.checked || chkModalCue.checked) {
-        const audioExtsEmbed = ["flac", "mp3", "wav", "ogg", "m4a", "aac", "wma", "opus"];
+        const audioExtsEmbed = ["flac", "mp3", "wav", "ogg", "m4a", "m4b", "aac", "wma", "opus"];
         for (const aext of audioExtsEmbed) {
           const candidate = `${dir}/${stem}.${aext}`;
           const exists = await invoke<boolean>("file_exists", { path: candidate });
@@ -3570,7 +3570,7 @@ templateCanvas.addEventListener("wheel", (e) => {
 btnTemplateBrowse.addEventListener("click", async () => {
   const selected = await open({
     multiple: false,
-    filters: [{ name: "Audio", extensions: ["flac", "mp3", "wav", "ogg", "m4a", "aac"] }],
+    filters: [{ name: "Audio", extensions: ["flac", "mp3", "wav", "ogg", "m4a", "m4b", "aac"] }],
   });
   if (selected) {
     const path = Array.isArray(selected) ? selected[0] : selected;
