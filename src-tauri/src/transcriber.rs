@@ -126,8 +126,24 @@ pub fn is_model_downloaded(model: &WhisperModel) -> bool {
     model_path(model).exists()
 }
 
+/// Progress sink shared by the decode and transcribe phases: a completion
+/// fraction for the *current* stage, plus the stage's name. Callers decide how
+/// to weight the stages against each other, since each pipeline runs a
+/// different set of them.
+pub type StageProgress = Arc<Mutex<dyn FnMut(f32, &str) + Send>>;
+
 /// Decode audio file using symphonia, resample to 16kHz mono f32 PCM
 pub fn audio_to_pcm(path: &Path) -> Result<Vec<f32>, String> {
+    audio_to_pcm_with_progress(path, None)
+}
+
+/// As `audio_to_pcm`, reporting decode and resample progress. Long audiobooks
+/// spend minutes in here before the transcriber emits anything, so without this
+/// the UI sits at 0% looking hung.
+pub fn audio_to_pcm_with_progress(
+    path: &Path,
+    progress: Option<StageProgress>,
+) -> Result<Vec<f32>, String> {
     let file = std::fs::File::open(path)
         .map_err(|e| format!("Failed to open audio file: {}", e))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
@@ -153,11 +169,28 @@ pub fn audio_to_pcm(path: &Path) -> Result<Vec<f32>, String> {
     let track_id = track.id;
     let source_rate = codec_params.sample_rate.unwrap_or(44100) as f64;
 
+    // Total frames lets us turn "samples decoded so far" into a percentage.
+    // Absent it (some streamed containers) we just report the stage with no
+    // fraction rather than inventing one.
+    let total_frames = codec_params.n_frames.unwrap_or(0) as f64;
+
+    let report = |frac: f32, stage: &str| {
+        if let Some(cb) = &progress {
+            if let Ok(mut f) = cb.lock() {
+                f(frac, stage);
+            }
+        }
+    };
+    report(0.0, "decoding");
+
     let mut decoder = symphonia::default::get_codecs()
         .make(&codec_params, &DecoderOptions::default())
         .map_err(|e| format!("Failed to create decoder: {}", e))?;
 
     let mut all_samples: Vec<f32> = Vec::new();
+    // Emitting on every packet would be thousands of events a second; a packet
+    // is ~20-40 ms of audio, so throttle to whole percentage points.
+    let mut last_reported_pct = -1i32;
 
     loop {
         let packet = match format.next_packet() {
@@ -195,6 +228,15 @@ pub fn audio_to_pcm(path: &Path) -> Result<Vec<f32>, String> {
             }
             all_samples.push(sum / num_channels as f32);
         }
+
+        if total_frames > 0.0 {
+            let frac = (all_samples.len() as f64 / total_frames).clamp(0.0, 1.0);
+            let pct = (frac * 100.0) as i32;
+            if pct > last_reported_pct {
+                last_reported_pct = pct;
+                report(frac as f32, "decoding");
+            }
+        }
     }
 
     // Resample to 16kHz using sinc interpolation (rubato)
@@ -202,6 +244,10 @@ pub fn audio_to_pcm(path: &Path) -> Result<Vec<f32>, String> {
     if (source_rate - target_rate).abs() < 1.0 {
         return Ok(all_samples);
     }
+
+    // Rubato processes the whole buffer in one call, so there is no inner
+    // progress to report -- name the stage so a long pause is at least legible.
+    report(1.0, "resampling");
 
     use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
 
@@ -291,7 +337,7 @@ impl Transcriber {
     pub fn transcribe(
         &self,
         audio_path: &Path,
-        progress_cb: Option<Arc<Mutex<dyn FnMut(f32) + Send>>>,
+        progress_cb: Option<StageProgress>,
     ) -> Result<TranscriptionResult, String> {
         self.transcribe_inner(audio_path, progress_cb, false)
     }
@@ -299,7 +345,7 @@ impl Transcriber {
     pub fn transcribe_per_word(
         &self,
         audio_path: &Path,
-        progress_cb: Option<Arc<Mutex<dyn FnMut(f32) + Send>>>,
+        progress_cb: Option<StageProgress>,
     ) -> Result<TranscriptionResult, String> {
         self.transcribe_inner(audio_path, progress_cb, true)
     }
@@ -307,10 +353,10 @@ impl Transcriber {
     fn transcribe_inner(
         &self,
         audio_path: &Path,
-        progress_cb: Option<Arc<Mutex<dyn FnMut(f32) + Send>>>,
+        progress_cb: Option<StageProgress>,
         per_word: bool,
     ) -> Result<TranscriptionResult, String> {
-        let samples = audio_to_pcm(audio_path)?;
+        let samples = audio_to_pcm_with_progress(audio_path, progress_cb.clone())?;
         let duration_secs = samples.len() as f64 / 16000.0;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -326,7 +372,7 @@ impl Transcriber {
         if let Some(cb) = progress_cb {
             params.set_progress_callback_safe(move |progress| {
                 if let Ok(mut f) = cb.lock() {
-                    f(progress as f32 / 100.0);
+                    f(progress as f32 / 100.0, "transcribing");
                 }
             });
         }
@@ -372,6 +418,60 @@ impl Transcriber {
 }
 
 /// Format transcription as SRT subtitle format
+/// Plain-text transcript with chapter headings interleaved at their start
+/// times. Used when the source file states its own chapters (an .m4b
+/// audiobook), so the transcript reads as a chaptered document instead of one
+/// undifferentiated wall of text.
+///
+/// A heading lands before the first segment that starts at or after the
+/// chapter's start time, so a chapter whose boundary falls mid-segment opens on
+/// the next whole segment rather than splitting a sentence.
+pub fn to_chaptered_text(result: &TranscriptionResult, chapters: &[(String, f64)]) -> String {
+    // Chapters starting past the end of the audio are stale metadata -- a
+    // trimmed file whose chapter list was copied wholesale, say -- and would
+    // otherwise pile up as headings with no text under them.
+    let chapters: Vec<&(String, f64)> = chapters
+        .iter()
+        .filter(|(_, start)| *start <= result.duration_secs)
+        .collect();
+    if chapters.is_empty() {
+        return result.text.clone();
+    }
+
+    let mut out = String::new();
+    let mut next = 0usize;
+
+    let push_heading = |out: &mut String, title: &str, secs: f64| {
+        let total = secs.max(0.0) as u64;
+        let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!("=== {} [{:02}:{:02}:{:02}] ===\n\n", title, h, m, s));
+    };
+
+    for segment in &result.segments {
+        // Several chapters can precede one segment (short front matter, or a
+        // chapter that contains no speech at all); emit each in turn.
+        while next < chapters.len() && segment.start >= chapters[next].1 {
+            push_heading(&mut out, &chapters[next].0, chapters[next].1);
+            next += 1;
+        }
+        if !out.is_empty() && !out.ends_with('\n') && !out.ends_with(' ') {
+            out.push(' ');
+        }
+        out.push_str(&segment.text);
+    }
+
+    // Any chapters starting past the last segment still belong in the file.
+    while next < chapters.len() {
+        push_heading(&mut out, &chapters[next].0, chapters[next].1);
+        next += 1;
+    }
+
+    out.trim_end().to_string()
+}
+
 pub fn to_srt(result: &TranscriptionResult) -> String {
     let mut out = String::new();
     for (i, seg) in result.segments.iter().enumerate() {
@@ -414,4 +514,68 @@ fn format_timestamp_vtt(secs: f64) -> String {
     let s = (secs % 60.0) as u32;
     let ms = ((secs % 1.0) * 1000.0) as u32;
     format!("{:02}:{:02}:{:02}.{:03}", h, m, s, ms)
+}
+
+#[cfg(test)]
+mod chaptered_text_tests {
+    use super::{to_chaptered_text, Segment, TranscriptionResult};
+
+    fn result(segments: &[(f64, &str)]) -> TranscriptionResult {
+        let segments: Vec<Segment> = segments
+            .iter()
+            .map(|(start, text)| Segment { start: *start, end: start + 5.0, text: text.to_string() })
+            .collect();
+        let text = segments.iter().map(|s| s.text.clone()).collect::<Vec<_>>().join(" ");
+        TranscriptionResult { file: "book.m4b".into(), segments, text, duration_secs: 60.0 }
+    }
+
+    #[test]
+    fn returns_plain_text_when_there_are_no_chapters() {
+        let r = result(&[(0.0, "one"), (5.0, "two")]);
+        assert_eq!(to_chaptered_text(&r, &[]), "one two");
+    }
+
+    #[test]
+    fn opens_each_chapter_on_the_next_whole_segment() {
+        let r = result(&[(0.0, "intro line"), (10.0, "first line"), (20.0, "second line")]);
+        let chapters = [("Opening".to_string(), 0.0), ("Chapter One".to_string(), 8.0)];
+        let out = to_chaptered_text(&r, &chapters);
+        assert_eq!(
+            out,
+            "=== Opening [00:00:00] ===\n\nintro line\n\n=== Chapter One [00:00:08] ===\n\nfirst line second line"
+        );
+    }
+
+    #[test]
+    fn emits_consecutive_chapters_that_contain_no_speech() {
+        let r = result(&[(30.0, "late start")]);
+        let chapters = [
+            ("Credits".to_string(), 0.0),
+            ("Dedication".to_string(), 10.0),
+            ("Chapter One".to_string(), 20.0),
+        ];
+        let out = to_chaptered_text(&r, &chapters);
+        assert!(out.contains("=== Credits [00:00:00] ==="));
+        assert!(out.contains("=== Dedication [00:00:10] ==="));
+        assert!(out.ends_with("=== Chapter One [00:00:20] ===\n\nlate start"));
+    }
+
+    #[test]
+    fn keeps_a_trailing_chapter_inside_the_audio_but_past_the_last_segment() {
+        // "End Credits" with no transcribed speech under it still belongs.
+        let r = result(&[(0.0, "body")]);
+        let chapters = [("Body".to_string(), 0.0), ("End Credits".to_string(), 55.0)];
+        let out = to_chaptered_text(&r, &chapters);
+        assert!(out.ends_with("=== End Credits [00:00:55] ==="));
+    }
+
+    #[test]
+    fn drops_chapters_starting_past_the_end_of_the_audio() {
+        // A trimmed file that kept the original chapter list would otherwise
+        // end in a run of empty headings.
+        let r = result(&[(0.0, "body")]);
+        let chapters = [("Body".to_string(), 0.0), ("Stale".to_string(), 3600.0)];
+        let out = to_chaptered_text(&r, &chapters);
+        assert_eq!(out, "=== Body [00:00:00] ===\n\nbody");
+    }
 }

@@ -3,6 +3,7 @@ use crate::deepgram;
 use crate::flac_utils;
 use crate::parakeet;
 use crate::sherpa;
+use crate::mp4_chapters;
 use crate::silence_trim;
 use crate::transcriber::{
     self, TranscriptionProgress, TranscriptionResult, WhisperModel,
@@ -617,22 +618,37 @@ pub async fn transcribe_file(
     let result = tokio::task::spawn_blocking(move || {
         let transcriber = transcriber::Transcriber::new(&model, threads)?;
 
-        let progress_cb: Arc<Mutex<dyn FnMut(f32) + Send>> = Arc::new(Mutex::new({
+        // Decode+resample own the first slice of the bar. The split is an
+        // estimate -- the honest detail is in the status text -- but it beats a
+        // bar sitting at zero for minutes while a 9-hour audiobook decodes.
+        const DECODE_SHARE: f32 = 0.15;
+        let progress_cb: transcriber::StageProgress = Arc::new(Mutex::new({
             let win = win.clone();
             let jid = jid.clone();
             let fname = fname.clone();
             let ct = ct.clone();
-            move |progress: f32| {
+            move |progress: f32, stage: &str| {
                 if ct.is_cancelled() {
                     return;
                 }
+                let (scaled, status) = match stage {
+                    "decoding" => (
+                        progress * DECODE_SHARE,
+                        format!("decoding {}%", (progress * 100.0) as u32),
+                    ),
+                    "resampling" => (DECODE_SHARE, "resampling".to_string()),
+                    _ => (
+                        DECODE_SHARE + progress * (1.0 - DECODE_SHARE),
+                        "transcribing".to_string(),
+                    ),
+                };
                 win.emit(
                     "transcription-progress",
                     TranscriptionProgress {
                         job_id: jid.clone(),
                         file: fname.clone(),
-                        progress,
-                        status: "transcribing".to_string(),
+                        progress: scaled,
+                        status,
                     },
                 )
                 .ok();
@@ -670,6 +686,13 @@ pub async fn transcribe_file(
         job.output_format.split(',').map(|s| s.trim()).collect()
     };
 
+    // An .m4b audiobook states its own chapters; interleaving them into the
+    // plain-text transcript costs nothing and makes a multi-hour book readable.
+    let embedded_chapters: Vec<(String, f64)> = mp4_chapters::read_chapters(std::path::Path::new(&job.path))
+        .into_iter()
+        .map(|c| (c.title, c.start_secs))
+        .collect();
+
     for fmt in &formats {
         let ext = *fmt;
         let out_path = output_dir.join(format!("{}_transcription_{}.{}", stem, job.model, ext));
@@ -677,7 +700,7 @@ pub async fn transcribe_file(
             "srt" => transcriber::to_srt(&result),
             "vtt" => transcriber::to_vtt(&result),
             "json" => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            _ => result.text.clone(),
+            _ => transcriber::to_chaptered_text(&result, &embedded_chapters),
         };
         std::fs::write(&out_path, content)
             .map_err(|e| format!("Failed to write {}: {}", out_path.display(), e))?;
@@ -1400,6 +1423,31 @@ pub async fn embed_chapters_in_flac(req: EmbedChaptersRequest) -> Result<String,
     } else {
         Err(format!("Chapter embedding not supported for .{} files", ext))
     }
+}
+
+/// Read chapter markers already embedded in an MP4-family container (.m4b
+/// audiobooks in particular). Returns an empty list when the file has none, so
+/// the caller can fall back to LLM detection.
+#[tauri::command]
+pub async fn read_embedded_chapters(path: String) -> Result<Vec<Chapter>, String> {
+    let chapters = tokio::task::spawn_blocking(move || {
+        mp4_chapters::read_chapters(std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|e| format!("Chapter-read task error: {}", e))?;
+
+    Ok(chapters
+        .into_iter()
+        .map(|c| {
+            let total = c.start_secs.max(0.0) as u64;
+            let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+            Chapter {
+                title: c.title,
+                start_time: format!("{:02}:{:02}:{:02}", h, m, s),
+                start_secs: c.start_secs,
+            }
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -2388,23 +2436,30 @@ pub async fn transcribe_sherpa(
 
         let whisper_result = tokio::task::spawn_blocking(move || {
             let transcriber = transcriber::Transcriber::new(&model_for_whisper, threads)?;
-            let progress_cb: Arc<Mutex<dyn FnMut(f32) + Send>> = Arc::new(Mutex::new({
+            let progress_cb: transcriber::StageProgress = Arc::new(Mutex::new({
                 let win = win.clone();
                 let jid = jid.clone();
                 let fname = fname.clone();
                 let ct = ct.clone();
-                move |progress: f32| {
+                move |progress: f32, stage: &str| {
                     if ct.is_cancelled() {
                         return;
                     }
-                    let scaled = 0.05 + progress * 0.65;
+                    let (scaled, status) = match stage {
+                        "decoding" => (
+                            0.02 + progress * 0.03,
+                            format!("decoding {}%", (progress * 100.0) as u32),
+                        ),
+                        "resampling" => (0.05, "resampling".to_string()),
+                        _ => (0.05 + progress * 0.65, "transcribing".to_string()),
+                    };
                     win.emit(
                         "transcription-progress",
                         TranscriptionProgress {
                             job_id: jid.clone(),
                             file: fname.clone(),
                             progress: scaled,
-                            status: "transcribing".to_string(),
+                            status,
                         },
                     )
                     .ok();
@@ -2642,22 +2697,34 @@ pub async fn transcribe_parakeet(
     let path_for_parakeet = audio_path.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        let progress_cb: Arc<Mutex<dyn FnMut(f32) + Send>> = Arc::new(Mutex::new({
+        const DECODE_SHARE: f32 = 0.15;
+        let progress_cb: transcriber::StageProgress = Arc::new(Mutex::new({
             let win = win.clone();
             let jid = jid.clone();
             let fname = fname.clone();
             let ct = ct.clone();
-            move |progress: f32| {
+            move |progress: f32, stage: &str| {
                 if ct.is_cancelled() {
                     return;
                 }
+                let (scaled, status) = match stage {
+                    "decoding" => (
+                        progress * DECODE_SHARE,
+                        format!("decoding {}%", (progress * 100.0) as u32),
+                    ),
+                    "resampling" => (DECODE_SHARE, "resampling".to_string()),
+                    _ => (
+                        DECODE_SHARE + progress * (1.0 - DECODE_SHARE),
+                        "transcribing".to_string(),
+                    ),
+                };
                 win.emit(
                     "transcription-progress",
                     TranscriptionProgress {
                         job_id: jid.clone(),
                         file: fname.clone(),
-                        progress,
-                        status: "transcribing".to_string(),
+                        progress: scaled,
+                        status,
                     },
                 )
                 .ok();
@@ -2688,6 +2755,13 @@ pub async fn transcribe_parakeet(
         job.output_format.split(',').map(|s| s.trim()).collect()
     };
 
+    // An .m4b audiobook states its own chapters; interleaving them into the
+    // plain-text transcript costs nothing and makes a multi-hour book readable.
+    let embedded_chapters: Vec<(String, f64)> = mp4_chapters::read_chapters(std::path::Path::new(&audio_path))
+        .into_iter()
+        .map(|c| (c.title, c.start_secs))
+        .collect();
+
     for fmt in &formats {
         let ext = *fmt;
         let out_path = output_dir.join(format!("{}_transcription_parakeet.{}", stem, ext));
@@ -2695,7 +2769,7 @@ pub async fn transcribe_parakeet(
             "srt" => transcriber::to_srt(&result),
             "vtt" => transcriber::to_vtt(&result),
             "json" => serde_json::to_string_pretty(&result).unwrap_or_default(),
-            _ => result.text.clone(),
+            _ => transcriber::to_chaptered_text(&result, &embedded_chapters),
         };
         std::fs::write(&out_path, content)
             .map_err(|e| format!("Failed to write {}: {}", out_path.display(), e))?;
@@ -2798,7 +2872,34 @@ pub async fn transcribe_parakeet_sherpa(
     // same PCM — avoids decoding the file twice.
     let (transcript_segments, audio_duration, sherpa_segs) =
         tokio::task::spawn_blocking(move || -> Result<_, String> {
-            let pcm = transcriber::audio_to_pcm(&path_for_job)?;
+            // Same decode-progress lead-in as the other local engines: a long
+            // audiobook spends minutes here before ASR starts.
+            let decode_cb: transcriber::StageProgress = Arc::new(Mutex::new({
+                let win = win.clone();
+                let jid = jid.clone();
+                let fname = fname.clone();
+                let ct = ct.clone();
+                move |progress: f32, stage: &str| {
+                    if ct.is_cancelled() {
+                        return;
+                    }
+                    let status = match stage {
+                        "resampling" => "resampling".to_string(),
+                        _ => format!("decoding {}%", (progress * 100.0) as u32),
+                    };
+                    win.emit(
+                        "transcription-progress",
+                        TranscriptionProgress {
+                            job_id: jid.clone(),
+                            file: fname.clone(),
+                            progress: 0.02 + progress * 0.03,
+                            status,
+                        },
+                    )
+                    .ok();
+                }
+            }));
+            let pcm = transcriber::audio_to_pcm_with_progress(&path_for_job, Some(decode_cb))?;
             let duration = pcm.len() as f64 / 16000.0;
 
             let segments: Vec<(f64, f64, String)>;
@@ -2813,12 +2914,12 @@ pub async fn transcribe_parakeet_sherpa(
                     ));
                 }
             } else {
-                let progress_cb: Arc<Mutex<dyn FnMut(f32) + Send>> = Arc::new(Mutex::new({
+                let progress_cb: transcriber::StageProgress = Arc::new(Mutex::new({
                     let win = win.clone();
                     let jid = jid.clone();
                     let fname = fname.clone();
                     let ct = ct.clone();
-                    move |progress: f32| {
+                    move |progress: f32, _stage: &str| {
                         if ct.is_cancelled() {
                             return;
                         }

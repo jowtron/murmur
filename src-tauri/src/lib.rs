@@ -8,6 +8,7 @@ mod sherpa;
 mod silence_trim;
 mod transcriber;
 mod gap_detection;
+mod mp4_chapters;
 mod template;
 mod yamnet;
 
@@ -69,6 +70,7 @@ pub fn run() {
             commands::fix_seektable,
             commands::fix_seektables_batch,
             commands::embed_chapters_in_flac,
+            commands::read_embedded_chapters,
             commands::write_cue_file,
             commands::delete_file,
             commands::check_transcription_exists,

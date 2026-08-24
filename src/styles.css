@@ -271,6 +271,15 @@ select, input[type="text"], input[type="password"] {
   margin-top: 2px;
 }
 
+/* Projected time remaining, shown beside a running job's percentage. Muted and
+   smaller than the percentage: it is an estimate, not a measurement. */
+.eta {
+  display: block;
+  font-size: 0.65rem;
+  opacity: 0.6;
+  font-weight: normal;
+}
+
 /* Estimated cost / "Free" pill shown next to a completed job's "Done" status.
    cursor: help signals the hover tooltip carries the full breakdown. */
 .cost-badge {

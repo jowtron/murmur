@@ -13,7 +13,6 @@
 
 use crate::transcriber::{self, Segment, TranscriptionResult};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// Directory that holds the extracted Parakeet model directory.
@@ -70,15 +69,16 @@ const MAX_WORD_GAP_SECS: f64 = 0.8;
 /// Transcribe `audio_path` with Parakeet. Decodes to 16 kHz mono PCM, segments
 /// on silence with Silero VAD, decodes each speech chunk, and merges results.
 ///
-/// `progress_cb` receives a 0.0–1.0 fraction; `cancel` is polled between chunks.
+/// `progress_cb` receives a 0.0–1.0 fraction plus the stage it belongs to
+/// (`decoding`, `resampling`, `transcribing`); `cancel` is polled between chunks.
 pub fn transcribe(
     audio_path: &Path,
     num_threads: i32,
     cancel: &CancellationToken,
-    progress_cb: Option<Arc<Mutex<dyn FnMut(f32) + Send>>>,
+    progress_cb: Option<transcriber::StageProgress>,
 ) -> Result<TranscriptionResult, String> {
     // Decode + resample to the 16 kHz mono f32 PCM sherpa requires.
-    let pcm = transcriber::audio_to_pcm(audio_path)?;
+    let pcm = transcriber::audio_to_pcm_with_progress(audio_path, progress_cb.clone())?;
     let file_name = audio_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -94,7 +94,7 @@ pub fn transcribe_pcm(
     file_name: String,
     num_threads: i32,
     cancel: &CancellationToken,
-    progress_cb: Option<Arc<Mutex<dyn FnMut(f32) + Send>>>,
+    progress_cb: Option<transcriber::StageProgress>,
 ) -> Result<TranscriptionResult, String> {
     use sherpa_onnx::{
         OfflineModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
@@ -221,7 +221,7 @@ pub fn transcribe_pcm(
 
         if let Some(cb) = &progress_cb {
             if let Ok(mut f) = cb.lock() {
-                f((idx + 1) as f32 / total as f32);
+                f((idx + 1) as f32 / total as f32, "transcribing");
             }
         }
     }

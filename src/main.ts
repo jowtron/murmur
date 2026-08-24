@@ -86,8 +86,16 @@ interface QueueItem {
   modelUsed?: string;
   startedAt?: number;
   elapsed?: number;
+  // ETA is projected from the *current* stage's observed rate, not the job
+  // lifetime: decoding and transcribing run at wildly different speeds, so a
+  // lifetime average lurches badly at the hand-off.
+  stageKey?: string;
+  stageAnchorAt?: number;
+  stageAnchorProgress?: number;
+  eta?: number;
   autoDetectChapters: boolean;
   chapters?: Chapter[];
+  chaptersSource?: "embedded" | "llm";
   snappedChapters?: ChapterWithSnap[];
   detectStatus?: string;
   engine: Engine;
@@ -306,6 +314,33 @@ function formatElapsed(ms: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
+function formatEta(ms: number): string {
+  const secs = Math.round(ms / 1000);
+  if (secs < 60) return `~${secs}s left`;
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `~${mins}m left`;
+  return `~${Math.floor(mins / 60)}h ${mins % 60}m left`;
+}
+
+// Status-column text while a job runs: stage name, percentage, and ETA.
+function transcribingLabel(item: QueueItem): string {
+  const pct = Math.round(item.progress * 100);
+  const stage = item.stageText;
+  // Decode/resample stages carry their own percentage and must be named, or a
+  // long audiobook looks frozen at 0%. Whisper's own ASR stage says nothing
+  // useful beyond the number, so it keeps the bare percentage it always had.
+  const ownPercent = !!stage && (stage.startsWith("Decoding") || stage.startsWith("Resampling"));
+  let head: string;
+  if (ownPercent) {
+    head = stage!;
+  } else if (stage && item.engine !== "whisper") {
+    head = item.progress > 0 && item.progress < 1 ? `${stage} ${pct}%` : stage;
+  } else {
+    head = `${pct}%`;
+  }
+  return item.eta ? `${head} <span class="eta">${formatEta(item.eta)}</span>` : head;
+}
+
 function engineShort(e: Engine): string {
   switch (e) {
     case "assemblyai": return "AssemblyAI";
@@ -366,7 +401,7 @@ function renderQueue() {
         </div>
         <div class="file-path">${escapeHtml(item.path)}</div>
         ${item.error ? `<div class="error-msg">${escapeHtml(item.error)}</div>` : ""}
-        ${item.chapters ? `<div class="chapters-badge clickable" data-id="${item.id}" style="cursor:pointer; text-decoration:underline;">${item.chapters.length} chapters detected</div> <span class="chapters-badge" style="cursor:pointer;text-decoration:underline;margin-left:6px;" data-align-id="${item.id}">Align</span>` : ""}
+        ${item.chapters ? `<div class="chapters-badge clickable" data-id="${item.id}" style="cursor:pointer; text-decoration:underline;">${item.chapters.length} chapters ${item.chaptersSource === "embedded" ? "from file" : "detected"}</div> <span class="chapters-badge" style="cursor:pointer;text-decoration:underline;margin-left:6px;" data-align-id="${item.id}">Align</span>` : ""}
         ${
           item.status === "transcribing" || item.status === "detecting"
             ? `<div class="progress-bar"><div class="fill" style="width: ${Math.round(item.progress * 100)}%"></div></div>`
@@ -385,7 +420,7 @@ function renderQueue() {
         <span class="status status-${item.status}${item.stageText && item.stageText.endsWith("…") ? " is-working" : ""}">
           ${item.status === "pending" ? "Pending" : ""}
           ${item.status === "queued" ? (item.stageText || "Queued") : ""}
-          ${item.status === "transcribing" ? (item.stageText && item.engine !== "whisper" ? (item.progress > 0 && item.progress < 1 ? `${item.stageText} ${Math.round(item.progress * 100)}%` : item.stageText) : `${Math.round(item.progress * 100)}%`) : ""}
+          ${item.status === "transcribing" ? transcribingLabel(item) : ""}
           ${item.status === "detecting" ? `<span id="detect-status-${item.id}">Detecting...</span>` : ""}
           ${item.status === "complete" ? `Done${costBadgeHtml(item)}` : ""}
           ${item.status === "error" ? "Error" : ""}
@@ -738,12 +773,44 @@ async function checkModelAndPromptDownload(modelName: string): Promise<boolean> 
   });
 }
 
+/// Write the chapter sidecar, then the .cue / FLAC-embed if those are enabled.
+/// Shared by both chapter sources so embedded chapters land exactly where
+/// detected ones do.
+async function writeChapterOutputs(
+  item: QueueItem,
+  chapters: Chapter[],
+  outputDir: string,
+  stem: string,
+  sourceTag: string,
+  skipCueEmbed: boolean,
+): Promise<void> {
+  if (chapters.length === 0) return;
+
+  const settings = loadSettings();
+  const chapterFormat = settings.chapterOutputFormat || "txt";
+  const isJson = chapterFormat === "json";
+  const content = isJson
+    ? JSON.stringify(chapters, null, 2)
+    : chapters.map((ch) => `${ch.start_time} - ${ch.title}`).join("\n");
+  const chapterPath = `${outputDir}/${stem}_chapters_${sourceTag}.${isJson ? "json" : "txt"}`;
+  await invoke("write_text_file", { path: chapterPath, content });
+
+  // Skipped during reprocess so manual alignment isn't clobbered.
+  if (skipCueEmbed) return;
+  if (chkEmbedFlac.checked) {
+    try {
+      await invoke("embed_chapters_in_flac", { req: { audio_path: item.path, chapters } });
+    } catch (embedErr) { console.warn("Embed chapters failed:", embedErr); }
+  }
+  if (chkWriteCue.checked) {
+    try {
+      await invoke("write_cue_file", { audioPath: item.path, chapters });
+    } catch (cueErr) { console.warn("Write cue failed:", cueErr); }
+  }
+}
+
 async function runChapterDetection(item: QueueItem, skipCueEmbed = false): Promise<void> {
   const settings = loadSettings();
-  if (!settings.apiKey) {
-    item.error = (item.error || "") + " (Set an OpenRouter API key in Settings to detect chapters)";
-    return;
-  }
 
   item.status = "detecting";
   renderQueue();
@@ -752,6 +819,26 @@ async function runChapterDetection(item: QueueItem, skipCueEmbed = false): Promi
   const stem = item.name.replace(/\.[^.]+$/, "");
   const model = item.modelUsed || selectModel.value;
   const srtPath = `${outputDir}/${stem}_transcription_${model}.srt`;
+
+  // An .m4b (or any MP4) usually carries its own chapter list. Those are exact,
+  // so prefer them over asking an LLM to infer boundaries from the transcript —
+  // no API key, no cost, no guessing.
+  try {
+    const embedded = await invoke<Chapter[]>("read_embedded_chapters", { path: item.path });
+    if (embedded.length > 0) {
+      item.chapters = embedded;
+      item.chaptersSource = "embedded";
+      await writeChapterOutputs(item, embedded, outputDir, stem, "embedded", skipCueEmbed);
+      return;
+    }
+  } catch (e) {
+    console.warn("Embedded chapter read failed, falling back to detection:", e);
+  }
+
+  if (!settings.apiKey) {
+    item.error = (item.error || "") + " (Set an OpenRouter API key in Settings to detect chapters)";
+    return;
+  }
 
   try {
     const transcript = await invoke<string>("read_text_file", { path: srtPath });
@@ -799,38 +886,10 @@ async function runChapterDetection(item: QueueItem, skipCueEmbed = false): Promi
     }
 
     item.chapters = chapters;
-
-    if (chapters.length > 0) {
-      const chapterFormat = settings.chapterOutputFormat || "txt";
-      let content: string;
-      let ext: string;
-
-      if (chapterFormat === "json") {
-        content = JSON.stringify(chapters, null, 2);
-        ext = "json";
-      } else {
-        content = chapters.map((ch) => `${ch.start_time} - ${ch.title}`).join("\n");
-        ext = "txt";
-      }
-
-      const llmShort = llmModelShort(settings.llmModel);
-      const chapterPath = `${outputDir}/${stem}_chapters_${llmShort}.${ext}`;
-      await invoke("write_text_file", { path: chapterPath, content });
-
-      // Embed chapters in FLAC and write .cue (skip during reprocess to preserve manual alignment)
-      if (!skipCueEmbed) {
-        if (chkEmbedFlac.checked) {
-          try {
-            await invoke("embed_chapters_in_flac", { req: { audio_path: item.path, chapters } });
-          } catch (embedErr) { console.warn("Embed chapters failed:", embedErr); }
-        }
-        if (chkWriteCue.checked) {
-          try {
-            await invoke("write_cue_file", { audioPath: item.path, chapters });
-          } catch (cueErr) { console.warn("Write cue failed:", cueErr); }
-        }
-      }
-    }
+    item.chaptersSource = "llm";
+    await writeChapterOutputs(
+      item, chapters, outputDir, stem, llmModelShort(settings.llmModel), skipCueEmbed,
+    );
   } catch (err: any) {
     const errMsg = typeof err === "string" ? err : err?.message || "Chapter detection failed";
     item.error = (item.error || "") + ` (Chapters: ${errMsg})`;
@@ -3081,6 +3140,24 @@ listen<TranscriptionProgress>("transcription-progress", (event) => {
   if (item) {
     item.progress = data.progress;
     item.stageText = formatStageText(data.status);
+
+    // Anchor on each new stage, then project the remainder from the rate
+    // observed since that anchor.
+    const stageKey = data.status.startsWith("decoding ") ? "decoding" : data.status;
+    if (item.stageKey !== stageKey) {
+      item.stageKey = stageKey;
+      item.stageAnchorAt = Date.now();
+      item.stageAnchorProgress = data.progress;
+      item.eta = undefined;
+    } else if (item.stageAnchorAt !== undefined && item.stageAnchorProgress !== undefined) {
+      const gained = data.progress - item.stageAnchorProgress;
+      const spent = Date.now() - item.stageAnchorAt;
+      // Wait for real movement over real time; anything less projects noise.
+      if (gained > 0.005 && spent > 3000 && data.progress < 1) {
+        item.eta = ((1 - data.progress) / gained) * spent;
+      }
+    }
+    if (data.status === "complete") item.eta = undefined;
     const isActiveStage =
       data.status === "transcribing" ||
       data.status === "uploading" ||
@@ -3106,6 +3183,8 @@ function formatStageText(status: string): string {
     return `Processing (${inner})…`;
   }
   if (status === "loading_model") return "Loading model…";
+  if (status.startsWith("decoding ")) return `Decoding audio ${status.substring("decoding ".length)}…`;
+  if (status === "resampling") return "Resampling to 16 kHz…";
   if (status === "transcribing") return "Transcribing…";
   if (status === "diarizing") return "Diarizing…";
   if (status === "merging") return "Merging speakers…";
