@@ -6,6 +6,7 @@ use symphonia::core::codecs::DecoderOptions;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
+use rubato::Resampler;
 use symphonia::core::probe::Hint;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
@@ -30,6 +31,11 @@ pub struct TranscriptionProgress {
     pub file: String,
     pub progress: f32,
     pub status: String,
+    /// How fast the current stage is running relative to realtime -- audio
+    /// seconds processed per wall-clock second. `None` until there is enough
+    /// of a sample to mean anything.
+    #[serde(default)]
+    pub speed: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +132,11 @@ pub fn is_model_downloaded(model: &WhisperModel) -> bool {
     model_path(model).exists()
 }
 
+/// Input frames handed to the resampler per call. Large enough that per-call
+/// overhead is negligible, small enough that its buffers stay trivial next to
+/// the decoded audio.
+const RESAMPLE_CHUNK: usize = 16384;
+
 /// Progress sink shared by the decode and transcribe phases: a completion
 /// fraction for the *current* stage, plus the stage's name. Callers decide how
 /// to weight the stages against each other, since each pipeline runs a
@@ -187,7 +198,41 @@ pub fn audio_to_pcm_with_progress(
         .make(&codec_params, &DecoderOptions::default())
         .map_err(|e| format!("Failed to create decoder: {}", e))?;
 
-    let mut all_samples: Vec<f32> = Vec::new();
+    // Resample as we decode rather than buffering the whole file at its source
+    // rate first. A 7.6-hour audiobook at 44.1 kHz mono f32 is ~4.8 GB held all
+    // at once, and rubato's one-shot call over it reported no progress and
+    // could not be interrupted. Streaming keeps only a small staging buffer
+    // plus the 16 kHz output the caller actually needs.
+    let target_rate = 16000.0;
+    let needs_resample = (source_rate - target_rate).abs() >= 1.0;
+
+    let mut resampler = if needs_resample {
+        use rubato::{
+            SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+        };
+        let params = SincInterpolationParameters {
+            sinc_len: 256,
+            f_cutoff: 0.95,
+            interpolation: SincInterpolationType::Linear,
+            oversampling_factor: 256,
+            window: WindowFunction::BlackmanHarris2,
+        };
+        Some(
+            SincFixedIn::<f32>::new(target_rate / source_rate, 2.0, params, RESAMPLE_CHUNK, 1)
+                .map_err(|e| format!("Failed to create resampler: {}", e))?,
+        )
+    } else {
+        None
+    };
+
+    // Decoded mono frames waiting to fill the resampler's next input chunk.
+    let mut staging: Vec<f32> = Vec::with_capacity(RESAMPLE_CHUNK * 2);
+    let mut out: Vec<f32> = Vec::new();
+    if total_frames > 0.0 {
+        let ratio = if needs_resample { target_rate / source_rate } else { 1.0 };
+        out.reserve((total_frames * ratio) as usize + RESAMPLE_CHUNK);
+    }
+    let mut decoded_frames: u64 = 0;
     // Emitting on every packet would be thousands of events a second; a packet
     // is ~20-40 ms of audio, so throttle to whole percentage points.
     let mut last_reported_pct = -1i32;
@@ -226,11 +271,33 @@ pub fn audio_to_pcm_with_progress(
             for ch in 0..num_channels {
                 sum += samples[frame * num_channels + ch];
             }
-            all_samples.push(sum / num_channels as f32);
+            staging.push(sum / num_channels as f32);
+        }
+        decoded_frames += num_frames as u64;
+
+        // Feed the resampler whole chunks; the remainder stays staged for the
+        // next packet. Reusing one resampler across calls preserves its sinc
+        // delay line, so the output is continuous across chunk boundaries.
+        if let Some(resampler) = resampler.as_mut() {
+            loop {
+                let want = resampler.input_frames_next();
+                if staging.len() < want {
+                    break;
+                }
+                let mut chunk = resampler
+                    .process(&[&staging[..want]], None)
+                    .map_err(|e| format!("Resampling failed: {}", e))?;
+                if let Some(channel) = chunk.pop() {
+                    out.extend(channel);
+                }
+                staging.drain(..want);
+            }
+        } else {
+            out.append(&mut staging);
         }
 
         if total_frames > 0.0 {
-            let frac = (all_samples.len() as f64 / total_frames).clamp(0.0, 1.0);
+            let frac = (decoded_frames as f64 / total_frames).clamp(0.0, 1.0);
             let pct = (frac * 100.0) as i32;
             if pct > last_reported_pct {
                 last_reported_pct = pct;
@@ -239,38 +306,31 @@ pub fn audio_to_pcm_with_progress(
         }
     }
 
-    // Resample to 16kHz using sinc interpolation (rubato)
-    let target_rate = 16000.0;
-    if (source_rate - target_rate).abs() < 1.0 {
-        return Ok(all_samples);
+    // Whatever is left is shorter than a full chunk; `process_partial` pads it.
+    if let Some(resampler) = resampler.as_mut() {
+        if !staging.is_empty() {
+            let mut chunk = resampler
+                .process_partial(Some(&[&staging[..]]), None)
+                .map_err(|e| format!("Resampling failed: {}", e))?;
+            if let Some(channel) = chunk.pop() {
+                out.extend(channel);
+            }
+        }
+        // That last call emits a whole chunk's worth of output regardless of
+        // how short the real remainder was, leaving up to a chunk of
+        // padding-derived silence on the end. Cut back to the length the input
+        // actually implies, or the file reads as a fraction of a second longer
+        // than it is.
+        let expected = (decoded_frames as f64 * (target_rate / source_rate)).round() as usize;
+        if out.len() > expected {
+            out.truncate(expected);
+        }
+    } else {
+        out.append(&mut staging);
     }
 
-    // Rubato processes the whole buffer in one call, so there is no inner
-    // progress to report -- name the stage so a long pause is at least legible.
-    report(1.0, "resampling");
-
-    use rubato::{SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction, Resampler};
-
-    let params = SincInterpolationParameters {
-        sinc_len: 256,
-        f_cutoff: 0.95,
-        interpolation: SincInterpolationType::Linear,
-        oversampling_factor: 256,
-        window: WindowFunction::BlackmanHarris2,
-    };
-
-    let mut resampler = SincFixedIn::<f32>::new(
-        target_rate / source_rate,
-        2.0,
-        params,
-        all_samples.len(),
-        1,
-    ).map_err(|e| format!("Failed to create resampler: {}", e))?;
-
-    let result = resampler.process(&[&all_samples], None)
-        .map_err(|e| format!("Resampling failed: {}", e))?;
-
-    Ok(result.into_iter().next().unwrap_or_default())
+    report(1.0, "decoding");
+    Ok(out)
 }
 
 /// Get audio duration in seconds using symphonia

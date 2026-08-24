@@ -31,6 +31,10 @@ interface TranscriptionProgress {
   file: string;
   progress: number;
   status: string;
+  // Realtime multiplier for the current stage: audio seconds handled per
+  // wall-clock second. Absent until there is enough of a sample to mean
+  // anything, and on stages that don't measure it.
+  speed?: number | null;
 }
 
 interface ModelDownloadProgress {
@@ -93,6 +97,7 @@ interface QueueItem {
   stageAnchorAt?: number;
   stageAnchorProgress?: number;
   eta?: number;
+  speed?: number;
   autoDetectChapters: boolean;
   chapters?: Chapter[];
   chaptersSource?: "embedded" | "llm";
@@ -338,7 +343,13 @@ function transcribingLabel(item: QueueItem): string {
   } else {
     head = `${pct}%`;
   }
-  return item.eta ? `${head} <span class="eta">${formatEta(item.eta)}</span>` : head;
+  // The multiplier is measured, unlike the bar's split between stages, so it
+  // is the more trustworthy number of the two.
+  const detail = [
+    item.speed ? `${item.speed >= 10 ? Math.round(item.speed) : item.speed.toFixed(1)}×` : "",
+    item.eta ? formatEta(item.eta) : "",
+  ].filter(Boolean).join(" · ");
+  return detail ? `${head} <span class="eta">${detail}</span>` : head;
 }
 
 function engineShort(e: Engine): string {
@@ -3140,6 +3151,7 @@ listen<TranscriptionProgress>("transcription-progress", (event) => {
   if (item) {
     item.progress = data.progress;
     item.stageText = formatStageText(data.status);
+    item.speed = data.speed ?? undefined;
 
     // Anchor on each new stage, then project the remainder from the rate
     // observed since that anchor.
@@ -3184,7 +3196,6 @@ function formatStageText(status: string): string {
   }
   if (status === "loading_model") return "Loading model…";
   if (status.startsWith("decoding ")) return `Decoding audio ${status.substring("decoding ".length)}…`;
-  if (status === "resampling") return "Resampling to 16 kHz…";
   if (status === "transcribing") return "Transcribing…";
   if (status === "diarizing") return "Diarizing…";
   if (status === "merging") return "Merging speakers…";

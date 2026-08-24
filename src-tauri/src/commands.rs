@@ -606,6 +606,7 @@ pub async fn transcribe_file(
                 file: file_name.clone(),
                 progress: 0.0,
                 status: "loading_model".to_string(),
+                speed: None,
             },
         )
         .ok();
@@ -614,46 +615,20 @@ pub async fn transcribe_file(
     let jid = job_id.clone();
     let fname = file_name.clone();
     let ct = cancel_token.clone();
+    // Container metadata only -- cheap, and it lets the progress bar talk in
+    // realtime multiples instead of bare percentages.
+    let audio_secs = transcriber::get_duration(&audio_path).unwrap_or(0.0);
+    let model_key = job.model.clone();
+    let observed: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    let observed_out = observed.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         let transcriber = transcriber::Transcriber::new(&model, threads)?;
 
-        // Decode+resample own the first slice of the bar. The split is an
-        // estimate -- the honest detail is in the status text -- but it beats a
-        // bar sitting at zero for minutes while a 9-hour audiobook decodes.
-        const DECODE_SHARE: f32 = 0.15;
-        let progress_cb: transcriber::StageProgress = Arc::new(Mutex::new({
-            let win = win.clone();
-            let jid = jid.clone();
-            let fname = fname.clone();
-            let ct = ct.clone();
-            move |progress: f32, stage: &str| {
-                if ct.is_cancelled() {
-                    return;
-                }
-                let (scaled, status) = match stage {
-                    "decoding" => (
-                        progress * DECODE_SHARE,
-                        format!("decoding {}%", (progress * 100.0) as u32),
-                    ),
-                    "resampling" => (DECODE_SHARE, "resampling".to_string()),
-                    _ => (
-                        DECODE_SHARE + progress * (1.0 - DECODE_SHARE),
-                        "transcribing".to_string(),
-                    ),
-                };
-                win.emit(
-                    "transcription-progress",
-                    TranscriptionProgress {
-                        job_id: jid.clone(),
-                        file: fname.clone(),
-                        progress: scaled,
-                        status,
-                    },
-                )
-                .ok();
-            }
-        }));
+        let progress_cb = local_progress_sink(
+            win.clone(), jid.clone(), fname.clone(), ct.clone(),
+            model_key.clone(), audio_secs, (0.0, 1.0), observed.clone(),
+        );
 
         if job.per_word {
             transcriber.transcribe_per_word(&audio_path, Some(progress_cb))
@@ -667,6 +642,12 @@ pub async fn transcribe_file(
     // Check if cancelled during transcription
     if cancel_token.is_cancelled() {
         return Err("Cancelled".to_string());
+    }
+
+    // Remember how fast this model ran so the next job can weight its progress
+    // bar by measurement rather than the first-run constant.
+    if let Some(speed) = *observed_out.lock().unwrap() {
+        record_speed(&job.model, speed);
     }
 
     // Save output
@@ -714,6 +695,7 @@ pub async fn transcribe_file(
                 file: file_name,
                 progress: 1.0,
                 status: "complete".to_string(),
+                speed: None,
             },
         )
         .ok();
@@ -1428,6 +1410,184 @@ pub async fn embed_chapters_in_flac(req: EmbedChaptersRequest) -> Result<String,
 /// Read chapter markers already embedded in an MP4-family container (.m4b
 /// audiobooks in particular). Returns an empty list when the file has none, so
 /// the caller can fall back to LLM detection.
+// === Local-engine progress pacing ===
+
+/// Decode's slice of the progress bar on the first run with a given model,
+/// before there is a measured transcription speed to weigh it against.
+const DEFAULT_DECODE_SHARE: f32 = 0.15;
+
+/// Where measured transcription speeds are remembered between runs.
+fn speeds_path() -> PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("murmur")
+        .join("engine_speeds.json")
+}
+
+/// Transcription speed per model, in audio seconds per wall-clock second.
+fn load_speeds() -> std::collections::BTreeMap<String, f64> {
+    std::fs::read_to_string(speeds_path())
+        .ok()
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+/// Remember how fast a model actually ran, so the next job's progress bar can
+/// weight decode against transcription by measurement rather than a constant.
+fn record_speed(model: &str, speed: f64) {
+    if !speed.is_finite() || speed <= 0.0 {
+        return;
+    }
+    let mut speeds = load_speeds();
+    // Blend toward the new observation: one odd run -- thermal throttling, or
+    // the machine busy with something else -- shouldn't swing the estimate.
+    let blended = match speeds.get(model) {
+        Some(previous) => previous * 0.6 + speed * 0.4,
+        None => speed,
+    };
+    speeds.insert(model.to_string(), blended);
+
+    let path = speeds_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&speeds) {
+        std::fs::write(path, json).ok();
+    }
+}
+
+/// Splits a local job's progress bar between decoding and transcribing, and
+/// reports how fast each stage is running relative to realtime.
+///
+/// The two stages run at very different speeds, so the split is by *measured*
+/// cost: the decode rate is timed as it happens and weighed against how fast
+/// this model transcribed last time. On the first run with a model there is
+/// nothing to weigh against, so it falls back to `DEFAULT_DECODE_SHARE`.
+struct Pacer {
+    audio_secs: f64,
+    /// Transcription speed this model showed previously, in audio seconds per
+    /// wall-clock second. `None` on a model's first run.
+    expected_speed: Option<f64>,
+    /// The slice of the overall bar these two stages occupy. Engines that run
+    /// further stages afterwards (diarization) pass a narrower one.
+    band: (f32, f32),
+    share: f32,
+    reported: f32,
+}
+
+impl Pacer {
+    fn new(audio_secs: f64, expected_speed: Option<f64>, band: (f32, f32)) -> Self {
+        Self {
+            audio_secs,
+            expected_speed,
+            band,
+            share: DEFAULT_DECODE_SHARE,
+            reported: band.0,
+        }
+    }
+
+    /// Fold in one progress report. `elapsed` is seconds spent in this stage so
+    /// far. Returns the overall bar position and the stage's realtime
+    /// multiplier, the latter only once there is enough of a sample to mean
+    /// something.
+    fn update(&mut self, progress: f32, decoding: bool, elapsed: f64) -> (f32, Option<f32>) {
+        let rate = if elapsed > 0.0 && self.audio_secs > 0.0 && progress > 0.0 {
+            Some(self.audio_secs * progress as f64 / elapsed)
+        } else {
+            None
+        };
+
+        // Two different thresholds on purpose. The multiplier is shown to a
+        // person, so it needs a long enough sample not to flicker; the split
+        // only has to tell the two stages apart, and a short file's decode can
+        // be over in a fraction of a second -- exactly the case where holding
+        // out for a "good" sample would leave the bar on the fallback constant.
+        let min_display_secs = if decoding { 0.5 } else { 1.0 };
+        let speed = if elapsed >= min_display_secs {
+            rate.map(|r| r as f32)
+        } else {
+            None
+        };
+
+        let stage_fraction = if decoding {
+            if let (Some(measured), Some(expected)) = (rate, self.expected_speed) {
+                if progress > 0.05 && elapsed >= 0.05 && measured > 0.0 && expected > 0.0 {
+                    let decode_total = self.audio_secs / measured;
+                    let transcribe_total = self.audio_secs / expected;
+                    self.share =
+                        (decode_total / (decode_total + transcribe_total)).clamp(0.02, 0.5) as f32;
+                }
+            }
+            progress * self.share
+        } else {
+            self.share + progress * (1.0 - self.share)
+        };
+
+        let (start, end) = self.band;
+        // Clamped monotonic: a refining estimate that walked the bar backwards
+        // would read as the job losing ground.
+        let scaled = (start + stage_fraction * (end - start).max(0.0)).max(self.reported);
+        self.reported = scaled;
+        (scaled, speed)
+    }
+}
+
+/// Progress sink for a local (Whisper/Parakeet) job: owns the stage timers and
+/// emits what `Pacer` works out.
+#[allow(clippy::too_many_arguments)]
+fn local_progress_sink(
+    window: Window,
+    job_id: String,
+    file_name: String,
+    cancel: CancellationToken,
+    model_key: String,
+    audio_secs: f64,
+    band: (f32, f32),
+    observed: Arc<Mutex<Option<f64>>>,
+) -> transcriber::StageProgress {
+    let mut pacer = Pacer::new(audio_secs, load_speeds().get(&model_key).copied(), band);
+    let mut decode_started: Option<std::time::Instant> = None;
+    let mut transcribe_started: Option<std::time::Instant> = None;
+
+    Arc::new(Mutex::new(move |progress: f32, stage: &str| {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let decoding = stage == "decoding";
+        let started = if decoding {
+            *decode_started.get_or_insert(now)
+        } else {
+            *transcribe_started.get_or_insert(now)
+        };
+
+        let (scaled, speed) =
+            pacer.update(progress, decoding, now.duration_since(started).as_secs_f64());
+        if !decoding {
+            if let Some(measured) = speed {
+                *observed.lock().unwrap() = Some(measured as f64);
+            }
+        }
+
+        window
+            .emit(
+                "transcription-progress",
+                TranscriptionProgress {
+                    job_id: job_id.clone(),
+                    file: file_name.clone(),
+                    progress: scaled,
+                    status: if decoding {
+                        format!("decoding {}%", (progress * 100.0) as u32)
+                    } else {
+                        "transcribing".to_string()
+                    },
+                    speed,
+                },
+            )
+            .ok();
+    }))
+}
+
 #[tauri::command]
 pub async fn read_embedded_chapters(path: String) -> Result<Vec<Chapter>, String> {
     let chapters = tokio::task::spawn_blocking(move || {
@@ -1723,6 +1883,7 @@ fn emit_aai(window: &Window, job_id: &str, file: &str, progress: f32, status: &s
                 file: file.to_string(),
                 progress,
                 status: status.to_string(),
+                speed: None,
             },
         )
         .ok();
@@ -2433,42 +2594,25 @@ pub async fn transcribe_sherpa(
         let ct = cancel_token.clone();
         let model_for_whisper = model.clone();
         let path_for_whisper = audio_path.clone();
+        let audio_secs = transcriber::get_duration(&audio_path).unwrap_or(0.0);
+        let model_key = job.model.clone();
+        let observed: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+        let observed_out = observed.clone();
 
         let whisper_result = tokio::task::spawn_blocking(move || {
             let transcriber = transcriber::Transcriber::new(&model_for_whisper, threads)?;
-            let progress_cb: transcriber::StageProgress = Arc::new(Mutex::new({
-                let win = win.clone();
-                let jid = jid.clone();
-                let fname = fname.clone();
-                let ct = ct.clone();
-                move |progress: f32, stage: &str| {
-                    if ct.is_cancelled() {
-                        return;
-                    }
-                    let (scaled, status) = match stage {
-                        "decoding" => (
-                            0.02 + progress * 0.03,
-                            format!("decoding {}%", (progress * 100.0) as u32),
-                        ),
-                        "resampling" => (0.05, "resampling".to_string()),
-                        _ => (0.05 + progress * 0.65, "transcribing".to_string()),
-                    };
-                    win.emit(
-                        "transcription-progress",
-                        TranscriptionProgress {
-                            job_id: jid.clone(),
-                            file: fname.clone(),
-                            progress: scaled,
-                            status,
-                        },
-                    )
-                    .ok();
-                }
-            }));
+            let progress_cb = local_progress_sink(
+                win.clone(), jid.clone(), fname.clone(), ct.clone(),
+                model_key.clone(), audio_secs, (0.02, 0.70), observed.clone(),
+            );
             transcriber.transcribe(&path_for_whisper, Some(progress_cb))
         })
         .await
         .map_err(|e| format!("Whisper task error: {}", e))??;
+
+        if let Some(speed) = *observed_out.lock().unwrap() {
+            record_speed(&job.model, speed);
+        }
 
         whisper_segments = whisper_result
             .segments
@@ -2686,6 +2830,7 @@ pub async fn transcribe_parakeet(
                 file: file_name.clone(),
                 progress: 0.0,
                 status: "loading_model".to_string(),
+                speed: None,
             },
         )
         .ok();
@@ -2695,45 +2840,23 @@ pub async fn transcribe_parakeet(
     let fname = file_name.clone();
     let ct = cancel_token.clone();
     let path_for_parakeet = audio_path.clone();
+    let audio_secs = transcriber::get_duration(&audio_path).unwrap_or(0.0);
+    let observed: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    let observed_out = observed.clone();
 
     let result = tokio::task::spawn_blocking(move || {
-        const DECODE_SHARE: f32 = 0.15;
-        let progress_cb: transcriber::StageProgress = Arc::new(Mutex::new({
-            let win = win.clone();
-            let jid = jid.clone();
-            let fname = fname.clone();
-            let ct = ct.clone();
-            move |progress: f32, stage: &str| {
-                if ct.is_cancelled() {
-                    return;
-                }
-                let (scaled, status) = match stage {
-                    "decoding" => (
-                        progress * DECODE_SHARE,
-                        format!("decoding {}%", (progress * 100.0) as u32),
-                    ),
-                    "resampling" => (DECODE_SHARE, "resampling".to_string()),
-                    _ => (
-                        DECODE_SHARE + progress * (1.0 - DECODE_SHARE),
-                        "transcribing".to_string(),
-                    ),
-                };
-                win.emit(
-                    "transcription-progress",
-                    TranscriptionProgress {
-                        job_id: jid.clone(),
-                        file: fname.clone(),
-                        progress: scaled,
-                        status,
-                    },
-                )
-                .ok();
-            }
-        }));
+        let progress_cb = local_progress_sink(
+            win.clone(), jid.clone(), fname.clone(), ct.clone(),
+            "parakeet".to_string(), audio_secs, (0.0, 1.0), observed.clone(),
+        );
         parakeet::transcribe(&path_for_parakeet, threads, &ct, Some(progress_cb))
     })
     .await
     .map_err(|e| format!("Task error: {}", e))??;
+
+    if let Some(speed) = *observed_out.lock().unwrap() {
+        record_speed("parakeet", speed);
+    }
 
     if cancel_token.is_cancelled() {
         return Err("Cancelled".to_string());
@@ -2783,6 +2906,7 @@ pub async fn transcribe_parakeet(
                 file: file_name,
                 progress: 1.0,
                 status: "complete".to_string(),
+                speed: None,
             },
         )
         .ok();
@@ -2861,45 +2985,26 @@ pub async fn transcribe_parakeet_sherpa(
     // Whisper+Sherpa engine reuses an existing Whisper SRT.
     let existing_srt = output_dir.join(format!("{}_transcription_parakeet.srt", stem));
 
-    let win = window.clone();
-    let jid = job_id.clone();
     let fname = file_name.clone();
     let ct = cancel_token.clone();
     let path_for_job = audio_path.clone();
     let reuse_srt = existing_srt.exists();
+    let audio_secs = transcriber::get_duration(&audio_path).unwrap_or(0.0);
+    let observed: Arc<Mutex<Option<f64>>> = Arc::new(Mutex::new(None));
+    let observed_out = observed.clone();
+    // One sink for both stages: sharing it keeps a single `Pacer`, so the
+    // decode it times is the same one weighed against the ASR that follows.
+    let progress_sink = local_progress_sink(
+        window.clone(), job_id.clone(), file_name.clone(), cancel_token.clone(),
+        "parakeet".to_string(), audio_secs, (0.02, 0.70), observed,
+    );
 
     // Decode once, then run Parakeet (unless reusing an SRT) and Sherpa on the
     // same PCM — avoids decoding the file twice.
     let (transcript_segments, audio_duration, sherpa_segs) =
         tokio::task::spawn_blocking(move || -> Result<_, String> {
-            // Same decode-progress lead-in as the other local engines: a long
-            // audiobook spends minutes here before ASR starts.
-            let decode_cb: transcriber::StageProgress = Arc::new(Mutex::new({
-                let win = win.clone();
-                let jid = jid.clone();
-                let fname = fname.clone();
-                let ct = ct.clone();
-                move |progress: f32, stage: &str| {
-                    if ct.is_cancelled() {
-                        return;
-                    }
-                    let status = match stage {
-                        "resampling" => "resampling".to_string(),
-                        _ => format!("decoding {}%", (progress * 100.0) as u32),
-                    };
-                    win.emit(
-                        "transcription-progress",
-                        TranscriptionProgress {
-                            job_id: jid.clone(),
-                            file: fname.clone(),
-                            progress: 0.02 + progress * 0.03,
-                            status,
-                        },
-                    )
-                    .ok();
-                }
-            }));
-            let pcm = transcriber::audio_to_pcm_with_progress(&path_for_job, Some(decode_cb))?;
+            let pcm =
+                transcriber::audio_to_pcm_with_progress(&path_for_job, Some(progress_sink.clone()))?;
             let duration = pcm.len() as f64 / 16000.0;
 
             let segments: Vec<(f64, f64, String)>;
@@ -2914,30 +3019,9 @@ pub async fn transcribe_parakeet_sherpa(
                     ));
                 }
             } else {
-                let progress_cb: transcriber::StageProgress = Arc::new(Mutex::new({
-                    let win = win.clone();
-                    let jid = jid.clone();
-                    let fname = fname.clone();
-                    let ct = ct.clone();
-                    move |progress: f32, _stage: &str| {
-                        if ct.is_cancelled() {
-                            return;
-                        }
-                        let scaled = 0.05 + progress * 0.65;
-                        win.emit(
-                            "transcription-progress",
-                            TranscriptionProgress {
-                                job_id: jid.clone(),
-                                file: fname.clone(),
-                                progress: scaled,
-                                status: "transcribing".to_string(),
-                            },
-                        )
-                        .ok();
-                    }
-                }));
-                let result =
-                    parakeet::transcribe_pcm(&pcm, fname.clone(), threads, &ct, Some(progress_cb))?;
+                let result = parakeet::transcribe_pcm(
+                    &pcm, fname.clone(), threads, &ct, Some(progress_sink.clone()),
+                )?;
                 segments = result
                     .segments
                     .iter()
@@ -2957,6 +3041,13 @@ pub async fn transcribe_parakeet_sherpa(
 
     if cancel_token.is_cancelled() {
         return Err("Cancelled".to_string());
+    }
+
+    // Only a real ASR pass measures anything; a reused SRT skipped it.
+    if !reuse_srt {
+        if let Some(speed) = *observed_out.lock().unwrap() {
+            record_speed("parakeet", speed);
+        }
     }
 
     emit_aai(&window, &job_id, &file_name, 0.92, "merging");
@@ -2993,4 +3084,78 @@ pub async fn transcribe_parakeet_sherpa(
         speaker_count: speakers.len(),
         duration_secs: Some(audio_duration),
     })
+}
+
+#[cfg(test)]
+mod pacer_tests {
+    use super::{Pacer, DEFAULT_DECODE_SHARE};
+
+    /// One hour of audio, decoded at 100x realtime (36 s) and transcribed at
+    /// 10x (360 s): decode is a tenth of the work, so it should get about a
+    /// tenth of the bar.
+    #[test]
+    fn weights_the_split_by_measured_cost() {
+        let mut pacer = Pacer::new(3600.0, Some(10.0), (0.0, 1.0));
+        // Half the decode done after 18 s => 100x realtime.
+        let (bar, speed) = pacer.update(0.5, true, 18.0);
+        assert_eq!(speed.map(|s| s.round()), Some(100.0));
+        let share = pacer.share;
+        assert!((share - 0.0909).abs() < 0.005, "share was {share}");
+        assert!((bar - 0.5 * share).abs() < 1e-6);
+    }
+
+    #[test]
+    fn falls_back_to_the_constant_without_a_prior_measurement() {
+        let mut pacer = Pacer::new(3600.0, None, (0.0, 1.0));
+        pacer.update(0.5, true, 18.0);
+        assert_eq!(pacer.share, DEFAULT_DECODE_SHARE);
+    }
+
+    #[test]
+    fn transcription_spans_the_rest_of_the_bar() {
+        let mut pacer = Pacer::new(3600.0, Some(10.0), (0.0, 1.0));
+        pacer.update(1.0, true, 36.0);
+        let share = pacer.share;
+        let (bar, _) = pacer.update(0.5, false, 180.0);
+        assert!((bar - (share + 0.5 * (1.0 - share))).abs() < 1e-6);
+        let (done, _) = pacer.update(1.0, false, 360.0);
+        assert!((done - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn never_walks_backwards_when_the_estimate_refines() {
+        let mut pacer = Pacer::new(3600.0, Some(10.0), (0.0, 1.0));
+        // An early, wildly pessimistic decode rate inflates decode's share...
+        let (first, _) = pacer.update(0.10, true, 60.0);
+        // ...then the decode turns out to be much faster, shrinking it.
+        let (second, _) = pacer.update(0.20, true, 62.0);
+        assert!(pacer.share < 0.5);
+        assert!(second >= first, "bar went backwards: {first} -> {second}");
+    }
+
+    #[test]
+    fn stays_inside_its_band() {
+        let mut pacer = Pacer::new(3600.0, Some(10.0), (0.02, 0.70));
+        let (start, _) = pacer.update(0.0, true, 0.0);
+        assert!(start >= 0.02);
+        let (end, _) = pacer.update(1.0, false, 360.0);
+        assert!((end - 0.70).abs() < 1e-6, "ended at {end}");
+    }
+
+    #[test]
+    fn withholds_the_multiplier_until_the_sample_is_long_enough() {
+        let mut pacer = Pacer::new(3600.0, Some(10.0), (0.0, 1.0));
+        assert_eq!(pacer.update(0.01, true, 0.2).1, None);
+        assert_eq!(pacer.update(0.5, false, 0.4).1, None);
+        assert!(pacer.update(0.5, false, 180.0).1.is_some());
+    }
+
+    #[test]
+    fn reports_nothing_when_the_duration_is_unknown() {
+        let mut pacer = Pacer::new(0.0, Some(10.0), (0.0, 1.0));
+        let (bar, speed) = pacer.update(0.5, true, 10.0);
+        assert_eq!(speed, None);
+        // Still paces the bar off the fallback share.
+        assert!((bar - 0.5 * DEFAULT_DECODE_SHARE).abs() < 1e-6);
+    }
 }
