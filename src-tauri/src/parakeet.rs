@@ -239,6 +239,9 @@ pub fn transcribe_pcm(
         segments,
         text: full_text,
         duration_secs,
+        // The guard is Whisper-specific for now; Parakeet is a transducer with
+        // its own failure modes and has not been diagnosed for this.
+        repetition_warning: None,
     })
 }
 

@@ -23,6 +23,11 @@ pub struct TranscriptionResult {
     pub segments: Vec<Segment>,
     pub text: String,
     pub duration_secs: f64,
+    /// Set when `repetition_loop_ranges` had to drop runaway repeats, so the
+    /// caller can tell the user part of the audio went untranscribed. Optional
+    /// and skipped when empty to keep the .json output shape unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repetition_warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,22 +422,123 @@ impl Transcriber {
         per_word: bool,
     ) -> Result<TranscriptionResult, String> {
         let samples = audio_to_pcm_with_progress(audio_path, progress_cb.clone())?;
-        let duration_secs = samples.len() as f64 / 16000.0;
+        let duration_secs = samples.len() as f64 / SAMPLE_RATE as f64;
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let bounds = chunk_boundaries(&samples);
+        let chunk_count = bounds.len() - 1;
+
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut raw_texts: Vec<String> = Vec::new();
+        let mut unrecovered: Vec<(f64, f64, usize)> = Vec::new();
+
+        for c in 0..chunk_count {
+            let (from, to) = (bounds[c], bounds[c + 1]);
+
+            // Each attempt is a perturbation, not just a retry. The collapse is
+            // chaotically input-sensitive — a sub-sample resampling difference
+            // was enough to flip the same audio between looping and clean — so
+            // decoding the same samples differently is usually enough to escape
+            // it. Ordered cheapest first; we stop at the first clean result.
+            let attempts: [(SamplingStrategy, usize); 3] = [
+                (SamplingStrategy::Greedy { best_of: 5 }, 0),
+                (SamplingStrategy::BeamSearch { beam_size: 5, patience: -1.0 }, 0),
+                (SamplingStrategy::Greedy { best_of: 5 }, SAMPLE_RATE / 8),
+            ];
+
+            let mut best: Option<(Vec<Segment>, Vec<String>, usize, f64)> = None;
+
+            for (strategy, skip) in attempts {
+                let begin = (from + skip).min(to);
+                if begin >= to {
+                    continue;
+                }
+                let offset = begin as f64 / SAMPLE_RATE as f64;
+                let label = format!("{:?}", strategy);
+                let prog = progress_cb.clone().map(|cb| (cb, c, chunk_count));
+                let (segs, raw) = self.run_window(&samples[begin..to], per_word, strategy, prog)?;
+
+                let lost: usize = repetition_loop_ranges(&segs).iter().map(|r| r.len()).sum();
+                if lost > 0 {
+                    // Worth seeing in logs: a chunk that needs retrying is the
+                    // early warning that a file is prone to this.
+                    eprintln!(
+                        "murmur: chunk {}/{} looped ({} segments) with {:?}; perturbing",
+                        c + 1,
+                        chunk_count,
+                        lost,
+                        label
+                    );
+                }
+                let better = best.as_ref().map_or(true, |(_, _, b, _)| lost < *b);
+                if better {
+                    best = Some((segs, raw, lost, offset));
+                }
+                if lost == 0 {
+                    break;
+                }
+            }
+
+            let Some((mut segs, mut raw, lost, offset)) = best else {
+                continue;
+            };
+
+            // Whatever survived is still the best of the attempts; collapse any
+            // residual loop so the transcript does not silently repeat itself.
+            let dropped = repetition_loop_ranges(&segs);
+            if !dropped.is_empty() {
+                let keep = keep_mask(segs.len(), &dropped);
+                segs = segs.into_iter().zip(&keep).filter(|(_, k)| **k).map(|(x, _)| x).collect();
+                raw = raw.into_iter().zip(&keep).filter(|(_, k)| **k).map(|(x, _)| x).collect();
+                unrecovered.push((offset, to as f64 / SAMPLE_RATE as f64, lost));
+            }
+
+            for mut seg in segs {
+                seg.start += offset;
+                seg.end += offset;
+                segments.push(seg);
+            }
+            raw_texts.extend(raw);
+        }
+
+        Ok(TranscriptionResult {
+            file: audio_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            segments,
+            text: raw_texts.concat().trim().to_string(),
+            duration_secs,
+            repetition_warning: describe_unrecovered(&unrecovered),
+        })
+    }
+
+    /// One bounded `whisper_full` run over `pcm`, with a fresh state so no
+    /// decoder state can carry across chunk boundaries.
+    fn run_window(
+        &self,
+        pcm: &[f32],
+        per_word: bool,
+        strategy: SamplingStrategy,
+        progress: Option<(StageProgress, usize, usize)>,
+    ) -> Result<(Vec<Segment>, Vec<String>), String> {
+        let mut params = FullParams::new(strategy);
         params.set_n_threads(self.thread_count);
         params.set_language(Some("en"));
         params.set_print_progress(false);
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_token_timestamps(true);
-        params.set_split_on_word(true);      // split at word boundaries, not mid-word
+        params.set_split_on_word(true);
         params.set_max_len(if per_word { 1 } else { 20 });
 
-        if let Some(cb) = progress_cb {
-            params.set_progress_callback_safe(move |progress| {
+        if let Some((cb, index, total)) = progress {
+            params.set_progress_callback_safe(move |p| {
                 if let Ok(mut f) = cb.lock() {
-                    f(progress as f32 / 100.0, "transcribing");
+                    // Map this chunk's 0-100 onto its slice of the whole job.
+                    // A retry restarts the chunk, so this can step backwards;
+                    // the Pacer clamps the bar monotonic, so it never shows.
+                    let overall = (index as f32 + (p as f32 / 100.0)) / total as f32;
+                    f(overall, "transcribing");
                 }
             });
         }
@@ -443,37 +549,20 @@ impl Transcriber {
             .map_err(|e| format!("Failed to create state: {}", e))?;
 
         state
-            .full(params, &samples)
+            .full(params, pcm)
             .map_err(|e| format!("Transcription failed: {}", e))?;
 
-        let num_segments = state.full_n_segments().map_err(|e| format!("{}", e))?;
+        let n = state.full_n_segments().map_err(|e| format!("{}", e))?;
         let mut segments = Vec::new();
-        let mut full_text = String::new();
-
-        for i in 0..num_segments {
+        let mut raw = Vec::new();
+        for i in 0..n {
             let start = state.full_get_segment_t0(i).map_err(|e| format!("{}", e))? as f64 / 100.0;
             let end = state.full_get_segment_t1(i).map_err(|e| format!("{}", e))? as f64 / 100.0;
-            let text = state
-                .full_get_segment_text(i)
-                .map_err(|e| format!("{}", e))?;
-
-            full_text.push_str(&text);
-            segments.push(Segment {
-                start,
-                end,
-                text: text.trim().to_string(),
-            });
+            let text = state.full_get_segment_text(i).map_err(|e| format!("{}", e))?;
+            segments.push(Segment { start, end, text: text.trim().to_string() });
+            raw.push(text);
         }
-
-        Ok(TranscriptionResult {
-            file: audio_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            segments,
-            text: full_text.trim().to_string(),
-            duration_secs,
-        })
+        Ok((segments, raw))
     }
 }
 
@@ -532,6 +621,158 @@ pub fn to_chaptered_text(result: &TranscriptionResult, chapters: &[(String, f64)
     out.trim_end().to_string()
 }
 
+pub const SAMPLE_RATE: usize = 16000;
+
+/// Cap on how long a single `whisper_full` run may be.
+///
+/// The decoder can collapse into a repetition loop and then never recover for
+/// the rest of the run — in every observed case it repeated one phrase to
+/// end-of-file rather than resuming. Measured on one 98-minute recording:
+/// greedy lost the last 12 minutes, beam search lost the last 45. Bounding the
+/// run means a collapse can only ever cost part of one chunk. 5 minutes is
+/// chosen because a loop was seen starting 11 minutes into a 17-minute run.
+const CHUNK_SECS: f64 = 300.0;
+/// How far either side of a boundary to hunt for a quiet place to cut.
+const BOUNDARY_SEARCH_SECS: f64 = 20.0;
+/// Width of the window scored while hunting for that quiet place.
+const BOUNDARY_WINDOW_SECS: f64 = 0.4;
+/// A trailing stub shorter than this is merged into the previous chunk.
+const MIN_TAIL_SECS: f64 = 30.0;
+
+/// Split points for `samples`, always starting at 0 and ending at `len()`.
+///
+/// Cuts land at the quietest point near each target boundary rather than on an
+/// exact multiple, so a chunk edge is unlikely to fall mid-word.
+fn chunk_boundaries(samples: &[f32]) -> Vec<usize> {
+    let chunk = (CHUNK_SECS * SAMPLE_RATE as f64) as usize;
+    if samples.len() <= chunk {
+        return vec![0, samples.len()];
+    }
+
+    let search = (BOUNDARY_SEARCH_SECS * SAMPLE_RATE as f64) as usize;
+    let win = (BOUNDARY_WINDOW_SECS * SAMPLE_RATE as f64) as usize;
+    let min_tail = (MIN_TAIL_SECS * SAMPLE_RATE as f64) as usize;
+
+    let mut out = vec![0usize];
+    let mut target = chunk;
+
+    while target + min_tail < samples.len() {
+        let prev = *out.last().unwrap();
+        let lo = target.saturating_sub(search).max(prev + win);
+        let hi = (target + search).min(samples.len().saturating_sub(win));
+        let mut cut = target;
+        if lo < hi {
+            let mut best = f64::MAX;
+            let mut i = lo;
+            while i + win <= hi {
+                let e: f64 = samples[i..i + win].iter().map(|v| (*v as f64) * (*v as f64)).sum();
+                if e < best {
+                    best = e;
+                    cut = i + win / 2;
+                }
+                i += win / 4;
+            }
+        }
+        if cut <= prev {
+            break;
+        }
+        out.push(cut);
+        target = cut + chunk;
+    }
+
+    out.push(samples.len());
+    out
+}
+
+/// Summarise chunks that were still looping after every retry.
+fn describe_unrecovered(spans: &[(f64, f64, usize)]) -> Option<String> {
+    if spans.is_empty() {
+        return None;
+    }
+    let total: usize = spans.iter().map(|(_, _, n)| n).sum();
+    let where_ = spans
+        .iter()
+        .map(|(a, b, _)| format!("{}-{}", format_timestamp_vtt(*a), format_timestamp_vtt(*b)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "{} chunk(s) still looped after retries ({}); {} repeated segment(s) removed. That audio is not transcribed.",
+        spans.len(),
+        where_,
+        total
+    ))
+}
+
+/// Longest repeating block treated as a decoder loop, in segments.
+const REPEAT_MAX_PERIOD: usize = 8;
+/// Consecutive copies before we call it a loop rather than emphatic speech.
+const REPEAT_MIN_COPIES: usize = 6;
+/// Copies left in place, so the transcript still reads as what was said.
+const REPEAT_KEEP_COPIES: usize = 2;
+
+fn normalize_for_repeat(text: &str) -> String {
+    text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Find runs where a block of up to `REPEAT_MAX_PERIOD` segments repeats
+/// consecutively at least `REPEAT_MIN_COPIES` times, and return the ranges
+/// holding the surplus copies.
+///
+/// Whisper can collapse into a repetition loop and emit one phrase for the
+/// rest of the file. `best_of: 5` in `transcribe_inner` is the real fix, but
+/// no decoder setting removes the failure mode outright, and a transcript that
+/// silently stops saying anything is worse than one that says it broke — so
+/// this runs regardless. Matching is on a whole block, not a single segment,
+/// because `set_max_len` splits one repeated phrase across several segments.
+pub fn repetition_loop_ranges(segments: &[Segment]) -> Vec<std::ops::Range<usize>> {
+    let norm: Vec<String> = segments.iter().map(|s| normalize_for_repeat(&s.text)).collect();
+    let n = norm.len();
+    let mut out = Vec::new();
+    let mut i = 0;
+
+    while i < n {
+        // Prefer whichever period covers the most ground; on a tie the
+        // smaller period wins, so a 3-segment phrase is not reported as a
+        // 6-segment one repeating half as often.
+        let mut best: Option<(usize, usize)> = None;
+        for p in 1..=REPEAT_MAX_PERIOD.min(n - i) {
+            if norm[i..i + p].iter().all(|t| t.is_empty()) {
+                continue;
+            }
+            let mut copies = 1;
+            while i + (copies + 1) * p <= n
+                && norm[i..i + p] == norm[i + copies * p..i + (copies + 1) * p]
+            {
+                copies += 1;
+            }
+            if copies >= REPEAT_MIN_COPIES && best.map_or(true, |(bp, bc)| copies * p > bc * bp) {
+                best = Some((p, copies));
+            }
+        }
+
+        match best {
+            Some((p, copies)) => {
+                let end = i + copies * p;
+                out.push(i + REPEAT_KEEP_COPIES * p..end);
+                i = end;
+            }
+            None => i += 1,
+        }
+    }
+    out
+}
+
+fn keep_mask(len: usize, dropped: &[std::ops::Range<usize>]) -> Vec<bool> {
+    let mut keep = vec![true; len];
+    for r in dropped {
+        for k in r.clone() {
+            keep[k] = false;
+        }
+    }
+    keep
+}
+
+
 pub fn to_srt(result: &TranscriptionResult) -> String {
     let mut out = String::new();
     for (i, seg) in result.segments.iter().enumerate() {
@@ -586,7 +827,7 @@ mod chaptered_text_tests {
             .map(|(start, text)| Segment { start: *start, end: start + 5.0, text: text.to_string() })
             .collect();
         let text = segments.iter().map(|s| s.text.clone()).collect::<Vec<_>>().join(" ");
-        TranscriptionResult { file: "book.m4b".into(), segments, text, duration_secs: 60.0 }
+        TranscriptionResult { file: "book.m4b".into(), segments, text, duration_secs: 60.0, repetition_warning: None }
     }
 
     #[test]
@@ -637,5 +878,262 @@ mod chaptered_text_tests {
         let chapters = [("Body".to_string(), 0.0), ("Stale".to_string(), 3600.0)];
         let out = to_chaptered_text(&r, &chapters);
         assert_eq!(out, "=== Body [00:00:00] ===\n\nbody");
+    }
+}
+
+#[cfg(test)]
+mod repetition_tests {
+    use super::{repetition_loop_ranges, Segment, REPEAT_KEEP_COPIES};
+
+    fn segs(texts: &[&str]) -> Vec<Segment> {
+        texts
+            .iter()
+            .enumerate()
+            .map(|(i, t)| Segment {
+                start: i as f64 * 2.0,
+                end: i as f64 * 2.0 + 2.0,
+                text: t.to_string(),
+            })
+            .collect()
+    }
+
+    fn dropped_count(texts: &[&str]) -> usize {
+        repetition_loop_ranges(&segs(texts)).iter().map(|r| r.len()).sum()
+    }
+
+    #[test]
+    fn leaves_ordinary_speech_alone() {
+        let s = segs(&["hello there", "how are you", "fine thanks", "good good"]);
+        assert!(repetition_loop_ranges(&s).is_empty());
+    }
+
+    #[test]
+    fn tolerates_short_emphatic_repetition() {
+        // "yeah yeah yeah yeah" is real speech, not a decoder loop.
+        assert_eq!(dropped_count(&["yeah", "yeah", "yeah", "yeah"]), 0);
+    }
+
+    #[test]
+    fn collapses_a_single_segment_loop() {
+        let texts = vec!["intro"; 1]
+            .into_iter()
+            .chain(std::iter::repeat("i am not going to").take(50))
+            .collect::<Vec<_>>();
+        let ranges = repetition_loop_ranges(&segs(&texts));
+        assert_eq!(ranges.len(), 1);
+        // 50 copies in, REPEAT_KEEP_COPIES survive.
+        assert_eq!(ranges[0].len(), 50 - REPEAT_KEEP_COPIES);
+        assert_eq!(ranges[0].start, 1 + REPEAT_KEEP_COPIES);
+    }
+
+    #[test]
+    fn collapses_a_multi_segment_phrase_loop() {
+        // The real failure: max_len splits one phrase across 3 segments, and
+        // the whole block repeats. Detection must work on the block, not the
+        // individual segment.
+        let mut texts: Vec<&str> = vec!["so there we go"];
+        for _ in 0..40 {
+            texts.extend_from_slice(&["i'm not going to", "be interested", "in you guys"]);
+        }
+        let ranges = repetition_loop_ranges(&segs(&texts));
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].len(), (40 - REPEAT_KEEP_COPIES) * 3);
+    }
+
+    #[test]
+    fn ignores_case_and_whitespace_differences() {
+        let texts = std::iter::repeat("The  Same   Thing")
+            .take(4)
+            .chain(std::iter::repeat("the same thing").take(4))
+            .collect::<Vec<_>>();
+        assert_eq!(dropped_count(&texts), 8 - REPEAT_KEEP_COPIES);
+    }
+
+    #[test]
+    fn does_not_report_empty_segments_as_a_loop() {
+        assert_eq!(dropped_count(&["", "", "", "", "", "", "", ""]), 0);
+    }
+}
+
+#[cfg(test)]
+mod long_file_check {
+    use super::{Transcriber, WhisperModel};
+    use std::path::Path;
+
+    /// End-to-end check against a real recording. Ignored by default because
+    /// it needs a multi-GB model and runs for minutes; the path comes from the
+    /// environment so no personal file path lives in the repo.
+    ///
+    ///   MURMUR_LOOP_CHECK="/path/to/audio.m4a" \
+    ///     cargo test --release long_file -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn long_file_transcribes_to_the_end_without_looping() {
+        let path = std::env::var("MURMUR_LOOP_CHECK")
+            .expect("set MURMUR_LOOP_CHECK to the audio file to check");
+        let threads = std::thread::available_parallelism().map(|n| n.get() as i32).unwrap_or(8);
+
+        let t = Transcriber::new(&WhisperModel::LargeV3, threads).expect("load model");
+        let r = t.transcribe(Path::new(&path), None).expect("transcribe");
+
+        let last_end = r.segments.last().map(|s| s.end).unwrap_or(0.0);
+        let hhmmss = |s: f64| {
+            let s = s.max(0.0) as u64;
+            format!("{:02}:{:02}:{:02}", s / 3600, (s % 3600) / 60, s % 60)
+        };
+
+        println!("audio duration : {} ({:.1}s)", hhmmss(r.duration_secs), r.duration_secs);
+        println!("last segment   : {} ({:.1}s)", hhmmss(last_end), last_end);
+        println!("coverage       : {:.1}%", last_end / r.duration_secs * 100.0);
+        println!("segments       : {}", r.segments.len());
+        println!("chars          : {}", r.text.len());
+        match &r.repetition_warning {
+            Some(w) => println!("GUARD FIRED    : {}", w),
+            None => println!("GUARD          : clean, no loop detected"),
+        }
+        let tail = r.text.chars().rev().take(220).collect::<String>();
+        println!("tail           : ...{}", tail.chars().rev().collect::<String>());
+
+        // Assert on content, not on timestamps: the copies the guard leaves
+        // behind carry timestamps near the end of the file, so a looped run
+        // still reports full coverage. That mistake made an earlier version of
+        // this test pass on a transcript that was missing 12 minutes.
+        assert!(
+            r.repetition_warning.is_none(),
+            "decoder collapsed into a loop: {}",
+            r.repetition_warning.clone().unwrap_or_default()
+        );
+        assert!(
+            last_end >= r.duration_secs * 0.97,
+            "transcript stops at {} of {}",
+            hhmmss(last_end),
+            hhmmss(r.duration_secs)
+        );
+    }
+}
+
+#[cfg(test)]
+mod decode_dump {
+    use super::audio_to_pcm;
+    use std::io::Write;
+    use std::path::Path;
+
+    /// Write our own decode of a region to a wav, so it can be listened to or
+    /// fed back through the model independently of ffmpeg's decode.
+    ///
+    ///   MURMUR_DUMP_SRC=in.m4a MURMUR_DUMP_OUT=out.wav MURMUR_DUMP_FROM=4900 \
+    ///     cargo test --release decode_dump -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn dump_our_decoded_region() {
+        let src = std::env::var("MURMUR_DUMP_SRC").expect("MURMUR_DUMP_SRC");
+        let out = std::env::var("MURMUR_DUMP_OUT").expect("MURMUR_DUMP_OUT");
+        let from: f64 = std::env::var("MURMUR_DUMP_FROM").expect("MURMUR_DUMP_FROM").parse().unwrap();
+
+        let pcm = audio_to_pcm(Path::new(&src)).expect("decode");
+        let start = ((from * 16000.0) as usize).min(pcm.len());
+        let body = &pcm[start..];
+        println!("dumping {} samples ({:.1}s) from {:.1}s", body.len(), body.len() as f64 / 16000.0, from);
+
+        let (mut lo, mut hi, mut clipped) = (f32::MAX, f32::MIN, 0usize);
+        for &v in body {
+            lo = lo.min(v); hi = hi.max(v);
+            if v.abs() > 1.0 { clipped += 1; }
+        }
+        println!("f32 range   : {:.4} .. {:.4}", lo, hi);
+        println!("over +-1.0  : {} samples ({:.4}%)", clipped, clipped as f64 / body.len() as f64 * 100.0);
+
+        let bytes: Vec<u8> = body
+            .iter()
+            .flat_map(|s| ((s.clamp(-1.0, 1.0) * 32767.0) as i16).to_le_bytes())
+            .collect();
+        let mut f = std::fs::File::create(&out).expect("create wav");
+        let (sr, ch, bits) = (16000u32, 1u16, 16u16);
+        f.write_all(b"RIFF").unwrap();
+        f.write_all(&(36 + bytes.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(b"WAVEfmt ").unwrap();
+        f.write_all(&16u32.to_le_bytes()).unwrap();
+        f.write_all(&1u16.to_le_bytes()).unwrap();
+        f.write_all(&ch.to_le_bytes()).unwrap();
+        f.write_all(&sr.to_le_bytes()).unwrap();
+        f.write_all(&(sr * ch as u32 * bits as u32 / 8).to_le_bytes()).unwrap();
+        f.write_all(&(ch * bits / 8).to_le_bytes()).unwrap();
+        f.write_all(&bits.to_le_bytes()).unwrap();
+        f.write_all(b"data").unwrap();
+        f.write_all(&(bytes.len() as u32).to_le_bytes()).unwrap();
+        f.write_all(&bytes).unwrap();
+        println!("wrote {}", out);
+    }
+}
+
+#[cfg(test)]
+mod chunk_boundary_tests {
+    use super::{chunk_boundaries, CHUNK_SECS, MIN_TAIL_SECS, SAMPLE_RATE};
+
+    fn secs(n: f64) -> usize {
+        (n * SAMPLE_RATE as f64) as usize
+    }
+
+    /// Deterministic stand-in for speech: loud everywhere except the gaps.
+    fn tone(len: usize, quiet: &[(usize, usize)]) -> Vec<f32> {
+        let mut v: Vec<f32> = (0..len)
+            .map(|i| ((i as f32) * 0.05).sin() * 0.5)
+            .collect();
+        for (a, b) in quiet {
+            for s in v[*a..*b].iter_mut() {
+                *s = 0.0;
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn a_short_file_is_one_chunk() {
+        let v = tone(secs(60.0), &[]);
+        assert_eq!(chunk_boundaries(&v), vec![0, v.len()]);
+    }
+
+    #[test]
+    fn boundaries_span_the_whole_file_and_increase() {
+        let v = tone(secs(720.0), &[]);
+        let b = chunk_boundaries(&v);
+        assert_eq!(b[0], 0);
+        assert_eq!(*b.last().unwrap(), v.len());
+        assert!(b.len() >= 3, "720s should split into multiple chunks, got {:?}", b.len());
+        assert!(b.windows(2).all(|w| w[0] < w[1]), "boundaries must increase: {:?}", b);
+    }
+
+    #[test]
+    fn no_chunk_exceeds_the_cap() {
+        let v = tone(secs(1300.0), &[]);
+        let b = chunk_boundaries(&v);
+        let longest = b.windows(2).map(|w| w[1] - w[0]).max().unwrap();
+        // A cut may land up to BOUNDARY_SEARCH_SECS late, plus a merged tail.
+        let ceiling = secs(CHUNK_SECS + 20.0 + MIN_TAIL_SECS);
+        assert!(longest <= ceiling, "chunk of {} samples exceeds {}", longest, ceiling);
+    }
+
+    #[test]
+    fn there_is_no_runt_chunk_at_the_end() {
+        // 300s cap with a 310s file: the 10s tail must merge, not stand alone.
+        let v = tone(secs(310.0), &[]);
+        let b = chunk_boundaries(&v);
+        let shortest = b.windows(2).map(|w| w[1] - w[0]).min().unwrap();
+        assert!(shortest >= secs(MIN_TAIL_SECS), "runt chunk of {} samples", shortest);
+    }
+
+    #[test]
+    fn the_cut_lands_in_a_quiet_gap_near_the_boundary() {
+        // Silence from 292s to 294s; the cut for the 300s boundary should
+        // prefer it over slicing through the tone.
+        let gap = (secs(292.0), secs(294.0));
+        let v = tone(secs(720.0), &[gap]);
+        let b = chunk_boundaries(&v);
+        let cut = b[1];
+        assert!(
+            cut >= gap.0 && cut <= gap.1,
+            "cut at {:.1}s did not land in the 292-294s gap",
+            cut as f64 / SAMPLE_RATE as f64
+        );
     }
 }

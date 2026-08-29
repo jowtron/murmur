@@ -24,6 +24,10 @@ interface TranscriptionResult {
   segments: { start: number; end: number; text: string }[];
   text: string;
   duration_secs: number;
+  // Present only when the decoder collapsed into a repetition loop that
+  // survived every retry, meaning part of the audio is missing from the
+  // transcript. Absent on a clean run (the Rust side skips it when empty).
+  repetition_warning?: string | null;
 }
 
 interface TranscriptionProgress {
@@ -98,6 +102,9 @@ interface QueueItem {
   stageAnchorProgress?: number;
   eta?: number;
   speed?: number;
+  // Set from TranscriptionResult.repetition_warning: the transcript is
+  // incomplete. Cleared on every fresh run so a re-transcribe can drop it.
+  repetitionWarning?: string;
   autoDetectChapters: boolean;
   chapters?: Chapter[];
   chaptersSource?: "embedded" | "llm";
@@ -215,6 +222,14 @@ function costBadgeHtml(item: QueueItem): string {
   if (item.costUsd == null) return ""; // unknown (e.g. reused cached output without a duration)
   const cls = item.costUsd === 0 ? "cost-badge cost-free" : "cost-badge";
   return ` <span class="${cls}" title="${item.costNote ? escapeHtml(item.costNote) : ""}">${formatCost(item.costUsd)}</span>`;
+}
+
+// Shown next to "Done" when part of the audio never made it into the
+// transcript. Deliberately loud: a trimmed repetition loop leaves output that
+// looks complete, which is exactly how 12 minutes went missing unnoticed.
+function warningBadgeHtml(item: QueueItem): string {
+  if (item.status !== "complete" || !item.repetitionWarning) return "";
+  return ` <span class="warn-badge" title="${escapeHtml(item.repetitionWarning)}">Incomplete</span>`;
 }
 
 function llmModelShort(fullModel: string): string {
@@ -433,7 +448,7 @@ function renderQueue() {
           ${item.status === "queued" ? (item.stageText || "Queued") : ""}
           ${item.status === "transcribing" ? transcribingLabel(item) : ""}
           ${item.status === "detecting" ? `<span id="detect-status-${item.id}">Detecting...</span>` : ""}
-          ${item.status === "complete" ? `Done${costBadgeHtml(item)}` : ""}
+          ${item.status === "complete" ? `Done${costBadgeHtml(item)}${warningBadgeHtml(item)}` : ""}
           ${item.status === "error" ? "Error" : ""}
           ${item.status === "cancelled" ? "Cancelled" : ""}
         </span>
@@ -1506,9 +1521,10 @@ async function transcribeItemParakeet(item: QueueItem) {
     item.progress = 0;
     item.startedAt = undefined;
     item.elapsed = undefined;
+    item.repetitionWarning = undefined;
     renderQueue();
 
-    await invoke("transcribe_parakeet", {
+    const result = await invoke<TranscriptionResult>("transcribe_parakeet", {
       job: {
         id: item.id,
         path: item.path,
@@ -1517,6 +1533,7 @@ async function transcribeItemParakeet(item: QueueItem) {
         threads,
       },
     });
+    item.repetitionWarning = result?.repetition_warning || undefined;
 
     item.elapsed = Date.now() - (item.startedAt || Date.now());
 
@@ -1884,6 +1901,7 @@ async function transcribeItem(item: QueueItem) {
       item.progress = 0;
       item.startedAt = undefined;
       item.elapsed = undefined;
+      item.repetitionWarning = undefined;
       renderQueue();
 
       // If chapters needed, ensure SRT is produced alongside selected format
@@ -1892,7 +1910,7 @@ async function transcribeItem(item: QueueItem) {
         outputFormat = `${format},srt`;
       }
 
-      await invoke("transcribe_file", {
+      const result = await invoke<TranscriptionResult>("transcribe_file", {
         job: {
           id: item.id,
           path: item.path,
@@ -1903,6 +1921,7 @@ async function transcribeItem(item: QueueItem) {
           per_word: chkPerWord.checked,
         },
       });
+      item.repetitionWarning = result?.repetition_warning || undefined;
 
       item.elapsed = Date.now() - (item.startedAt || Date.now());
 
