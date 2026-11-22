@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 pub struct CachedTrim {
-    pub temp_wav: PathBuf,
+    pub temp_audio: PathBuf,
     pub map: Vec<silence_trim::SegmentMap>,
     pub original_duration: f64,
     pub trimmed_duration: f64,
@@ -1069,6 +1069,20 @@ fn is_video_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether a cloud upload should go up as a re-encoded 16 kHz mono FLAC rather
+/// than the original file, and the stage label to show while that happens.
+/// Video containers always (never upload the picture). Uncompressed and
+/// lossless audio too: the services work at 16 kHz mono, so a 44.1 kHz stereo
+/// WAV or FLAC would send several times the bytes for nothing. Lossy formats
+/// (mp3, m4a, opus...) are already smaller than a 16 kHz FLAC and go as-is.
+fn upload_transcode_label(path: &Path) -> Option<&'static str> {
+    if is_video_file(path) {
+        return Some("extracting audio");
+    }
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    matches!(ext.as_str(), "wav" | "wave" | "aif" | "aiff" | "flac").then_some("compressing audio")
+}
+
 #[tauri::command]
 pub async fn scan_directory(path: String) -> Result<Vec<String>, String> {
     let dir = PathBuf::from(&path);
@@ -1811,7 +1825,7 @@ pub async fn preview_silence_trim(
     let cache = state.trim_cache.clone();
     let path_for_task = path.clone();
     let trim = tokio::task::spawn_blocking(move || {
-        silence_trim::trim_audio_to_temp_wav(
+        silence_trim::trim_audio_to_temp_flac(
             std::path::Path::new(&path_for_task),
             threshold_db,
             min_silence_secs,
@@ -1827,12 +1841,12 @@ pub async fn preview_silence_trim(
     {
         let mut guard = cache.lock().unwrap();
         if let Some(old) = guard.remove(&path) {
-            let _ = std::fs::remove_file(&old.temp_wav);
+            let _ = std::fs::remove_file(&old.temp_audio);
         }
         guard.insert(
             path,
             CachedTrim {
-                temp_wav: trim.temp_wav,
+                temp_audio: trim.temp_audio,
                 map: trim.map,
                 original_duration: trim.original_duration,
                 trimmed_duration: trim.trimmed_duration,
@@ -1850,7 +1864,7 @@ pub async fn preview_silence_trim(
 pub fn discard_trim_preview(path: String, state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.trim_cache.lock().unwrap();
     if let Some(entry) = guard.remove(&path) {
-        let _ = std::fs::remove_file(&entry.temp_wav);
+        let _ = std::fs::remove_file(&entry.temp_audio);
     }
     Ok(())
 }
@@ -1859,7 +1873,7 @@ pub fn discard_trim_preview(path: String, state: State<'_, AppState>) -> Result<
 pub fn discard_all_trim_previews(state: State<'_, AppState>) -> Result<(), String> {
     let mut guard = state.trim_cache.lock().unwrap();
     for (_, entry) in guard.drain() {
-        let _ = std::fs::remove_file(&entry.temp_wav);
+        let _ = std::fs::remove_file(&entry.temp_audio);
     }
     Ok(())
 }
@@ -1887,6 +1901,77 @@ fn emit_aai(window: &Window, job_id: &str, file: &str, progress: f32, status: &s
             },
         )
         .ok();
+}
+
+/// Turns curl's upload readings into queue progress plus a status line like
+/// "uploading 42 / 159 MB · 320 KB/s".
+///
+/// The upload's share of the bar is fixed from the first reading that has a
+/// speed: expected upload time weighed against `server_secs`, the expected
+/// time the service spends after the upload. So a ten-minute upload over a
+/// phone hotspot gets most of the bar, and five seconds on fibre barely
+/// registers. Before this the bar sat at 5% for the whole upload.
+struct UploadMeter<'a> {
+    window: &'a Window,
+    job_id: &'a str,
+    file: &'a str,
+    total_bytes: u64,
+    server_secs: f64,
+    start: f32,
+    /// Where the upload ends on the bar; `None` until a speed is known.
+    end: Option<f32>,
+}
+
+impl<'a> UploadMeter<'a> {
+    /// Bar position the server stage starts from, even if the upload finished
+    /// before curl ever printed a speed.
+    const MAX_END: f32 = 0.85;
+
+    fn new(window: &'a Window, job_id: &'a str, file: &'a str, path: &Path, server_secs: f64) -> Self {
+        let total_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let meter = Self { window, job_id, file, total_bytes, server_secs, start: 0.05, end: None };
+        emit_aai(window, job_id, file, meter.start, &meter.status(0, None));
+        meter
+    }
+
+    fn on(&mut self, p: crate::curl_util::UploadProgress) {
+        if self.end.is_none() && p.bytes_per_sec > 0 && self.total_bytes > 0 {
+            let upload_secs = self.total_bytes as f64 / p.bytes_per_sec as f64;
+            let share = upload_secs / (upload_secs + self.server_secs.max(1.0));
+            self.end = Some((self.start + (0.95 - self.start) * share as f32).clamp(self.start + 0.01, Self::MAX_END));
+        }
+        let sent = if p.done { self.total_bytes } else { p.sent };
+        let frac = if p.done {
+            1.0
+        } else if self.total_bytes > 0 {
+            (sent as f64 / self.total_bytes as f64).min(1.0) as f32
+        } else {
+            0.0
+        };
+        let end = self.end.unwrap_or(self.start);
+        let progress = self.start + (end - self.start) * frac;
+        let speed = (!p.done).then_some(p.bytes_per_sec);
+        emit_aai(self.window, self.job_id, self.file, progress, &self.status(sent, speed));
+    }
+
+    /// Where the upload finished on the bar, for the next stage to start from.
+    fn end(&self) -> f32 {
+        self.end.unwrap_or(self.start + 0.05)
+    }
+
+    fn status(&self, sent: u64, speed: Option<u64>) -> String {
+        let mb = |b: u64| b as f64 / (1024.0 * 1024.0);
+        let fmt_mb = |v: f64| if v < 10.0 { format!("{:.1}", v) } else { format!("{:.0}", v) };
+        let mut s = format!("uploading {} / {} MB", fmt_mb(mb(sent).min(mb(self.total_bytes))), fmt_mb(mb(self.total_bytes)));
+        if let Some(bps) = speed {
+            if bps >= 1024 * 1024 {
+                s.push_str(&format!(" · {:.1} MB/s", mb(bps)));
+            } else {
+                s.push_str(&format!(" · {} KB/s", bps / 1024));
+            }
+        }
+        s
+    }
 }
 
 #[tauri::command]
@@ -1949,7 +2034,7 @@ pub async fn transcribe_assemblyai(
         let cached = state.trim_cache.lock().unwrap().remove(&job.path);
         let trim_result = if let Some(c) = cached {
             silence_trim::TrimResult {
-                temp_wav: c.temp_wav,
+                temp_audio: c.temp_audio,
                 map: c.map,
                 original_duration: c.original_duration,
                 trimmed_duration: c.trimmed_duration,
@@ -1961,7 +2046,7 @@ pub async fn transcribe_assemblyai(
             let min_sil = job.min_silence_secs;
             let pad = job.silence_padding_secs;
             tokio::task::spawn_blocking(move || {
-                silence_trim::trim_audio_to_temp_wav(&src, thr, min_sil, pad)
+                silence_trim::trim_audio_to_temp_flac(&src, thr, min_sil, pad)
             })
             .await
             .map_err(|e| format!("Silence-trim task error: {}", e))??
@@ -1985,19 +2070,18 @@ pub async fn transcribe_assemblyai(
 
         trim_map = trim_result.map;
         uploaded_secs = Some(trim_result.trimmed_duration).filter(|d| *d > 0.0);
-        temp_upload = TempFileGuard(Some(trim_result.temp_wav.clone()));
-        trim_result.temp_wav
-    } else if is_video_file(&audio_path) {
-        // Never upload a video container — extract the audio track to a temp WAV.
-        emit_aai(&window, &job_id, &file_name, 0.02, "extracting audio");
+        temp_upload = TempFileGuard(Some(trim_result.temp_audio.clone()));
+        trim_result.temp_audio
+    } else if let Some(label) = upload_transcode_label(&audio_path) {
+        emit_aai(&window, &job_id, &file_name, 0.02, label);
         let src = audio_path.clone();
-        let wav = tokio::task::spawn_blocking(move || {
-            silence_trim::extract_audio_to_temp_wav(&src)
+        let flac = tokio::task::spawn_blocking(move || {
+            silence_trim::extract_audio_to_temp_flac(&src)
         })
         .await
         .map_err(|e| format!("Audio-extract task error: {}", e))??;
-        temp_upload = TempFileGuard(Some(wav.clone()));
-        wav
+        temp_upload = TempFileGuard(Some(flac.clone()));
+        flac
     } else {
         audio_path.clone()
     };
@@ -2006,12 +2090,17 @@ pub async fn transcribe_assemblyai(
         return Err("Cancelled".to_string());
     }
 
-    emit_aai(&window, &job_id, &file_name, 0.05, "uploading");
-
-    let upload_url = assemblyai::upload_file(&path_for_upload, &job.api_key, &cancel_token).await?;
+    // AssemblyAI's own processing time is estimated below at ~25% of the
+    // uploaded duration; the upload's share of the bar is weighed against it.
+    let expected_processing = uploaded_secs.map(|d| (d * 0.25).max(30.0)).unwrap_or(60.0);
+    let mut meter = UploadMeter::new(&window, &job_id, &file_name, &path_for_upload, expected_processing);
+    let upload_url =
+        assemblyai::upload_file(&path_for_upload, &job.api_key, &cancel_token, |p| meter.on(p)).await?;
     temp_upload.remove_now();
+    // Submit and processing share whatever the upload left.
+    let base = meter.end() + 0.01;
 
-    emit_aai(&window, &job_id, &file_name, 0.10, "submitting");
+    emit_aai(&window, &job_id, &file_name, base, "submitting");
 
     let transcript_id = assemblyai::submit(
         &upload_url,
@@ -2023,7 +2112,8 @@ pub async fn transcribe_assemblyai(
     )
     .await?;
 
-    emit_aai(&window, &job_id, &file_name, 0.15, "processing");
+    let base = base + 0.01;
+    emit_aai(&window, &job_id, &file_name, base, "processing");
 
     // AssemblyAI only reports queued/processing while working, so estimate
     // progress from wall time vs an expected ~25% of the uploaded duration.
@@ -2057,7 +2147,7 @@ pub async fn transcribe_assemblyai(
                     &window,
                     &job_id,
                     &file_name,
-                    0.15,
+                    base,
                     &format!("processing (poll retry {}/5)", consecutive_poll_errors),
                 );
                 tokio::select! {
@@ -2081,9 +2171,9 @@ pub async fn transcribe_assemblyai(
                 let est = match uploaded_secs {
                     Some(d) => {
                         let expected = (d * 0.25).max(30.0);
-                        0.15 + 0.80 * (poll_started.elapsed().as_secs_f64() / expected).min(1.0) as f32
+                        base + (0.95 - base) * (poll_started.elapsed().as_secs_f64() / expected).min(1.0) as f32
                     }
-                    None => 0.15 + elapsed_polls as f32 * 0.01,
+                    None => base + elapsed_polls as f32 * 0.01,
                 }
                 .min(0.95);
                 emit_aai(&window, &job_id, &file_name, est, &format!("processing ({})", t.status));
@@ -2199,30 +2289,44 @@ pub async fn transcribe_deepgram(
         .unwrap_or_default();
     let job_id = job.id.clone();
 
-    // Never upload a video container — extract the audio track to a temp WAV.
     let mut temp_upload = TempFileGuard(None);
-    let path_for_upload = if is_video_file(&audio_path) {
-        emit_aai(&window, &job_id, &file_name, 0.02, "extracting audio");
+    let path_for_upload = if let Some(label) = upload_transcode_label(&audio_path) {
+        emit_aai(&window, &job_id, &file_name, 0.02, label);
         let src = audio_path.clone();
-        let wav = tokio::task::spawn_blocking(move || {
-            silence_trim::extract_audio_to_temp_wav(&src)
+        let flac = tokio::task::spawn_blocking(move || {
+            silence_trim::extract_audio_to_temp_flac(&src)
         })
         .await
         .map_err(|e| format!("Audio-extract task error: {}", e))??;
-        temp_upload = TempFileGuard(Some(wav.clone()));
-        wav
+        temp_upload = TempFileGuard(Some(flac.clone()));
+        flac
     } else {
         audio_path.clone()
     };
 
-    emit_aai(&window, &job_id, &file_name, 0.05, "uploading");
-
+    // Deepgram transcribes inside the same request, so once the last byte is
+    // sent the bar moves to "processing" and waits on the response. Its
+    // turnaround is quick next to most uploads (the job carries no duration
+    // to scale it by), so a flat allowance sets the upload's share.
+    let expected_processing = 30.0;
+    let mut meter = UploadMeter::new(&window, &job_id, &file_name, &path_for_upload, expected_processing);
+    let mut processing_shown = false;
     let response = deepgram::transcribe(
         &path_for_upload,
         &job.api_key,
         &job.model,
         job.language_code.as_deref(),
         &cancel_token,
+        |p| {
+            if p.done {
+                if !processing_shown {
+                    processing_shown = true;
+                    emit_aai(&window, &job_id, &file_name, meter.end(), "processing");
+                }
+            } else {
+                meter.on(p);
+            }
+        },
     )
     .await?;
     temp_upload.remove_now();

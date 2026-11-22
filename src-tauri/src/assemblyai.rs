@@ -1,4 +1,4 @@
-use crate::curl_util::{auth_header_config, run_curl};
+use crate::curl_util::{auth_header_config, run_curl, run_curl_with_progress, UploadProgress};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::Duration;
@@ -54,6 +54,7 @@ pub async fn upload_file(
     path: &Path,
     api_key: &str,
     cancel: &CancellationToken,
+    on_progress: impl FnMut(UploadProgress),
 ) -> Result<String, String> {
     let url = format!("{}/upload", API_BASE);
     let path_str = path
@@ -61,7 +62,7 @@ pub async fn upload_file(
         .ok_or_else(|| "Path is not valid UTF-8".to_string())?;
     let data_arg = format!("@{}", path_str);
 
-    let stdout = run_curl(
+    let stdout = run_curl_with_progress(
         &[
             "--fail-with-body",
             "-X", "POST",
@@ -76,6 +77,7 @@ pub async fn upload_file(
         ],
         &auth_header_config(api_key),
         Some(cancel),
+        on_progress,
     )
     .await?;
 

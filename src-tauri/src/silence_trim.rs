@@ -109,16 +109,16 @@ pub fn detect_speech_regions(
 }
 
 pub struct TrimResult {
-    pub temp_wav: PathBuf,
+    pub temp_audio: PathBuf,
     pub map: Vec<SegmentMap>,
     pub original_duration: f64,
     pub trimmed_duration: f64,
 }
 
-/// Decode the input file, detect speech, splice into a 16 kHz mono 16-bit PCM WAV
+/// Decode the input file, detect speech, splice into a 16 kHz mono 16-bit FLAC
 /// in the OS temp dir, and return the path along with the mapping needed to
 /// translate AssemblyAI timestamps back to the original timeline.
-pub fn trim_audio_to_temp_wav(
+pub fn trim_audio_to_temp_flac(
     audio_path: &Path,
     threshold_db: f32,
     min_silence_secs: f32,
@@ -155,25 +155,25 @@ pub fn trim_audio_to_temp_wav(
     let trimmed_duration = cursor;
 
     let temp_path = std::env::temp_dir()
-        .join(format!("murmur_aai_{}.wav", uuid::Uuid::new_v4()));
-    write_wav_16bit_mono_16k(&temp_path, &out_samples)?;
+        .join(format!("murmur_aai_{}.flac", uuid::Uuid::new_v4()));
+    write_flac_16bit_mono_16k(&temp_path, &out_samples)?;
 
     Ok(TrimResult {
-        temp_wav: temp_path,
+        temp_audio: temp_path,
         map,
         original_duration: total_secs,
         trimmed_duration,
     })
 }
 
-/// Decode the input file into a 16 kHz mono 16-bit PCM WAV in the OS temp dir,
+/// Decode the input file into a 16 kHz mono 16-bit FLAC in the OS temp dir,
 /// with no trimming. Used for video containers so only the audio track is
 /// uploaded to cloud engines, not the (much larger) video stream.
-pub fn extract_audio_to_temp_wav(audio_path: &Path) -> Result<PathBuf, String> {
+pub fn extract_audio_to_temp_flac(audio_path: &Path) -> Result<PathBuf, String> {
     let samples = crate::transcriber::audio_to_pcm(audio_path)?;
     let temp_path = std::env::temp_dir()
-        .join(format!("murmur_extract_{}.wav", uuid::Uuid::new_v4()));
-    write_wav_16bit_mono_16k(&temp_path, &samples)?;
+        .join(format!("murmur_extract_{}.flac", uuid::Uuid::new_v4()));
+    write_flac_16bit_mono_16k(&temp_path, &samples)?;
     Ok(temp_path)
 }
 
@@ -198,40 +198,136 @@ pub fn map_trimmed_ms_to_original_ms(trimmed_ms: u64, map: &[SegmentMap]) -> u64
     trimmed_ms
 }
 
-fn write_wav_16bit_mono_16k(path: &Path, samples: &[f32]) -> Result<(), String> {
-    let sr: u32 = 16_000;
-    let bits_per_sample: u16 = 16;
-    let num_channels: u16 = 1;
-    let byte_rate = sr * (bits_per_sample / 8) as u32 * num_channels as u32;
-    let block_align: u16 = (bits_per_sample / 8) * num_channels;
-    let data_size: u32 = (samples.len() * 2) as u32;
-    let chunk_size: u32 = 36 + data_size;
+/// Encode 16 kHz mono f32 samples as a 16-bit FLAC file.
+///
+/// FLAC rather than WAV because this is what gets uploaded to the cloud
+/// engines: it is lossless (the services decode exactly the samples a WAV
+/// would have carried) at roughly half the bytes, which on a slow uplink is
+/// half the wait. Both AssemblyAI and Deepgram accept FLAC.
+fn write_flac_16bit_mono_16k(path: &Path, samples: &[f32]) -> Result<(), String> {
+    use flacenc::component::BitRepr;
+    use flacenc::error::Verify;
 
+    let config = flacenc::config::Encoder::default()
+        .into_verified()
+        .map_err(|e| format!("FLAC config error: {:?}", e))?;
+    let source = F32Source { samples, pos: 0, scratch: Vec::new() };
+    let mut stream = flacenc::encode_with_fixed_block_size(&config, source, config.block_size)
+        .map_err(|e| format!("FLAC encode failed: {:?}", e))?;
+    // flacenc counts the short final block in STREAMINFO's minimum block
+    // size. The spec excludes it, and with min != max decoders read the
+    // stream as variable-blocksize: libFLAC warns about frame numbering and
+    // symphonia refuses to open the file at all. Restate it as fixed.
+    let max_block = stream.stream_info().max_block_size();
+    stream
+        .stream_info_mut()
+        .set_block_sizes(max_block, max_block)
+        .map_err(|e| format!("FLAC header error: {:?}", e))?;
+    let mut sink = flacenc::bitsink::ByteSink::new();
+    stream
+        .write(&mut sink)
+        .map_err(|e| format!("FLAC write failed: {:?}", e))?;
     let mut file = std::fs::File::create(path)
-        .map_err(|e| format!("Failed to create temp wav: {}", e))?;
-    let w = |f: &mut std::fs::File, b: &[u8]| -> Result<(), String> {
-        f.write_all(b).map_err(|e| e.to_string())
-    };
-    w(&mut file, b"RIFF")?;
-    w(&mut file, &chunk_size.to_le_bytes())?;
-    w(&mut file, b"WAVE")?;
-    w(&mut file, b"fmt ")?;
-    w(&mut file, &16u32.to_le_bytes())?;
-    w(&mut file, &1u16.to_le_bytes())?;
-    w(&mut file, &num_channels.to_le_bytes())?;
-    w(&mut file, &sr.to_le_bytes())?;
-    w(&mut file, &byte_rate.to_le_bytes())?;
-    w(&mut file, &block_align.to_le_bytes())?;
-    w(&mut file, &bits_per_sample.to_le_bytes())?;
-    w(&mut file, b"data")?;
-    w(&mut file, &data_size.to_le_bytes())?;
-
-    let mut buf = Vec::with_capacity(samples.len() * 2);
-    for &s in samples {
-        let clamped = s.clamp(-1.0, 1.0);
-        let int_sample = (clamped * 32_767.0) as i16;
-        buf.extend_from_slice(&int_sample.to_le_bytes());
-    }
-    file.write_all(&buf).map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Failed to create temp flac: {}", e))?;
+    file.write_all(sink.as_slice()).map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Feeds f32 samples to the FLAC encoder a block at a time, converting to
+/// 16-bit as it goes, so a multi-hour file isn't copied whole into i32 first.
+struct F32Source<'a> {
+    samples: &'a [f32],
+    pos: usize,
+    scratch: Vec<i32>,
+}
+
+impl flacenc::source::Source for F32Source<'_> {
+    fn channels(&self) -> usize {
+        1
+    }
+    fn bits_per_sample(&self) -> usize {
+        16
+    }
+    fn sample_rate(&self) -> usize {
+        16_000
+    }
+    fn read_samples<F: flacenc::source::Fill>(
+        &mut self,
+        block_size: usize,
+        dest: &mut F,
+    ) -> Result<usize, flacenc::error::SourceError> {
+        let end = (self.pos + block_size).min(self.samples.len());
+        self.scratch.clear();
+        self.scratch.extend(
+            self.samples[self.pos..end]
+                .iter()
+                .map(|&s| (s.clamp(-1.0, 1.0) * 32_767.0) as i32),
+        );
+        dest.fill_interleaved(&self.scratch)?;
+        let n = end - self.pos;
+        self.pos = end;
+        Ok(n)
+    }
+    fn len_hint(&self) -> Option<usize> {
+        Some(self.samples.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Decode a real file, encode it as the upload FLAC, decode that back
+    /// and require the 16-bit samples to match exactly. Path comes from the
+    /// environment so no personal file is committed:
+    ///   MURMUR_FLAC_CHECK=/path/audio.m4a cargo test --release flac_roundtrip -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn flac_roundtrip() {
+        let src = std::env::var("MURMUR_FLAC_CHECK").expect("set MURMUR_FLAC_CHECK");
+        let samples = crate::transcriber::audio_to_pcm(Path::new(&src)).unwrap();
+        let out = std::env::temp_dir().join("murmur_flac_roundtrip.flac");
+        let t = std::time::Instant::now();
+        write_flac_16bit_mono_16k(&out, &samples).unwrap();
+        let enc = t.elapsed();
+        let flac_bytes = std::fs::metadata(&out).unwrap().len();
+        let wav_bytes = 44 + samples.len() as u64 * 2;
+
+        let file = std::fs::File::open(&out).unwrap();
+        let mss = symphonia::core::io::MediaSourceStream::new(Box::new(file), Default::default());
+        let probed = symphonia::default::get_probe()
+            .format(&Default::default(), mss, &Default::default(), &Default::default())
+            .unwrap();
+        let mut format = probed.format;
+        let track = format.default_track().unwrap().clone();
+        assert_eq!(track.codec_params.sample_rate, Some(16_000));
+        let mut dec = symphonia::default::get_codecs()
+            .make(&track.codec_params, &Default::default())
+            .unwrap();
+        let mut decoded: Vec<i16> = Vec::with_capacity(samples.len());
+        while let Ok(pkt) = format.next_packet() {
+            let buf = dec.decode(&pkt).unwrap();
+            let mut sb = symphonia::core::audio::SampleBuffer::<i16>::new(
+                buf.capacity() as u64,
+                *buf.spec(),
+            );
+            sb.copy_interleaved_ref(buf);
+            decoded.extend_from_slice(sb.samples());
+        }
+        let expected: Vec<i16> = samples
+            .iter()
+            .map(|&s| (s.clamp(-1.0, 1.0) * 32_767.0) as i16)
+            .collect();
+        println!(
+            "{:.0} s audio: encode {:.2?}, FLAC {:.1} MB vs WAV {:.1} MB ({:.0}%)",
+            samples.len() as f64 / 16_000.0,
+            enc,
+            flac_bytes as f64 / 1e6,
+            wav_bytes as f64 / 1e6,
+            100.0 * flac_bytes as f64 / wav_bytes as f64
+        );
+        assert_eq!(decoded.len(), expected.len());
+        assert!(decoded == expected, "decoded FLAC differs from source samples");
+        let _ = std::fs::remove_file(&out);
+    }
 }

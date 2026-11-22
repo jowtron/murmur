@@ -3174,7 +3174,11 @@ listen<TranscriptionProgress>("transcription-progress", (event) => {
 
     // Anchor on each new stage, then project the remainder from the rate
     // observed since that anchor.
-    const stageKey = data.status.startsWith("decoding ") ? "decoding" : data.status;
+    const stageKey = data.status.startsWith("decoding ")
+      ? "decoding"
+      : data.status.startsWith("uploading")
+        ? "uploading"
+        : data.status;
     if (item.stageKey !== stageKey) {
       item.stageKey = stageKey;
       item.stageAnchorAt = Date.now();
@@ -3191,7 +3195,7 @@ listen<TranscriptionProgress>("transcription-progress", (event) => {
     if (data.status === "complete") item.eta = undefined;
     const isActiveStage =
       data.status === "transcribing" ||
-      data.status === "uploading" ||
+      data.status.startsWith("uploading") ||
       data.status === "submitting" ||
       data.status === "diarizing" ||
       data.status === "merging" ||
@@ -3207,6 +3211,10 @@ listen<TranscriptionProgress>("transcription-progress", (event) => {
 
 function formatStageText(status: string): string {
   if (status === "uploading") return "Uploading…";
+  // "uploading 42 / 159 MB · 320 KB/s" from the backend's UploadMeter.
+  if (status.startsWith("uploading ")) return `Uploading ${status.substring("uploading ".length)}`;
+  if (status === "compressing audio") return "Compressing audio…";
+  if (status === "extracting audio") return "Extracting audio…";
   if (status === "submitting") return "Submitting…";
   if (status === "processing") return "Processing…";
   if (status.startsWith("processing (")) {

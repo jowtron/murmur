@@ -1,4 +1,4 @@
-use crate::curl_util::{auth_header_config, run_curl};
+use crate::curl_util::{auth_header_config, run_curl_with_progress, UploadProgress};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio_util::sync::CancellationToken;
@@ -70,6 +70,7 @@ pub async fn transcribe(
     model: &str,
     language_code: Option<&str>,
     cancel: &CancellationToken,
+    on_progress: impl FnMut(UploadProgress),
 ) -> Result<DeepgramResponse, String> {
     let path_str = path
         .to_str()
@@ -93,7 +94,7 @@ pub async fn transcribe(
     // --retry (without --retry-all-errors) only re-sends on transient errors,
     // so a completed-but-dropped response can't silently double-bill more than
     // those narrow cases.
-    let body = run_curl(
+    let body = run_curl_with_progress(
         &[
             "--fail-with-body",
             "-X", "POST",
@@ -105,6 +106,7 @@ pub async fn transcribe(
         ],
         &auth_header_config(&format!("Token {}", api_key)),
         Some(cancel),
+        on_progress,
     )
     .await
     .map_err(|e| format!("Deepgram request failed: {}", e))?;
